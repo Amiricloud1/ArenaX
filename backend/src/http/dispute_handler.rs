@@ -13,6 +13,7 @@ use crate::auth::middleware::ClaimsExt;
 use crate::models::{
     AddEvidenceRequest, AssignDisputeRequest, CreateTicketRequest, EscalateDisputeRequest,
     ListDisputesQuery, PaginationParams, RejectDisputeRequest, ResolveDisputeRequest,
+    ReviewDisputeAppealRequest, SubmitDisputeAppealRequest,
 };
 use crate::service::DisputeService;
 
@@ -82,6 +83,14 @@ pub async fn get_dispute(
     }
 
     let detail = service.get_dispute_detail(dispute_id).await?;
+    audit_dispute_access(
+        pool.get_ref(),
+        user_id,
+        dispute_id,
+        "DISPUTE_EVIDENCE_METADATA_ACCESSED",
+        "evidence metadata viewed",
+    )
+    .await?;
     Ok(HttpResponse::Ok().json(serde_json::json!({ "data": detail })))
 }
 
@@ -194,7 +203,38 @@ pub async fn list_evidence(
     }
 
     let evidence = service.list_evidence(dispute_id).await?;
+    audit_dispute_access(
+        pool.get_ref(),
+        user_id,
+        dispute_id,
+        "DISPUTE_EVIDENCE_METADATA_ACCESSED",
+        "evidence metadata viewed",
+    )
+    .await?;
     Ok(HttpResponse::Ok().json(serde_json::json!({ "data": evidence })))
+}
+
+async fn audit_dispute_access(
+    pool: &PgPool,
+    actor_id: Uuid,
+    dispute_id: Uuid,
+    action: &str,
+    details: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO audit_logs (user_id, action, resource_type, resource_id, details)
+        VALUES ($1, $2, 'dispute', $3, $4)
+        "#,
+    )
+    .bind(actor_id)
+    .bind(action)
+    .bind(dispute_id)
+    .bind(details)
+    .execute(pool)
+    .await
+    .map_err(ApiError::database_error)?;
+    Ok(())
 }
 
 /// GET /api/disputes/:id/history - Resolution history (staff only).
@@ -288,9 +328,96 @@ pub async fn reject_dispute(
     Ok(HttpResponse::Ok().json(serde_json::json!({ "data": dispute })))
 }
 
+/// POST /api/disputes/:id/appeal - Submit one appeal against a versioned decision.
+pub async fn submit_dispute_appeal(
+    req: HttpRequest,
+    pool: web::Data<PgPool>,
+    path: web::Path<Uuid>,
+    body: web::Json<SubmitDisputeAppealRequest>,
+) -> Result<HttpResponse, ApiError> {
+    let user_id = require_user(&req)?;
+    let service = DisputeService::new(pool.get_ref().clone());
+    let appeal = service
+        .submit_appeal(path.into_inner(), user_id, body.into_inner())
+        .await?;
+    Ok(HttpResponse::Created().json(serde_json::json!({ "data": appeal })))
+}
+
+/// GET /api/disputes/:id/appeal - Read the caller's appeal or staff-visible case appeal.
+pub async fn get_dispute_appeal(
+    req: HttpRequest,
+    pool: web::Data<PgPool>,
+    path: web::Path<Uuid>,
+) -> Result<HttpResponse, ApiError> {
+    let user_id = require_user(&req)?;
+    let service = DisputeService::new(pool.get_ref().clone());
+    let dispute_id = path.into_inner();
+    let dispute = service.get_dispute(dispute_id).await?;
+    let staff_access = req.claims().is_some_and(|claims| {
+        claims.roles.iter().any(|role| role == "admin" || role == "moderator")
+    });
+    if dispute.opened_by != user_id && !staff_access {
+        return Err(ApiError::forbidden("You may only view your own case appeal"));
+    }
+    let appeal = service.get_appeal(dispute_id).await?;
+    audit_dispute_access(
+        pool.get_ref(),
+        user_id,
+        dispute_id,
+        "DISPUTE_APPEAL_ACCESSED",
+        "case appeal viewed",
+    )
+    .await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "data": appeal })))
+}
+
+/// GET /api/disputes/appeals - Independent-review queue.
+pub async fn list_pending_appeals(
+    req: HttpRequest,
+    pool: web::Data<PgPool>,
+) -> Result<HttpResponse, ApiError> {
+    require_staff(&req)?;
+    let staff_id = require_staff(&req)?;
+    let service = DisputeService::new(pool.get_ref().clone());
+    let appeals = service.pending_appeals(100).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO audit_logs (user_id, action, resource_type, details)
+        VALUES ($1, 'DISPUTE_APPEAL_QUEUE_ACCESSED', 'dispute_appeal', 'pending appeal queue viewed')
+        "#,
+    )
+    .bind(staff_id)
+    .execute(pool.get_ref())
+    .await
+    .map_err(ApiError::database_error)?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "data": appeals })))
+}
+
+/// POST /api/disputes/appeals/:id/review - Review an appeal independently.
+pub async fn review_dispute_appeal(
+    req: HttpRequest,
+    pool: web::Data<PgPool>,
+    path: web::Path<Uuid>,
+    body: web::Json<ReviewDisputeAppealRequest>,
+) -> Result<HttpResponse, ApiError> {
+    let reviewer_id = require_staff(&req)?;
+    let service = DisputeService::new(pool.get_ref().clone());
+    let appeal = service
+        .review_appeal(
+            path.into_inner(),
+            reviewer_id,
+            body.accept,
+            &body.decision_reason,
+        )
+        .await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "data": appeal })))
+}
+
 pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
         web::scope("/disputes")
+            .route("/appeals", web::get().to(list_pending_appeals))
+            .route("/appeals/{id}/review", web::post().to(review_dispute_appeal))
             .route("", web::post().to(create_dispute))
             .route("", web::get().to(list_disputes))
             .route("/mine", web::get().to(list_my_disputes))
@@ -298,6 +425,8 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             .route("/{id}/evidence", web::post().to(add_evidence))
             .route("/{id}/evidence", web::get().to(list_evidence))
             .route("/{id}/history", web::get().to(get_history))
+            .route("/{id}/appeal", web::post().to(submit_dispute_appeal))
+            .route("/{id}/appeal", web::get().to(get_dispute_appeal))
             .route("/{id}/assign", web::post().to(assign_dispute))
             .route("/{id}/review", web::post().to(start_review))
             .route("/{id}/escalate", web::post().to(escalate_dispute))

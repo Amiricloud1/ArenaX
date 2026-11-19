@@ -432,90 +432,171 @@ impl MatchService {
 
     /// Attach freshly-hashed evidence to `user_id`'s dispute for `match_id`
     /// (#1081), creating the dispute if they have not filed one yet. The
-    /// SHA-256 hash and S3 key are persisted so the file's integrity can be
-    /// verified later by re-downloading and re-hashing it.
+    /// SHA-256 hash and unique S3 key are persisted so the file's integrity
+    /// can be verified later without overwriting an earlier upload.
     pub async fn attach_dispute_evidence(
         &self,
         match_id: Uuid,
         user_id: Uuid,
         evidence_hash: &str,
         evidence_s3_key: &str,
+        uploaded_by: Uuid,
     ) -> Result<MatchDispute, ApiError> {
-        let existing = sqlx::query_as!(
-            MatchDispute,
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .map_err(ApiError::database_error)?;
+        let mut new_dispute_tournament = None;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("{match_id}:{user_id}"))
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::database_error)?;
+
+        let existing = sqlx::query_as::<_, MatchDispute>(
             r#"
             SELECT * FROM match_disputes
             WHERE match_id = $1 AND disputing_player_id = $2
             ORDER BY created_at DESC
             LIMIT 1
+            FOR UPDATE
             "#,
-            match_id,
-            user_id
         )
-        .fetch_optional(&self.db_pool)
+        .bind(match_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| ApiError::database_error(e))?;
+        .map_err(ApiError::database_error)?;
 
-        if let Some(dispute) = existing {
-            if dispute.status == DisputeStatus::Resolved {
+        let (mut dispute, previous_version_id, version) = if let Some(dispute) = existing {
+            if matches!(
+                dispute.status,
+                DisputeStatus::Resolved | DisputeStatus::Rejected
+            ) {
                 return Err(ApiError::conflict(
-                    "cannot add evidence to a resolved dispute",
+                    "cannot add evidence to a finalized dispute",
                 ));
             }
-            let updated = sqlx::query_as!(
-                MatchDispute,
+            let previous_version_id = sqlx::query_scalar::<_, Uuid>(
                 r#"
-                UPDATE match_disputes
-                SET evidence_hash = $2, evidence_s3_key = $3
-                WHERE id = $1
+                SELECT id FROM match_dispute_evidence_versions
+                WHERE dispute_id = $1 ORDER BY version DESC LIMIT 1
+                "#,
+            )
+            .bind(dispute.id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(ApiError::database_error)?;
+            let version: i32 = sqlx::query_scalar(
+                "SELECT COALESCE(MAX(version), 0) + 1 FROM match_dispute_evidence_versions WHERE dispute_id = $1",
+            )
+            .bind(dispute.id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(ApiError::database_error)?;
+            (dispute, previous_version_id, version)
+        } else {
+            let match_record = self.get_match_by_id(match_id).await?;
+            let dispute = sqlx::query_as::<_, MatchDispute>(
+                r#"
+                INSERT INTO match_disputes (
+                    id, match_id, disputing_player_id, reason,
+                    evidence_hash, evidence_s3_key, status, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 RETURNING *
                 "#,
-                dispute.id,
-                evidence_hash,
-                evidence_s3_key
             )
-            .fetch_one(&self.db_pool)
+            .bind(Uuid::new_v4())
+            .bind(match_id)
+            .bind(user_id)
+            .bind("Evidence uploaded")
+            .bind(evidence_hash)
+            .bind(evidence_s3_key)
+            .bind(DisputeStatus::Pending as i32)
+            .bind(Utc::now())
+            .fetch_one(&mut *tx)
             .await
-            .map_err(|e| ApiError::database_error(e))?;
-            return Ok(updated);
-        }
+            .map_err(ApiError::database_error)?;
 
-        let match_record = self.get_match_by_id(match_id).await?;
+            sqlx::query("UPDATE matches SET status = $1, updated_at = $2 WHERE id = $3")
+                .bind(MatchStatus::Disputed as i32)
+                .bind(Utc::now())
+                .bind(match_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(ApiError::database_error)?;
+            new_dispute_tournament = Some(match_record.tournament_id);
+            (dispute, None, 1)
+        };
 
-        let dispute = sqlx::query_as!(
-            MatchDispute,
+        sqlx::query(
             r#"
-            INSERT INTO match_disputes (
-                id, match_id, disputing_player_id, reason,
-                evidence_hash, evidence_s3_key, status, created_at
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8
-            ) RETURNING *
+            INSERT INTO match_dispute_evidence_versions
+                (dispute_id, version, sha256, object_key, uploaded_by, transformation_parent_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
-            Uuid::new_v4(),
-            match_id,
-            user_id,
-            "Evidence uploaded",
-            evidence_hash,
-            evidence_s3_key,
-            DisputeStatus::Pending as _,
-            Utc::now()
         )
-        .fetch_one(&self.db_pool)
+        .bind(dispute.id)
+        .bind(version)
+        .bind(evidence_hash)
+        .bind(evidence_s3_key)
+        .bind(uploaded_by)
+        .bind(previous_version_id)
+        .execute(&mut *tx)
         .await
-        .map_err(|e| ApiError::database_error(e))?;
+        .map_err(ApiError::database_error)?;
 
-        self.update_match_status(match_id, MatchStatus::Disputed)
-            .await?;
+        sqlx::query(
+            "UPDATE match_disputes SET evidence_hash = $2, evidence_s3_key = $3 WHERE id = $1",
+        )
+        .bind(dispute.id)
+        .bind(evidence_hash)
+        .bind(evidence_s3_key)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+        dispute.evidence_hash = Some(evidence_hash.to_string());
+        dispute.evidence_s3_key = Some(evidence_s3_key.to_string());
+        sqlx::query(
+            r#"
+            INSERT INTO audit_logs (user_id, action, resource_type, resource_id, details)
+            VALUES ($1, 'DISPUTE_EVIDENCE_UPLOADED', 'match_dispute', $2, $3)
+            "#,
+        )
+        .bind(uploaded_by)
+        .bind(dispute.id)
+        .bind(
+            serde_json::json!({
+                "sha256": evidence_hash,
+                "object_key": evidence_s3_key,
+                "version": version
+            })
+            .to_string(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+        tx.commit().await.map_err(ApiError::database_error)?;
 
-        self.publish_match_event(serde_json::json!({
-            "type": "disputed",
-            "match_id": match_id,
-            "tournament_id": match_record.tournament_id,
-            "user_id": user_id,
-            "reason": "Evidence uploaded"
-        }))
-        .await?;
+        if let Some(tournament_id) = new_dispute_tournament {
+            if let Err(error) = self
+                .publish_match_event(serde_json::json!({
+                    "type": "disputed",
+                    "match_id": match_id,
+                    "tournament_id": tournament_id,
+                    "user_id": user_id,
+                    "reason": "Evidence uploaded"
+                }))
+                .await
+            {
+                tracing::error!(
+                    dispute_id = %dispute.id,
+                    error = %error,
+                    "Dispute evidence persisted, but its realtime event could not be published"
+                );
+            }
+        }
 
         Ok(dispute)
     }

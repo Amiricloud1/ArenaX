@@ -87,13 +87,13 @@ fn extension_for(content_type: &str) -> &'static str {
     }
 }
 
-/// S3 object key namespaced `{user_id}/{match_id}/{hash}.{ext}` (#1076) —
-/// scoping by user and match rules out path traversal or one player
-/// overwriting another's evidence, and keying by hash makes a duplicate
-/// upload of the same bytes idempotent.
+/// S3 object key namespaced by user, match, content hash, and a fresh upload
+/// id. The unique final component prevents even a repeat upload of identical
+/// bytes from issuing a PUT to an existing evidence object's key.
 pub fn evidence_object_key(user_id: Uuid, match_id: Uuid, content_type: &str, hash_hex: &str) -> String {
     format!(
-        "{user_id}/{match_id}/{hash_hex}.{}",
+        "{user_id}/{match_id}/{hash_hex}/{}.{}",
+        Uuid::new_v4(),
         extension_for(content_type)
     )
 }
@@ -127,6 +127,10 @@ pub async fn sweep_expired_evidence(
               AND evidence_retention_until <= NOW()
               AND evidence_legal_hold = FALSE
               AND evidence_deleted_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM match_dispute_evidence_versions v
+                  WHERE v.dispute_id = match_disputes.id
+              )
             ORDER BY evidence_retention_until
             LIMIT 1
                         FOR UPDATE SKIP LOCKED
@@ -161,6 +165,67 @@ pub async fn sweep_expired_evidence(
         tx.commit().await.map_err(ApiError::database_error)?;
         deleted += 1;
     }
+
+    loop {
+        let mut tx = db_pool.begin().await.map_err(ApiError::database_error)?;
+        let evidence = sqlx::query(
+            r#"
+            SELECT v.id, v.object_key, d.id AS dispute_id
+            FROM match_dispute_evidence_versions v
+            JOIN match_disputes d ON d.id = v.dispute_id
+            LEFT JOIN match_dispute_evidence_deletions deleted
+                ON deleted.evidence_version_id = v.id
+            WHERE d.evidence_retention_until <= NOW()
+              AND d.evidence_legal_hold = FALSE
+              AND deleted.evidence_version_id IS NULL
+            ORDER BY d.evidence_retention_until, v.version
+            LIMIT 1
+            FOR UPDATE OF d SKIP LOCKED
+            "#,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+
+        let Some(evidence) = evidence else {
+            tx.rollback().await.map_err(ApiError::database_error)?;
+            break;
+        };
+        let version_id: Uuid = evidence.try_get("id").map_err(ApiError::database_error)?;
+        let dispute_id: Uuid = evidence
+            .try_get("dispute_id")
+            .map_err(ApiError::database_error)?;
+        let key: String = evidence
+            .try_get("object_key")
+            .map_err(ApiError::database_error)?;
+
+        store.delete(&key).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO match_dispute_evidence_deletions (evidence_version_id)
+            VALUES ($1) ON CONFLICT (evidence_version_id) DO NOTHING
+            "#,
+        )
+        .bind(version_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+        sqlx::query(
+            r#"
+            UPDATE match_disputes
+            SET evidence_s3_key = NULL, evidence_deleted_at = COALESCE(evidence_deleted_at, NOW())
+            WHERE id = $1 AND evidence_s3_key = $2 AND evidence_legal_hold = FALSE
+            "#,
+        )
+        .bind(dispute_id)
+        .bind(key)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+        tx.commit().await.map_err(ApiError::database_error)?;
+        deleted += 1;
+    }
+
     Ok(deleted)
 }
 
@@ -387,7 +452,10 @@ mod tests {
         let user_id = Uuid::from_u128(1);
         let match_id = Uuid::from_u128(2);
         let key = evidence_object_key(user_id, match_id, "image/png", "abc123");
-        assert_eq!(key, format!("{user_id}/{match_id}/abc123.png"));
+        let repeated_upload_key = evidence_object_key(user_id, match_id, "image/png", "abc123");
+        assert!(key.starts_with(&format!("{user_id}/{match_id}/abc123/")));
+        assert!(key.ends_with(".png"));
+        assert_ne!(key, repeated_upload_key);
     }
 
     struct InMemoryStore {

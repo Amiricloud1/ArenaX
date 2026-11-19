@@ -37,6 +37,8 @@ pub struct LiftRequest {
 #[serde(rename_all = "camelCase")]
 pub struct AppealRequest {
     pub text: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -197,7 +199,12 @@ pub async fn submit_appeal(
     // The service scopes the update by user_id, so a player cannot appeal
     // someone else's suspension even with a valid id.
     let suspension = service
-        .submit_appeal(path.into_inner(), user_id, &body.text)
+        .submit_appeal(
+            path.into_inner(),
+            user_id,
+            &body.text,
+            &body.evidence_refs,
+        )
         .await?;
 
     Ok(HttpResponse::Ok().json(Envelope { data: suspension }))
@@ -208,10 +215,20 @@ pub async fn pending_appeals(
     req: HttpRequest,
     pool: web::Data<DbPool>,
 ) -> Result<HttpResponse, ApiError> {
-    require_moderator(&req)?;
+    let moderator_id = require_moderator(&req)?;
     let service = SuspensionService::new(pool.get_ref().clone());
 
     let appeals = service.pending_appeals(100).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO audit_logs (user_id, action, resource_type, details)
+        VALUES ($1, 'SUSPENSION_APPEAL_QUEUE_ACCESSED', 'player_suspension', 'pending appeal queue viewed')
+        "#,
+    )
+    .bind(moderator_id)
+    .execute(pool.get_ref())
+    .await
+    .map_err(ApiError::DatabaseError)?;
     Ok(HttpResponse::Ok().json(Envelope { data: appeals }))
 }
 

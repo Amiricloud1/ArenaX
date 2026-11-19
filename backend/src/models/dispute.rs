@@ -124,6 +124,7 @@ pub struct Dispute {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
+    pub decision_version: i32,
 }
 
 impl Dispute {
@@ -181,6 +182,22 @@ pub struct DisputeEvidence {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DisputeAppeal {
+    pub id: Uuid,
+    pub dispute_id: Uuid,
+    pub appellant_id: Uuid,
+    pub decision_version: i32,
+    pub appeal_text: String,
+    pub evidence_refs: serde_json::Value,
+    pub status: String,
+    pub reviewer_id: Option<Uuid>,
+    pub decision_reason: Option<String>,
+    pub submitted_at: DateTime<Utc>,
+    pub deadline_at: DateTime<Utc>,
+    pub reviewed_at: Option<DateTime<Utc>>,
+}
+
 // ─── Request/response DTOs ─────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -218,6 +235,20 @@ pub struct ResolveDisputeRequest {
 #[derive(Debug, Deserialize)]
 pub struct RejectDisputeRequest {
     pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SubmitDisputeAppealRequest {
+    pub decision_version: i32,
+    pub appeal_text: String,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewDisputeAppealRequest {
+    pub accept: bool,
+    pub decision_reason: String,
 }
 
 #[derive(Debug, Deserialize)]
