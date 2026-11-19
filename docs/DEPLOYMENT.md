@@ -9,11 +9,17 @@ deployment metrics for both `backend` and `frontend`.
 ```
 GitHub Actions (deploy.yml)
   1. build + push backend/frontend images to GHCR, tagged with the commit SHA
-  2. SSH to the deploy host, run scripts/deploy/blue-green-deploy.sh.
+  2. attest each image with GitHub build provenance binding its digest, source
+     commit, and trusted workflow identity
+  3. verify both attestations before SSH; reject missing, untrusted, or
+     mismatched provenance
+  4. SSH to the deploy host and run scripts/deploy/blue-green-deploy.sh with
+     the verified immutable image digests.
 
 blue-green-deploy.sh, on the deploy host:
   1. Read deploy/state/active-slot (blue|green) -> idle slot is the other color
-  2. Start the idle slot's containers on the new image
+  2. Start the idle slot's containers on the verified image digests and record
+     those digests, source revision, and provenance result beside the slot state
   3. Health-check the idle slot (backend /api/health) before it gets any
      real traffic — a bad build never reaches users
   4. Canary: shift CANARY_WEIGHT% of traffic to the idle slot via a
@@ -28,7 +34,8 @@ blue-green-deploy.sh, on the deploy host:
      an nginx reload, not a redeploy.
   7. Stop the old slot's containers.
   8. Append a record to deploy/metrics/deployments.jsonl (start/end time,
-     duration, slot transition, outcome).
+     duration, source revision, image digests, provenance result and
+     verification run id, slot transition, outcome).
 ```
 
 Nginx is the single stable entry point (`deploy/nginx/`) — its published
@@ -75,7 +82,7 @@ Every deploy and rollback appends one JSON line to
 `deploy/metrics/deployments.jsonl` on the deploy host:
 
 ```json
-{"started_at":"...","finished_at":"...","duration_seconds":142,"image_tag":"a1b2c3d4e5f6","from_slot":"blue","to_slot":"green","status":"success"}
+{"started_at":"...","finished_at":"...","duration_seconds":142,"image_tag":"a1b2c3d4e5f6","source_revision":"...","backend_image":"ghcr.io/owner/repo/backend@sha256:...","frontend_image":"ghcr.io/owner/repo/frontend@sha256:...","provenance_verified":true,"from_slot":"blue","to_slot":"green","status":"success"}
 ```
 
 `status` is one of `success`, `failed`, or `rollback`. Point a log

@@ -28,6 +28,12 @@ reversing schema destructively.
   using them. Do the drop in a follow-up release after the old code is gone.
 - Never make a column `NOT NULL` without a default in the same release that
   introduces it; backfill first, then tighten in a later release.
+- Add `.expand.up.sql`, `.backfill.up.sql`, and `.contract.up.sql` steps
+  separately. CI applies both previous- and current-version compatibility
+  fixtures across a sample expand/backfill/contract sequence.
+- A contract stage is refused unless `CONTRACT_RELEASE_MARKER` is set after
+  every binary that reads the old schema has been retired. The marker is an
+  explicit release approval, not a substitute for checking the running fleet.
 - Keep each migration idempotent where the engine allows it, and small enough
   to complete within the deploy gate timeout.
 - Down-migrations must be non-destructive: they may drop objects the same
@@ -84,3 +90,7 @@ Exercise both failure paths in staging before relying on them in production:
 - **Rollback path:** deploy a bad release, trigger rollback, and confirm the
   prior artifact is restored, readiness passes, and no destructive schema
   reversal occurred.
+- **Migration compatibility:** `backend/scripts/verify-migration-compatibility.sh`
+  applies its sample fixtures in an isolated schema and verifies the previous
+  application before and after expand/backfill, the current application, and
+  the separate contract marker gate.

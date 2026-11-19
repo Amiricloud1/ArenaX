@@ -93,6 +93,19 @@ npm run build
 - Migrations are append-only — never edit an existing migration file
 - Test both `up` and `down` migrations locally before opening a PR
 - Column/type changes require a multi-step migration (add → backfill → drop)
+- Additive/expand and backfill steps must remain compatible with both the
+  previous and current application fixtures in `backend/migration-compatibility/`.
+- A `.contract.up.sql` migration is gated by `CONTRACT_RELEASE_MARKER`; set it
+  only after every binary that reads the old schema has been retired.
+
+## Test quarantine
+
+Do not silently skip flaky tests. Add an entry to
+`.github/test-quarantine.json` with the exact command, owner, issue, failure
+evidence, scope, and expiry date. CI runs each quarantined test separately,
+reports disabled coverage independently, fails expired entries, and prompts
+removal after three consecutive passing runs. Keep the entry only as long as
+the recorded failure evidence justifies it.
 
 ## Dependency & supply-chain gate
 

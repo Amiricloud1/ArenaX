@@ -145,6 +145,7 @@ dist/
 test-results/
 playwright-report/
 test-results.xml
+.github/test-quarantine-history.json
 
 # Design docs (local only)
 docs/superpowers/
