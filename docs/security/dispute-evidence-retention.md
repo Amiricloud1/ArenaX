@@ -6,7 +6,7 @@ validates content type, size, and file signature at upload, stores a SHA-256
 digest with the dispute, and verifies that digest before returning an object.
 
 Evidence remains available while the dispute is unresolved. On resolution, the
-backend sets a 90-day retention deadline. A moderator or administrator may set
+backend sets a 12-month retention deadline. A moderator or administrator may set
 or clear a legal hold; held evidence is not deleted by the scheduled retention
 sweep. After the deadline and once any hold is cleared, the object is deleted
 from private storage. The dispute's SHA-256 digest, resolution, and audit
@@ -18,10 +18,10 @@ the evidence pointer is cleared only after the storage deletion succeeds.
 
 ## Custody and replacements
 
-Each successful upload also appends a row to
+Each new successful upload also appends a row to
 `match_dispute_evidence_versions`. The row records the server-observed upload
 time, authenticated uploader, SHA-256 digest, private object key, fixed
-`dispute_90d` retention class, and the previous version as
+`evidence_12m` retention class, and the previous version as
 `transformation_parent_id` when one exists. The table rejects updates and
 deletes; replacing evidence creates a new version and never rewrites the
 evidence bytes associated with an earlier decision. The evidence body is

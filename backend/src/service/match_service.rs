@@ -2220,7 +2220,7 @@ impl MatchService {
             r#"
             UPDATE match_disputes
             SET status = $1, admin_reviewer_id = $2, resolution = $3, resolved_at = $4,
-                evidence_retention_until = $4 + INTERVAL '90 days'
+                evidence_retention_until = $4 + INTERVAL '12 months'
             WHERE id = $5
             RETURNING *
             "#,

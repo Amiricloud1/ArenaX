@@ -39,6 +39,12 @@ CREATE INDEX idx_dispute_appeals_pending
 
 -- Each upload is a separate immutable custody record. Replacing evidence
 -- appends a version and links it to the previous version instead of erasing it.
+UPDATE match_disputes
+SET evidence_retention_until = resolved_at + INTERVAL '12 months'
+WHERE evidence_s3_key IS NOT NULL
+  AND evidence_deleted_at IS NULL
+  AND resolved_at IS NOT NULL;
+
 CREATE TABLE match_dispute_evidence_versions (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     dispute_id UUID NOT NULL REFERENCES match_disputes(id) ON DELETE CASCADE,
@@ -48,8 +54,8 @@ CREATE TABLE match_dispute_evidence_versions (
     uploaded_by UUID NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
     uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     transformation_parent_id UUID REFERENCES match_dispute_evidence_versions(id) ON DELETE RESTRICT,
-    retention_class VARCHAR(32) NOT NULL DEFAULT 'dispute_90d'
-        CHECK (retention_class = 'dispute_90d'),
+    retention_class VARCHAR(32) NOT NULL DEFAULT 'evidence_12m'
+        CHECK (retention_class = 'evidence_12m'),
     UNIQUE (dispute_id, version)
 );
 
