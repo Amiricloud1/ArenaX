@@ -35,6 +35,7 @@ export type AnalyticsEventName =
   | "profile_edited"
   | "achievement_unlocked"
   | "ab_test_assigned"
+  | "experiment_exposed"
   | "funnel_step"
   // PWA install funnel (Issue #858)
   | "pwa_prompt_shown"
@@ -117,6 +118,16 @@ export interface ABTestPayload extends BaseEventPayload {
   variant: string;
 }
 
+export interface ExperimentExposurePayload extends BaseEventPayload {
+  event: "experiment_exposed";
+  experimentId: string;
+  variant: string;
+  /** Version of the experiment definition used for assignment. */
+  assignmentVersion: string;
+  /** Where the experience was presented (e.g. "home_banner"). */
+  surface: string;
+}
+
 export interface FunnelStepPayload extends BaseEventPayload {
   event: "funnel_step";
   funnelName: string;
@@ -139,6 +150,7 @@ export type AnalyticsPayload =
   | TournamentWinSharedPayload
   | PurchasePayload
   | ABTestPayload
+  | ExperimentExposurePayload
   | FunnelStepPayload
   | GenericPayload;
 
@@ -164,6 +176,39 @@ export interface ABAssignment {
   variant: ABVariant;
   assignedAt: number;
 }
+
+/**
+ * Deterministic experiment assignment record.
+ * Persisted so a participant is never silently reassigned mid-session.
+ */
+export interface ExperimentAssignment {
+  experimentId: string;
+  variant: ABVariant;
+  /** Version of the experiment definition that produced this assignment. */
+  assignmentVersion: string;
+  /** Stable bucketing key (hashed participant identifier). */
+  bucketKey: string;
+  assignedAt: number;
+  /** True when the participant is in the experiment holdout. */
+  holdout: boolean;
+}
+
+export type GuardrailMetricDirection = "increase_is_bad" | "decrease_is_bad";
+
+export interface GuardrailMetric {
+  /** Metric identifier, e.g. "payment_error_rate". */
+  id: string;
+  /** Human-readable label for operator dashboards. */
+  label: string;
+  direction: GuardrailMetricDirection;
+  /** Absolute threshold beyond which the experiment is considered harmful. */
+  stopThreshold: number;
+}
+
+export type ExperimentAnalysisStatus =
+  | "insufficient_data"
+  | "safe_to_ship"
+  | "harmful";
 
 export const ALLOWED_EVENT_NAMES: readonly AnalyticsEventName[] = [
   "page_view",
@@ -192,5 +237,6 @@ export const ALLOWED_EVENT_NAMES: readonly AnalyticsEventName[] = [
   "profile_edited",
   "achievement_unlocked",
   "ab_test_assigned",
+  "experiment_exposed",
   "funnel_step",
 ] as const;

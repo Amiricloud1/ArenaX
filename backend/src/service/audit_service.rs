@@ -81,6 +81,39 @@ pub enum AuditAction {
     /// Explicit application-level record of a data modification, for paths
     /// where the change does not land in an audited table.
     DataModification,
+    /// A participant was assigned to an experiment cohort (Issue #255).
+    ///
+    /// Records the assignment version and cohort, never the exposure — that
+    /// is a separate action logged at presentation time.
+    ExperimentAssignment,
+    /// A participant was presented with the assigned experience (Issue #255).
+    ///
+    /// Logged at presentation, not assignment, so the trail distinguishes
+    /// "was bucketed" from "actually saw it".
+    ExperimentExposure,
+    /// An experiment was stopped by a guardrail breach (Issue #256).
+    ///
+    /// Records which guardrail tripped, the observed value and the threshold
+    /// that was defined before the experiment started.
+    ExperimentGuardrailStop,
+    /// A leaderboard snapshot was generated (Issue #257).
+    ///
+    /// Records the snapshot version and generation time so a served page can
+    /// be traced back to the exact ranking it was built from.
+    LeaderboardSnapshotGenerated,
+    /// A privacy deletion job was requested (Issue #258).
+    PrivacyDeletionRequested,
+    /// A dependent system acknowledged (or failed) a deletion (Issue #258).
+    ///
+    /// One entry per system per attempt; the payload carries the system name
+    /// and retry status but never the deleted values.
+    PrivacyDeletionAck,
+    /// A privacy deletion job was retried after a failed acknowledgement.
+    PrivacyDeletionRetry,
+    /// A privacy deletion job completed across all required systems.
+    PrivacyDeletionCompleted,
+    /// A documented legal-retention exception was applied to a deletion.
+    PrivacyDeletionRetentionException,
 }
 
 impl AuditAction {
@@ -97,8 +130,101 @@ impl AuditAction {
             Self::AdminOverride => "admin_override",
             Self::AdminConfigChange => "admin_config_change",
             Self::DataModification => "data_modification",
+            Self::ExperimentAssignment => "experiment_assignment",
+            Self::ExperimentExposure => "experiment_exposure",
+            Self::ExperimentGuardrailStop => "experiment_guardrail_stop",
+            Self::LeaderboardSnapshotGenerated => "leaderboard_snapshot_generated",
+            Self::PrivacyDeletionRequested => "privacy_deletion_requested",
+            Self::PrivacyDeletionAck => "privacy_deletion_ack",
+            Self::PrivacyDeletionRetry => "privacy_deletion_retry",
+            Self::PrivacyDeletionCompleted => "privacy_deletion_completed",
+            Self::PrivacyDeletionRetentionException => "privacy_deletion_retention_exception",
         }
     }
+
+    /// Whether entries of this action may carry personal data that must be
+    /// redacted once the subject's deletion completes (Issue #258).
+    ///
+    /// The privacy-deletion lifecycle actions are deliberately excluded: they
+    /// are the evidence that the deletion happened, and they are written with
+    /// identifiers already stripped (see [`redact_deleted_identifiers`]).
+    pub fn carries_subject_data(self) -> bool {
+        !matches!(
+            self,
+            Self::PrivacyDeletionRequested
+                | Self::PrivacyDeletionAck
+                | Self::PrivacyDeletionRetry
+                | Self::PrivacyDeletionCompleted
+                | Self::PrivacyDeletionRetentionException
+        )
+    }
+}
+
+/// Placeholder written in place of an identifier belonging to a deleted user.
+pub const REDACTED_PLACEHOLDER: &str = "[redacted]";
+
+/// Keys whose values are identifiers of the audited subject and must not
+/// survive a privacy deletion (Issue #258).
+///
+/// Matched case-insensitively against object keys at any depth. The list is
+/// intentionally about *identity*, not about every field: an audit entry that
+/// says "a ban was lifted" is still useful after the subject is gone, but one
+/// that names their email address is a leak.
+const REDACTABLE_KEYS: &[&str] = &[
+    "email",
+    "email_address",
+    "username",
+    "display_name",
+    "phone",
+    "phone_number",
+    "ip_address",
+    "user_agent",
+    "full_name",
+    "address",
+    "date_of_birth",
+    "external_id",
+    "stripe_customer_id",
+    "device_id",
+];
+
+/// Recursively replace values under identity-bearing keys with a placeholder.
+///
+/// Used when a privacy deletion completes: the audit trail must remain
+/// verifiable and queryable, but must no longer contain the deleted subject's
+/// identifiers. Returns the redacted value and the number of fields replaced
+/// so the caller can record that redaction happened without logging the
+/// values themselves.
+pub fn redact_deleted_identifiers(value: &JsonValue) -> (JsonValue, usize) {
+    fn walk(value: &JsonValue, redacted: &mut usize) -> JsonValue {
+        match value {
+            JsonValue::Object(map) => {
+                let mut out = serde_json::Map::with_capacity(map.len());
+                for (key, child) in map {
+                    let is_identity = REDACTABLE_KEYS
+                        .iter()
+                        .any(|k| k.eq_ignore_ascii_case(key));
+                    if is_identity && !child.is_null() {
+                        *redacted += 1;
+                        out.insert(
+                            key.clone(),
+                            JsonValue::String(REDACTED_PLACEHOLDER.to_string()),
+                        );
+                    } else {
+                        out.insert(key.clone(), walk(child, redacted));
+                    }
+                }
+                JsonValue::Object(out)
+            }
+            JsonValue::Array(items) => {
+                JsonValue::Array(items.iter().map(|item| walk(item, redacted)).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    let mut redacted = 0usize;
+    let out = walk(value, &mut redacted);
+    (out, redacted)
 }
 
 /// One entry to be written.
@@ -542,6 +668,15 @@ mod tests {
             AuditAction::AdminOverride,
             AuditAction::AdminConfigChange,
             AuditAction::DataModification,
+            AuditAction::ExperimentAssignment,
+            AuditAction::ExperimentExposure,
+            AuditAction::ExperimentGuardrailStop,
+            AuditAction::LeaderboardSnapshotGenerated,
+            AuditAction::PrivacyDeletionRequested,
+            AuditAction::PrivacyDeletionAck,
+            AuditAction::PrivacyDeletionRetry,
+            AuditAction::PrivacyDeletionCompleted,
+            AuditAction::PrivacyDeletionRetentionException,
         ];
 
         for action in actions {
@@ -577,5 +712,57 @@ mod tests {
         let cutoff = AuditService::retention_cutoff();
         let years_back = (Utc::now() - cutoff).num_days() / 365;
         assert_eq!(years_back, RETENTION_YEARS);
+    }
+
+    #[test]
+    fn privacy_lifecycle_actions_do_not_carry_subject_data() {
+        assert!(!AuditAction::PrivacyDeletionRequested.carries_subject_data());
+        assert!(!AuditAction::PrivacyDeletionAck.carries_subject_data());
+        assert!(!AuditAction::PrivacyDeletionRetry.carries_subject_data());
+        assert!(!AuditAction::PrivacyDeletionCompleted.carries_subject_data());
+        assert!(!AuditAction::PrivacyDeletionRetentionException.carries_subject_data());
+
+        // Ordinary actions may carry identifiers and are therefore subject to
+        // redaction once a deletion completes.
+        assert!(AuditAction::AdminView.carries_subject_data());
+        assert!(AuditAction::ExperimentExposure.carries_subject_data());
+    }
+
+    #[test]
+    fn redaction_strips_identity_keys_at_any_depth() {
+        let value = serde_json::json!({
+            "email": "player@example.com",
+            "nested": {
+                "Username": "player_one",
+                "ip_address": "203.0.113.7",
+                "cohort": "treatment",
+            },
+            "list": [
+                { "phone": "+15550100" },
+                { "note": "kept" },
+            ],
+            "count": 3,
+        });
+
+        let (redacted, count) = redact_deleted_identifiers(&value);
+
+        assert_eq!(count, 4);
+        assert_eq!(redacted["email"], REDACTED_PLACEHOLDER);
+        assert_eq!(redacted["nested"]["Username"], REDACTED_PLACEHOLDER);
+        assert_eq!(redacted["nested"]["ip_address"], REDACTED_PLACEHOLDER);
+        assert_eq!(redacted["list"][0]["phone"], REDACTED_PLACEHOLDER);
+        // Non-identity fields survive so the trail stays useful.
+        assert_eq!(redacted["nested"]["cohort"], "treatment");
+        assert_eq!(redacted["list"][1]["note"], "kept");
+        assert_eq!(redacted["count"], 3);
+    }
+
+    #[test]
+    fn redaction_leaves_null_identifiers_alone() {
+        let value = serde_json::json!({ "email": null, "username": "x" });
+        let (redacted, count) = redact_deleted_identifiers(&value);
+        assert_eq!(count, 1);
+        assert!(redacted["email"].is_null());
+        assert_eq!(redacted["username"], REDACTED_PLACEHOLDER);
     }
 }

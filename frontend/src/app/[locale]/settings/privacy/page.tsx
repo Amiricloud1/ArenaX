@@ -5,6 +5,7 @@ import Link from "next/link";
 import { ArrowLeft, User, Gamepad2, Bell, Lock, Accessibility, Palette, Keyboard } from "lucide-react";
 import { useSettings } from "@/hooks/useSettings";
 import { PrivacySettings } from "@/components/settings/PrivacySettings";
+import { DeletionJobStatus } from "@/components/settings/DeletionJobStatus";
 
 const navigationItems = [
   {
@@ -114,13 +115,36 @@ export default function PrivacySettingsPage() {
           </div>
 
           {/* Main Content */}
-          <div className="lg:col-span-3">
+          <div className="lg:col-span-3 space-y-8">
             <PrivacySettings
               settings={settings.privacy}
               onUpdate={updatePrivacy}
               onSave={saveSettings}
               isSaving={isSaving}
             />
+
+            {/* Data deletion tracking */}
+            <section aria-labelledby="deletion-status-heading" className="space-y-3">
+              <div>
+                <h2 id="deletion-status-heading" className="text-lg font-semibold">
+                  Data deletion status
+                </h2>
+                <p className="text-sm text-muted-foreground">
+                  Deleting your profile removes it from the primary database, but
+                  identifiable records may also exist in caches, analytics
+                  projections, and search indexes. Each dependent system must
+                  acknowledge deletion before the request is reported as complete.
+                </p>
+                <p className="text-sm text-muted-foreground mt-2">
+                  Completion is reported only after every required system confirms
+                  deletion, or when a documented legal-retention exception applies.
+                  Systems that have not yet confirmed are retried automatically and
+                  their retry status is shown below. Status details never include
+                  the deleted values themselves.
+                </p>
+              </div>
+              <DeletionJobStatus />
+            </section>
           </div>
         </div>
       </div>

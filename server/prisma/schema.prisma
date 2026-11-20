@@ -55,6 +55,9 @@ model User {
   organizedTournaments     Tournament[]
   leaderboardEntries       LeaderboardEntry[]
   apiKeys                  ApiKey[]
+  experimentAssignments    ExperimentAssignment[]
+  experimentExposures      ExperimentExposure[]
+  privacyDeletionJobs      PrivacyDeletionJob[]
 
   @@index([deletedAt])
   @@index([provider])
@@ -631,6 +634,7 @@ model Leaderboard {
   deletedAt   DateTime?
 
   entries     LeaderboardEntry[]
+  snapshots   LeaderboardSnapshot[]
 
   @@index([type])
   @@index([gameModeId])
@@ -988,5 +992,195 @@ model ApiKey {
   updatedAt DateTime  @updatedAt
 
   @@index([userId])
+}
+
+enum ExperimentStatus {
+  DRAFT
+  RUNNING
+  PAUSED
+  STOPPED
+  COMPLETED
+}
+
+enum ExperimentStopReason {
+  GUARDRAIL_HARM
+  GUARDRAIL_INCONCLUSIVE
+  MANUAL
+  SCHEDULE_ENDED
+  INSUFFICIENT_SAMPLE
+}
+
+model ExperimentDefinition {
+  id                 String           @id @default(uuid())
+  key                String           @unique
+  name               String
+  description        String?
+  status             ExperimentStatus @default(DRAFT)
+  version            Int              @default(1)
+  // Deterministic assignment configuration
+  scope              String           @default("global")
+  salt               String
+  trafficAllocation  Decimal          @default(1) @db.Decimal(5, 4)
+  holdoutPercent     Decimal          @default(0) @db.Decimal(5, 4)
+  variants           Json             @default("[]")
+  exclusionRules     Json             @default("[]")
+  requiresConsent    Boolean          @default(true)
+  // Guardrail analysis configuration
+  primaryMetric      String
+  guardrailMetrics   Json             @default("[]")
+  minimumSample      Int              @default(0)
+  analysisWindowDays Int              @default(14)
+  stopThresholds     Json             @default("{}")
+  startedAt          DateTime?
+  stoppedAt          DateTime?
+  stopReason         ExperimentStopReason?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+  deletedAt          DateTime?
+  assignments        ExperimentAssignment[]
+  exposures          ExperimentExposure[]
+  guardrailSamples   GuardrailMetricSample[]
+
+  @@index([status])
+  @@index([deletedAt])
+}
+
+model ExperimentAssignment {
+  id            String               @id @default(uuid())
+  experimentId  String
+  experiment    ExperimentDefinition @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+  userId        String
+  user          User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  variant       String
+  assignmentVersion Int              @default(1)
+  bucket        Int
+  isHoldout     Boolean              @default(false)
+  assignedAt    DateTime             @default(now())
+  metadata      Json                 @default("{}")
+  exposures     ExperimentExposure[]
+
+  @@unique([experimentId, userId])
+  @@index([experimentId, variant])
+  @@index([userId])
+}
+
+model ExperimentExposure {
+  id           String               @id @default(uuid())
+  experimentId String
+  experiment   ExperimentDefinition @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+  assignmentId String
+  assignment   ExperimentAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  userId       String
+  user         User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  variant      String
+  surface      String
+  sessionId    String?
+  exposedAt    DateTime             @default(now())
+  metadata     Json                 @default("{}")
+
+  @@index([experimentId, exposedAt])
+  @@index([assignmentId])
+  @@index([userId])
+}
+
+model GuardrailMetricSample {
+  id           String               @id @default(uuid())
+  experimentId String
+  experiment   ExperimentDefinition @relation(fields: [experimentId], references: [id], onDelete: Cascade)
+  metric       String
+  variant      String
+  value        Decimal              @db.Decimal(20, 7)
+  sampleCount  Int                  @default(1)
+  windowStart  DateTime
+  windowEnd    DateTime
+  metadata     Json                 @default("{}")
+  createdAt    DateTime             @default(now())
+
+  @@index([experimentId, metric, variant])
+  @@index([windowStart, windowEnd])
+}
+
+model LeaderboardSnapshot {
+  id            String                    @id @default(uuid())
+  leaderboardId String
+  leaderboard   Leaderboard               @relation(fields: [leaderboardId], references: [id], onDelete: Cascade)
+  version       Int
+  generatedAt   DateTime                  @default(now())
+  expiresAt     DateTime
+  entryCount    Int                       @default(0)
+  metadata      Json                      @default("{}")
+  entries       LeaderboardSnapshotEntry[]
+
+  @@unique([leaderboardId, version])
+  @@index([leaderboardId, generatedAt])
+  @@index([expiresAt])
+}
+
+model LeaderboardSnapshotEntry {
+  id         String              @id @default(uuid())
+  snapshotId String
+  snapshot   LeaderboardSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+  userId     String
+  rank       Int
+  score      Decimal             @db.Decimal(20, 7)
+  tieBreak   String
+  metadata   Json                @default("{}")
+
+  @@unique([snapshotId, userId])
+  @@index([snapshotId, rank])
+  @@index([userId])
+}
+
+enum PrivacyDeletionStatus {
+  PENDING
+  IN_PROGRESS
+  AWAITING_RETENTION
+  COMPLETED
+  FAILED
+}
+
+enum PrivacyDeletionTargetStatus {
+  PENDING
+  ACKNOWLEDGED
+  RETRYING
+  FAILED
+  RETAINED
+}
+
+model PrivacyDeletionJob {
+  id             String                @id @default(uuid())
+  userId         String
+  user           User?                 @relation(fields: [userId], references: [id], onDelete: SetNull)
+  status         PrivacyDeletionStatus @default(PENDING)
+  requestedBy    String?
+  reason         String?
+  requestedAt    DateTime              @default(now())
+  completedAt    DateTime?
+  attemptCount   Int                   @default(0)
+  lastAttemptAt  DateTime?
+  metadata       Json                  @default("{}")
+  acknowledgements PrivacyDeletionAcknowledgement[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([requestedAt])
+}
+
+model PrivacyDeletionAcknowledgement {
+  id           String                    @id @default(uuid())
+  jobId        String
+  job          PrivacyDeletionJob        @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  system       String
+  status       PrivacyDeletionTargetStatus @default(PENDING)
+  attemptCount Int                       @default(0)
+  lastAttemptAt DateTime?
+  acknowledgedAt DateTime?
+  retentionUntil DateTime?
+  errorCode    String?
+  metadata     Json                      @default("{}")
+  updatedAt    DateTime                  @updatedAt
+
+  @@unique([jobId, system])
+  @@index([jobId, status])
 }
 

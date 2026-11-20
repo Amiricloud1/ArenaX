@@ -14,7 +14,16 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/Select";
-import { ArrowUp, ArrowDown, ChevronLeft, ChevronRight, Trophy, Loader2 } from "lucide-react";
+import {
+  ArrowUp,
+  ArrowDown,
+  ChevronLeft,
+  ChevronRight,
+  Trophy,
+  Loader2,
+  RefreshCw,
+  Clock,
+} from "lucide-react";
 import type { LeaderboardCategory } from "@/types/leaderboard";
 import { useLeaderboard } from "@/hooks/useLeaderboard";
 
@@ -213,10 +222,16 @@ function LeaderboardContent() {
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState<PageSize>(25);
 
+  // Snapshot pinning: once the first page of a query is loaded we pin its
+  // snapshot id and keep requesting that same snapshot for subsequent pages so
+  // users never move between pages while a refresh happens underneath them.
+  const [pinnedSnapshotId, setPinnedSnapshotId] = useState<string | null>(null);
+
   const handleSeasonChange = useCallback(
     (newSeason: string) => {
       setSeason(newSeason);
       setPage(1);
+      setPinnedSnapshotId(null);
       const params = new URLSearchParams(searchParams.toString());
       if (newSeason === "current") {
         params.delete("season");
@@ -235,21 +250,33 @@ function LeaderboardContent() {
     return () => clearTimeout(t);
   }, [search]);
 
-  // Reset to page 1 whenever filters or search change
+  // Reset to page 1 (and unpin the snapshot) whenever filters or search change
   useEffect(() => {
     setPage(1);
-  }, [category, debouncedSearch, sortBy, sortDir, pageSize]);
+    setPinnedSnapshotId(null);
+  }, [category, debouncedSearch, sortBy, sortDir, pageSize, season]);
 
   const offset = (page - 1) * pageSize;
 
-  // Fetch from the real API via useLeaderboard — search is sent as a query param
+  // Fetch from the real API via useLeaderboard — search is sent as a query param.
+  // The pinned snapshot id is forwarded so every page of a given query resolves
+  // against the same immutable ranking snapshot.
   const { data, isLoading, isFetching, isError, refetch } = useLeaderboard(
     category,
     pageSize,
     offset,
     season,
     debouncedSearch || undefined,
+    pinnedSnapshotId ?? undefined,
   );
+
+  // Pin the snapshot id from the first page of a query (or when the server
+  // hands us a new one, e.g. after an explicit refresh).
+  useEffect(() => {
+    if (data?.snapshotId && data.snapshotId !== pinnedSnapshotId) {
+      setPinnedSnapshotId(data.snapshotId);
+    }
+  }, [data?.snapshotId, pinnedSnapshotId]);
 
   // Derived values
   const entries = data?.entries ?? [];
@@ -257,6 +284,21 @@ function LeaderboardContent() {
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
   const rangeStart = totalCount === 0 ? 0 : offset + 1;
   const rangeEnd = Math.min(offset + pageSize, totalCount);
+
+  // Snapshot metadata surfaced to the user
+  const snapshotId = data?.snapshotId ?? pinnedSnapshotId ?? null;
+  const snapshotVersion = data?.snapshotVersion ?? null;
+  const snapshotGeneratedAt = data?.snapshotGeneratedAt ?? null;
+  const isStale = data?.isStale ?? false;
+  const staleAgeSeconds = data?.staleAgeSeconds ?? null;
+
+  // Explicit refresh: drop the pin so the server can hand us a fresh snapshot,
+  // then refetch. Pagination stays on the same page but resolves against the
+  // new snapshot only after the user asked for it.
+  const handleRefresh = useCallback(() => {
+    setPinnedSnapshotId(null);
+    refetch();
+  }, [refetch]);
 
   // Server handles search — no client-side filter needed
   const visibleEntries = entries;
@@ -292,8 +334,59 @@ function LeaderboardContent() {
           Leaderboard
         </h1>
         <p className="text-muted-foreground">
-          Top performers across ArenaX — updated in real time.
+          Top performers across ArenaX — served from versioned ranking snapshots.
         </p>
+      </div>
+
+      {/* Snapshot metadata / freshness banner */}
+      <div
+        className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 rounded-md border bg-muted/30 px-4 py-2 text-xs text-muted-foreground"
+        role="status"
+        aria-live="polite"
+      >
+        <div className="flex items-center gap-3 flex-wrap">
+          <span className="inline-flex items-center gap-1">
+            <Clock className="h-3.5 w-3.5" aria-hidden="true" />
+            {snapshotGeneratedAt ? (
+              <>
+                Snapshot{" "}
+                <span className="font-mono text-foreground">
+                  {snapshotVersion != null ? `v${snapshotVersion}` : snapshotId?.slice(0, 8)}
+                </span>{" "}
+                generated{" "}
+                <time dateTime={snapshotGeneratedAt}>
+                  {new Date(snapshotGeneratedAt).toLocaleString()}
+                </time>
+              </>
+            ) : (
+              "Snapshot pending…"
+            )}
+          </span>
+          {isStale && (
+            <Badge
+              variant="outline"
+              className="border-amber-300 bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300"
+            >
+              Stale
+              {staleAgeSeconds != null
+                ? ` · ${Math.round(staleAgeSeconds)}s old`
+                : ""}
+            </Badge>
+          )}
+        </div>
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-7 text-xs gap-1 self-start sm:self-auto"
+          onClick={handleRefresh}
+          disabled={isFetching}
+        >
+          <RefreshCw
+            className={`h-3.5 w-3.5 ${isFetching ? "animate-spin" : ""}`}
+            aria-hidden="true"
+          />
+          Refresh
+        </Button>
       </div>
 
       {/* Filters */}
@@ -401,7 +494,7 @@ function LeaderboardContent() {
           {isError ? (
             <div className="py-12 text-center space-y-3">
               <p className="text-muted-foreground">Failed to load leaderboard data.</p>
-              <Button variant="outline" size="sm" onClick={() => refetch()}>
+              <Button variant="outline" size="sm" onClick={handleRefresh}>
                 Try again
               </Button>
             </div>
@@ -578,6 +671,7 @@ function LeaderboardContent() {
                   onPageSizeChange={(s) => {
                     setPageSize(s);
                     setPage(1);
+                    setPinnedSnapshotId(null);
                   }}
                   isLoading={isFetching}
                 />

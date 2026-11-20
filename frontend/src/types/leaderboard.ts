@@ -24,7 +24,27 @@ export interface LeaderboardEntry {
     updatedAt: string
 }
 
-export interface LeaderboardResponse {
+/**
+ * Snapshot metadata attached to every leaderboard response.
+ *
+ * A snapshot is an immutable view of the rankings at a point in time. Clients
+ * must pass `snapshotId` back on subsequent page requests so pagination stays
+ * pinned to the same view and users never move between pages mid-scroll.
+ */
+export interface LeaderboardSnapshotMeta {
+    /** Opaque identifier for the snapshot; echo back to pin pagination. */
+    snapshotId: string
+    /** Monotonically increasing version of the snapshot for this leaderboard. */
+    snapshotVersion: number
+    /** ISO timestamp of when the snapshot was created (data as-of time). */
+    snapshotCreatedAt: string
+    /** True when the snapshot is older than its freshness bound. */
+    stale: boolean
+    /** ISO timestamp after which the snapshot is considered stale. */
+    staleAfter: string
+}
+
+export interface LeaderboardResponse extends LeaderboardSnapshotMeta {
     entries: LeaderboardEntry[]
     totalCount: number
     period: string
@@ -58,7 +78,7 @@ export interface RankHistory {
     history: RankHistoryEntry[]
 }
 
-export interface SeasonalLeaderboard {
+export interface SeasonalLeaderboard extends LeaderboardSnapshotMeta {
     seasonId: string
     seasonName: string
     startDate: string
@@ -67,7 +87,7 @@ export interface SeasonalLeaderboard {
     totalParticipants: number
 }
 
-export interface LeaderboardStats {
+export interface LeaderboardStats extends LeaderboardSnapshotMeta {
     totalPlayers: number
     averageElo: number
     medianElo: number

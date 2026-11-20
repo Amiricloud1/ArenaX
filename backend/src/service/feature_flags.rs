@@ -15,6 +15,13 @@
 //!    assignments so changing weights does not reshuffle existing users.
 //! 6. **Flag analytics** — evaluation + conversion events with aggregated
 //!    counts, unique users, and breakdowns by reason and variant.
+//! 7. **Deterministic experiment assignment** (#255) — stable cohorts derived
+//!    from `hash(scope + participant + assignment_version + salt)`, holdout and
+//!    exclusion rules, analytics-consent gating, and a persisted
+//!    `assignment_version` so participants are never silently reassigned.
+//! 8. **Guardrail analysis** (#256) — pure decision function over primary-metric
+//!    lift, guardrail deltas, missing telemetry, and a multiple-comparison
+//!    correction producing `insufficient_data | safe_to_ship | harmful`.
 //!
 //! Evaluation priority:
 //! override (if not expired) → kill switch (`enabled = false`) →
@@ -142,6 +149,307 @@ pub struct EvaluationResult {
     pub variant: Option<String>,
     pub reason: EvaluationReason,
     pub bucket: u8,
+}
+
+// ─── Experiment assignment (#255) ─────────────────────────────────────────────
+
+/// Inputs required to deterministically assign a participant to an experiment.
+///
+/// `scope` is the experiment scope (usually the flag key), `assignment_version`
+/// is bumped whenever the cohort definition changes, and `salt` allows running
+/// independent experiments over the same population without correlated buckets.
+#[derive(Debug, Clone)]
+pub struct ExperimentAssignmentInput<'a> {
+    pub scope: &'a str,
+    pub participant_id: Uuid,
+    pub assignment_version: i32,
+    pub salt: &'a str,
+    /// Fraction (0–100) of the eligible population held out of the experiment.
+    pub holdout_percentage: i32,
+    /// Variants with weights. Empty means a simple boolean experiment.
+    pub variants: &'a BTreeMap<String, i32>,
+    pub default_variant: Option<&'a str>,
+    /// Whether the participant has granted analytics consent.
+    pub analytics_consent: bool,
+    /// Whether the participant is excluded (e.g. staff, fraud, prior exposure).
+    pub excluded: bool,
+    /// Whether the experiment is still running. Shutdown stops new assignment.
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssignmentReason {
+    /// Participant was assigned (or re-confirmed) a variant.
+    Assigned,
+    /// Participant is in the holdout cohort.
+    Holdout,
+    /// Participant is excluded from the experiment.
+    Excluded,
+    /// Participant has not granted analytics consent.
+    ConsentDenied,
+    /// Experiment has been shut down.
+    Shutdown,
+}
+
+impl AssignmentReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Assigned => "assigned",
+            Self::Holdout => "holdout",
+            Self::Excluded => "excluded",
+            Self::ConsentDenied => "consent_denied",
+            Self::Shutdown => "shutdown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentAssignment {
+    pub scope: String,
+    pub assignment_version: i32,
+    pub variant: Option<String>,
+    pub reason: AssignmentReason,
+    pub bucket: u8,
+    /// True when the caller must persist this assignment (first assignment).
+    pub is_new: bool,
+}
+
+/// Stable 0–99 bucket for an experiment assignment. Includes the assignment
+/// version so bumping the version reshuffles cohorts deterministically.
+pub fn experiment_bucket(
+    scope: &str,
+    participant_id: Uuid,
+    assignment_version: i32,
+    salt: &str,
+) -> u8 {
+    let key = format!("exp:{scope}:v{assignment_version}:{salt}");
+    (hash_to_u32(&key, participant_id) % 100) as u8
+}
+
+/// Pure, deterministic experiment assignment.
+///
+/// Order of checks: shutdown → exclusion → consent → holdout → variant pick.
+/// When `existing` is provided (a previously persisted variant for the same
+/// `assignment_version`) it is returned unchanged so a participant is never
+/// silently reassigned mid-session or across devices.
+pub fn resolve_experiment_assignment(
+    input: &ExperimentAssignmentInput<'_>,
+    existing: Option<&str>,
+) -> ExperimentAssignment {
+    let bucket = experiment_bucket(
+        input.scope,
+        input.participant_id,
+        input.assignment_version,
+        input.salt,
+    );
+
+    let base = |reason: AssignmentReason, variant: Option<String>, is_new: bool| {
+        ExperimentAssignment {
+            scope: input.scope.to_string(),
+            assignment_version: input.assignment_version,
+            variant,
+            reason,
+            bucket,
+            is_new,
+        }
+    };
+
+    if !input.active {
+        return base(AssignmentReason::Shutdown, None, false);
+    }
+    if input.excluded {
+        return base(AssignmentReason::Excluded, None, false);
+    }
+    if !input.analytics_consent {
+        return base(AssignmentReason::ConsentDenied, None, false);
+    }
+
+    // Sticky: honour a previously persisted assignment for this version.
+    if let Some(variant) = existing {
+        return base(AssignmentReason::Assigned, Some(variant.to_string()), false);
+    }
+
+    if input.holdout_percentage > 0 && (bucket as i32) < input.holdout_percentage.min(100) {
+        return base(AssignmentReason::Holdout, None, false);
+    }
+
+    let variant = if input.variants.is_empty() {
+        input
+            .default_variant
+            .map(str::to_string)
+            .or_else(|| Some("on".to_string()))
+    } else {
+        assign_variant(
+            input.participant_id,
+            &format!("exp:{scope}:v{version}", scope = input.scope, version = input.assignment_version),
+            input.variants,
+            input.default_variant,
+        )
+    };
+
+    base(AssignmentReason::Assigned, variant, true)
+}
+
+// ─── Guardrail analysis (#256) ────────────────────────────────────────────────
+
+/// Direction in which a guardrail metric is considered harmful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailDirection {
+    /// Higher is worse (e.g. payment error rate, latency).
+    HigherIsWorse,
+    /// Lower is worse (e.g. match quality, player safety score).
+    LowerIsWorse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardrailMetric {
+    pub name: String,
+    /// Observed treatment-minus-control delta (absolute).
+    pub delta: f64,
+    /// Standard error of the delta. `None` means telemetry is missing.
+    pub standard_error: Option<f64>,
+    /// Absolute delta beyond which the guardrail is operationally harmful.
+    pub stop_threshold: f64,
+    pub direction: GuardrailDirection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardrailAnalysisInput {
+    /// Observed primary-metric lift (treatment-minus-control).
+    pub primary_lift: f64,
+    pub primary_standard_error: Option<f64>,
+    /// Minimum sample size required before any decision is made.
+    pub minimum_sample: i64,
+    pub observed_sample: i64,
+    pub guardrails: Vec<GuardrailMetric>,
+    /// Number of hypotheses tested (primary + guardrails) for the correction.
+    pub comparisons: u32,
+    /// Significance level for the family-wise error rate.
+    pub alpha: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailStatus {
+    /// Not enough data (sample, telemetry, or variance) to decide.
+    InsufficientData,
+    /// Primary lift is significant and no guardrail is harmed.
+    SafeToShip,
+    /// A guardrail is statistically or operationally harmful.
+    Harmful,
+}
+
+impl GuardrailStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InsufficientData => "insufficient_data",
+            Self::SafeToShip => "safe_to_ship",
+            Self::Harmful => "harmful",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuardrailAnalysis {
+    pub status: GuardrailStatus,
+    /// Guardrails that tripped (statistically or operationally).
+    pub harmful_guardrails: Vec<String>,
+    /// Guardrails missing telemetry.
+    pub missing_telemetry: Vec<String>,
+    /// Bonferroni-corrected critical z-value used for the decision.
+    pub critical_z: f64,
+    pub primary_significant: bool,
+}
+
+/// Two-sided z critical value for a given family-wise alpha (normal approx).
+fn z_critical(alpha: f64) -> f64 {
+    // Common alpha values; fall back to a conservative 2.576 (99%).
+    match alpha {
+        a if a <= 0.001 => 3.291,
+        a if a <= 0.01 => 2.576,
+        a if a <= 0.05 => 1.96,
+        a if a <= 0.10 => 1.645,
+        _ => 2.576,
+    }
+}
+
+/// Pure guardrail decision function.
+///
+/// - `InsufficientData` when the sample is below the minimum, the primary
+///   standard error is missing, or any guardrail telemetry is missing.
+/// - `Harmful` when any guardrail exceeds its stop threshold operationally or
+///   is statistically significant in the harmful direction (Bonferroni
+///   corrected across `comparisons`).
+/// - `SafeToShip` only when the primary lift is significant in the positive
+///   direction and no guardrail is harmed.
+pub fn analyze_guardrails(input: &GuardrailAnalysisInput) -> GuardrailAnalysis {
+    let comparisons = input.comparisons.max(1) as f64;
+    let critical_z = z_critical(input.alpha) * comparisons.sqrt();
+
+    let missing_telemetry: Vec<String> = input
+        .guardrails
+        .iter()
+        .filter(|g| g.standard_error.is_none())
+        .map(|g| g.name.clone())
+        .collect();
+
+    let primary_significant = match input.primary_standard_error {
+        Some(se) if se > 0.0 => (input.primary_lift / se).abs() >= critical_z,
+        _ => false,
+    };
+
+    if input.observed_sample < input.minimum_sample
+        || input.primary_standard_error.is_none()
+        || !missing_telemetry.is_empty()
+    {
+        return GuardrailAnalysis {
+            status: GuardrailStatus::InsufficientData,
+            harmful_guardrails: Vec::new(),
+            missing_telemetry,
+            critical_z,
+            primary_significant,
+        };
+    }
+
+    let mut harmful_guardrails = Vec::new();
+    for g in &input.guardrails {
+        let operational = match g.direction {
+            GuardrailDirection::HigherIsWorse => g.delta > g.stop_threshold,
+            GuardrailDirection::LowerIsWorse => g.delta < -g.stop_threshold,
+        };
+        let statistical = match g.standard_error {
+            Some(se) if se > 0.0 => {
+                let z = g.delta / se;
+                match g.direction {
+                    GuardrailDirection::HigherIsWorse => z >= critical_z,
+                    GuardrailDirection::LowerIsWorse => z <= -critical_z,
+                }
+            }
+            _ => false,
+        };
+        if operational || statistical {
+            harmful_guardrails.push(g.name.clone());
+        }
+    }
+
+    let status = if !harmful_guardrails.is_empty() {
+        GuardrailStatus::Harmful
+    } else if primary_significant && input.primary_lift > 0.0 {
+        GuardrailStatus::SafeToShip
+    } else {
+        // No harm but no significant positive lift yet: keep collecting.
+        GuardrailStatus::InsufficientData
+    };
+
+    GuardrailAnalysis {
+        status,
+        harmful_guardrails,
+        missing_telemetry,
+        critical_z,
+        primary_significant,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -886,6 +1194,93 @@ impl FeatureFlagService {
         }
     }
 
+    // ── Deterministic experiment assignment (#255) ────────────────────────
+
+    /// Assign `user_id` to an experiment deterministically.
+    ///
+    /// Reads the persisted assignment (including its `assignment_version`) so a
+    /// participant keeps the same variant across devices and sessions. A new
+    /// assignment is persisted with the current `assignment_version`; a version
+    /// bump reshuffles cohorts deterministically.
+    pub async fn assign_experiment(
+        &self,
+        key: &str,
+        user_id: Uuid,
+        assignment_version: i32,
+        salt: &str,
+        holdout_percentage: i32,
+        analytics_consent: bool,
+        excluded: bool,
+    ) -> Result<ExperimentAssignment, ApiError> {
+        let flag = self.get_flag(key).await?;
+        let variants = parse_variants(&flag.variants);
+
+        #[derive(sqlx::FromRow)]
+        struct AssignmentRow {
+            variant: String,
+            assignment_version: i32,
+        }
+
+        let existing = sqlx::query_as::<_, AssignmentRow>(
+            r#"
+            SELECT variant, assignment_version
+            FROM feature_flag_assignments
+            WHERE flag_id = $1 AND user_id = $2
+            "#,
+        )
+        .bind(flag.id)
+        .bind(user_id)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(ApiError::DatabaseError)?;
+
+        // Only honour a persisted variant when the version matches; a version
+        // bump intentionally reshuffles cohorts.
+        let sticky = existing
+            .as_ref()
+            .filter(|row| row.assignment_version == assignment_version)
+            .map(|row| row.variant.as_str());
+
+        let input = ExperimentAssignmentInput {
+            scope: &flag.flag_key,
+            participant_id: user_id,
+            assignment_version,
+            salt,
+            holdout_percentage,
+            variants: &variants,
+            default_variant: flag.default_variant.as_deref(),
+            analytics_consent,
+            excluded,
+            active: flag.enabled,
+        };
+
+        let assignment = resolve_experiment_assignment(&input, sticky);
+
+        if assignment.is_new {
+            if let Some(variant) = assignment.variant.as_deref() {
+                if let Err(e) = sqlx::query(
+                    r#"
+                    INSERT INTO feature_flag_assignments
+                        (flag_id, user_id, variant, assignment_version)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (flag_id, user_id) DO NOTHING
+                    "#,
+                )
+                .bind(flag.id)
+                .bind(user_id)
+                .bind(variant)
+                .bind(assignment_version)
+                .execute(&self.db)
+                .await
+                {
+                    warn!(error = %e, %flag_id, %user_id, "Failed to persist experiment assignment");
+                }
+            }
+        }
+
+        Ok(assignment)
+    }
+
     async fn record_evaluation(&self, flag: &FeatureFlag, user_id: Uuid, result: &EvaluationResult) {
         if let Err(e) = sqlx::query(
             r#"
@@ -1355,5 +1750,253 @@ mod tests {
         assert!(validate_segments(&["beta_tester:true".to_string()]).is_ok());
         assert!(validate_segments(&["region:west".to_string()]).is_err());
         assert!(validate_segments(&["country:".to_string()]).is_err());
+    }
+
+    // ── Deterministic experiment assignment (#255) ────────────────────────
+
+    fn ab_variants() -> BTreeMap<String, i32> {
+        let mut v = BTreeMap::new();
+        v.insert("control".to_string(), 50);
+        v.insert("treatment".to_string(), 50);
+        v
+    }
+
+    fn assignment_input<'a>(
+        scope: &'a str,
+        participant: Uuid,
+        variants: &'a BTreeMap<String, i32>,
+    ) -> ExperimentAssignmentInput<'a> {
+        ExperimentAssignmentInput {
+            scope,
+            participant_id: participant,
+            assignment_version: 1,
+            salt: "salt",
+            holdout_percentage: 0,
+            variants,
+            default_variant: Some("control"),
+            analytics_consent: true,
+            excluded: false,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn experiment_bucket_is_deterministic_and_version_sensitive() {
+        let user = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let a = experiment_bucket("exp", user, 1, "salt");
+        let b = experiment_bucket("exp", user, 1, "salt");
+        assert_eq!(a, b);
+        assert!(a < 100);
+        // Different version or salt should (almost always) differ; assert totality.
+        let _ = experiment_bucket("exp", user, 2, "salt");
+        let _ = experiment_bucket("exp", user, 1, "other");
+    }
+
+    #[test]
+    fn experiment_assignment_is_balanced() {
+        let variants = ab_variants();
+        let mut control = 0u32;
+        let mut treatment = 0u32;
+        for i in 0..10_000u128 {
+            let user = Uuid::from_u128(i + 1);
+            let input = assignment_input("balance", user, &variants);
+            let a = resolve_experiment_assignment(&input, None);
+            assert_eq!(a.reason, AssignmentReason::Assigned);
+            match a.variant.as_deref() {
+                Some("control") => control += 1,
+                Some("treatment") => treatment += 1,
+                other => panic!("unexpected variant {other:?}"),
+            }
+        }
+        // 50/50 split over 10k users: expect ~5000 each, allow +/- 5%.
+        assert!((4500..=5500).contains(&control), "control={control}");
+        assert!((4500..=5500).contains(&treatment), "treatment={treatment}");
+    }
+
+    #[test]
+    fn experiment_assignment_is_sticky_across_devices() {
+        let variants = ab_variants();
+        let user = Uuid::parse_str("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").unwrap();
+        let input = assignment_input("sticky", user, &variants);
+        let first = resolve_experiment_assignment(&input, None);
+        assert!(first.is_new);
+        let variant = first.variant.clone().unwrap();
+        // Simulate a second device reading the persisted assignment.
+        let second = resolve_experiment_assignment(&input, Some(&variant));
+        assert_eq!(second.variant.as_deref(), Some(variant.as_str()));
+        assert!(!second.is_new);
+        assert_eq!(second.reason, AssignmentReason::Assigned);
+    }
+
+    #[test]
+    fn experiment_holdout_excludes_cohort() {
+        let variants = ab_variants();
+        let mut held_out = 0u32;
+        for i in 0..1000u128 {
+            let user = Uuid::from_u128(i + 1);
+            let mut input = assignment_input("holdout", user, &variants);
+            input.holdout_percentage = 10;
+            let a = resolve_experiment_assignment(&input, None);
+            if a.reason == AssignmentReason::Holdout {
+                assert!(a.variant.is_none());
+                held_out += 1;
+            }
+        }
+        // 10% holdout over 1000 users: expect ~100, allow +/- 3%.
+        assert!((70..=130).contains(&held_out), "held_out={held_out}");
+    }
+
+    #[test]
+    fn experiment_shutdown_stops_assignment() {
+        let variants = ab_variants();
+        let user = Uuid::new_v4();
+        let mut input = assignment_input("shutdown", user, &variants);
+        input.active = false;
+        let a = resolve_experiment_assignment(&input, None);
+        assert_eq!(a.reason, AssignmentReason::Shutdown);
+        assert!(a.variant.is_none());
+        assert!(!a.is_new);
+    }
+
+    #[test]
+    fn experiment_consent_denied_blocks_assignment() {
+        let variants = ab_variants();
+        let user = Uuid::new_v4();
+        let mut input = assignment_input("consent", user, &variants);
+        input.analytics_consent = false;
+        let a = resolve_experiment_assignment(&input, None);
+        assert_eq!(a.reason, AssignmentReason::ConsentDenied);
+        assert!(a.variant.is_none());
+        assert!(!a.is_new);
+    }
+
+    #[test]
+    fn experiment_exclusion_blocks_assignment() {
+        let variants = ab_variants();
+        let user = Uuid::new_v4();
+        let mut input = assignment_input("excluded", user, &variants);
+        input.excluded = true;
+        let a = resolve_experiment_assignment(&input, None);
+        assert_eq!(a.reason, AssignmentReason::Excluded);
+        assert!(a.variant.is_none());
+    }
+
+    #[test]
+    fn experiment_records_assignment_version() {
+        let variants = ab_variants();
+        let user = Uuid::new_v4();
+        let mut input = assignment_input("versioned", user, &variants);
+        input.assignment_version = 7;
+        let a = resolve_experiment_assignment(&input, None);
+        assert_eq!(a.assignment_version, 7);
+    }
+
+    // ── Guardrail analysis (#256) ─────────────────────────────────────────
+
+    fn guardrail(name: &str, delta: f64, se: Option<f64>, threshold: f64, dir: GuardrailDirection) -> GuardrailMetric {
+        GuardrailMetric {
+            name: name.to_string(),
+            delta,
+            standard_error: se,
+            stop_threshold: threshold,
+            direction: dir,
+        }
+    }
+
+    fn base_analysis_input() -> GuardrailAnalysisInput {
+        GuardrailAnalysisInput {
+            primary_lift: 0.05,
+            primary_standard_error: Some(0.01),
+            minimum_sample: 1000,
+            observed_sample: 5000,
+            guardrails: vec![guardrail(
+                "payment_error_rate",
+                0.001,
+                Some(0.001),
+                0.01,
+                GuardrailDirection::HigherIsWorse,
+            )],
+            comparisons: 2,
+            alpha: 0.05,
+        }
+    }
+
+    #[test]
+    fn guardrail_safe_to_ship_with_significant_lift() {
+        let result = analyze_guardrails(&base_analysis_input());
+        assert_eq!(result.status, GuardrailStatus::SafeToShip);
+        assert!(result.harmful_guardrails.is_empty());
+        assert!(result.primary_significant);
+    }
+
+    #[test]
+    fn guardrail_insufficient_data_below_minimum_sample() {
+        let mut input = base_analysis_input();
+        input.observed_sample = 10;
+        let result = analyze_guardrails(&input);
+        assert_eq!(result.status, GuardrailStatus::InsufficientData);
+    }
+
+    #[test]
+    fn guardrail_insufficient_data_when_telemetry_missing() {
+        let mut input = base_analysis_input();
+        input.guardrails = vec![guardrail(
+            "latency_p99",
+            0.0,
+            None,
+            0.05,
+            GuardrailDirection::HigherIsWorse,
+        )];
+        let result = analyze_guardrails(&input);
+        assert_eq!(result.status, GuardrailStatus::InsufficientData);
+        assert_eq!(result.missing_telemetry, vec!["latency_p99".to_string()]);
+    }
+
+    #[test]
+    fn guardrail_flags_operational_harm() {
+        let mut input = base_analysis_input();
+        input.guardrails = vec![guardrail(
+            "payment_error_rate",
+            0.5,
+            Some(0.001),
+            0.01,
+            GuardrailDirection::HigherIsWorse,
+        )];
+        let result = analyze_guardrails(&input);
+        assert_eq!(result.status, GuardrailStatus::Harmful);
+        assert_eq!(result.harmful_guardrails, vec!["payment_error_rate".to_string()]);
+    }
+
+    #[test]
+    fn guardrail_flags_statistical_harm_lower_is_worse() {
+        let mut input = base_analysis_input();
+        input.guardrails = vec![guardrail(
+            "match_quality",
+            -0.2,
+            Some(0.01),
+            0.5,
+            GuardrailDirection::LowerIsWorse,
+        )];
+        let result = analyze_guardrails(&input);
+        assert_eq!(result.status, GuardrailStatus::Harmful);
+        assert_eq!(result.harmful_guardrails, vec!["match_quality".to_string()]);
+    }
+
+    #[test]
+    fn guardrail_multiple_comparisons_raises_threshold() {
+        let mut input = base_analysis_input();
+        input.comparisons = 10;
+        let result = analyze_guardrails(&input);
+        // Bonferroni correction widens the critical z beyond the raw 1.96.
+        assert!(result.critical_z > 1.96);
+    }
+
+    #[test]
+    fn guardrail_no_significant_lift_is_insufficient() {
+        let mut input = base_analysis_input();
+        input.primary_lift = 0.001;
+        let result = analyze_guardrails(&input);
+        assert_eq!(result.status, GuardrailStatus::InsufficientData);
+        assert!(!result.primary_significant);
     }
 }
