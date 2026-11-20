@@ -36,6 +36,9 @@ export interface PrizeDistribution {
   amount?: number;
   label?: string;
   highlight?: string;
+  /** Locale-aware display strings; when absent, renderers fall back to shared formatters. */
+  formattedAmount?: string;
+  formattedPercentage?: string;
 }
 
 export interface BracketMatch {
@@ -55,6 +58,8 @@ export interface BracketMatch {
   nextMatchId?: string;
   previousMatchIds?: string[];
   scheduledTime?: string;
+  /** Locale-aware display string for scheduledTime; renderers fall back to shared formatters. */
+  formattedScheduledTime?: string;
   streamTitle?: string;
   venue?: string;
   notes?: string;
@@ -92,10 +97,45 @@ export interface BracketData {
   currentUserId?: string;
 }
 
+export interface PrizeDistributionOptions {
+  /** BCP 47 locale used for locale-aware amount/percentage formatting. */
+  locale?: string;
+  /** ISO 4217 currency code used for money formatting. */
+  currency?: string;
+}
+
 export function calculatePrizeDistribution(
   totalPrizePool: number,
+  options: PrizeDistributionOptions = {},
 ): PrizeDistribution[] {
-  return [
+  const { locale, currency = "USD" } = options;
+
+  const formatAmount = (amount: number): string | undefined => {
+    if (!locale) return undefined;
+    try {
+      return new Intl.NumberFormat(locale, {
+        style: "currency",
+        currency,
+        maximumFractionDigits: 2,
+      }).format(amount);
+    } catch {
+      return undefined;
+    }
+  };
+
+  const formatPercentage = (percentage: number): string | undefined => {
+    if (!locale) return undefined;
+    try {
+      return new Intl.NumberFormat(locale, {
+        style: "percent",
+        maximumFractionDigits: 2,
+      }).format(percentage / 100);
+    } catch {
+      return undefined;
+    }
+  };
+
+  const tiers: Array<Omit<PrizeDistribution, "formattedAmount" | "formattedPercentage">> = [
     {
       position: 1,
       percentage: 50,
@@ -125,4 +165,11 @@ export function calculatePrizeDistribution(
       highlight: "text-cyan-300",
     },
   ];
+
+  return tiers.map((tier) => ({
+    ...tier,
+    formattedAmount:
+      tier.amount !== undefined ? formatAmount(tier.amount) : undefined,
+    formattedPercentage: formatPercentage(tier.percentage),
+  }));
 }

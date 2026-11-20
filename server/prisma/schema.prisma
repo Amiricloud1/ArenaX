@@ -16,6 +16,12 @@ model User {
   isVerified    Boolean   @default(false)
   bio           String?
   socials       Json?
+  avatarUrl     String?
+  avatarThumbUrl String?
+  avatarProcessingState String @default("NONE") // NONE, PENDING, PROCESSING, READY, FAILED
+  avatarModerationStatus String @default("UNREVIEWED") // UNREVIEWED, APPROVED, REJECTED
+  avatarProcessingError String?
+  avatarUpdatedAt DateTime?
   walletAddress String?   @unique
   verificationToken        String?   @unique
   verificationTokenExpires DateTime?
@@ -61,6 +67,8 @@ model User {
   @@index([providerId])
   @@index([verificationToken])
   @@index([passwordResetToken])
+  @@index([avatarProcessingState])
+  @@index([avatarModerationStatus])
 }
 
 enum AchievementCategory {

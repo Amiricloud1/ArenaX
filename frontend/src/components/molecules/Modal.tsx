@@ -5,6 +5,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useReducedMotion } from "@/hooks/useReducedMotion";
+import { useGamepadNavigation } from "@/hooks/useGamepadNavigation";
+import { useActionDedup } from "@/hooks/useActionDedup";
 
 interface ModalProps {
   isOpen: boolean;
@@ -58,6 +60,12 @@ export function Modal({
   const modalRef = useRef<HTMLDivElement>(null);
   const previousActiveElement = useRef<HTMLElement | null>(null);
   const prefersReducedMotion = useReducedMotion();
+  const { dedupe } = useActionDedup();
+
+  // Deduplicated close handler so gamepad/keyboard/pointer cannot double-fire
+  const requestClose = useCallback(() => {
+    dedupe("modal:close", onClose);
+  }, [dedupe, onClose]);
 
   // Store previously focused element when modal opens
   useEffect(() => {
@@ -65,6 +73,15 @@ export function Modal({
       previousActiveElement.current = document.activeElement as HTMLElement;
     }
   }, [isOpen]);
+
+  // Gamepad/switch navigation: focus trap, pointer-free exit, visible focus
+  useGamepadNavigation({
+    containerRef: modalRef,
+    enabled: isOpen,
+    onCancel: closeOnEscape ? requestClose : undefined,
+    trapFocus: true,
+    restoreFocusRef: previousActiveElement,
+  });
 
   // Focus management: trap focus within modal
   useEffect(() => {
@@ -116,7 +133,7 @@ export function Modal({
 
     const handleEscape = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        onClose();
+        requestClose();
       }
     };
 
@@ -125,7 +142,7 @@ export function Modal({
     return () => {
       document.removeEventListener("keydown", handleEscape);
     };
-  }, [isOpen, closeOnEscape, onClose]);
+  }, [isOpen, closeOnEscape, requestClose]);
 
   // Prevent body scroll when modal is open
   useEffect(() => {
@@ -143,10 +160,10 @@ export function Modal({
   const handleOverlayClick = useCallback(
     (e: React.MouseEvent) => {
       if (e.target === e.currentTarget && closeOnOverlayClick) {
-        onClose();
+        requestClose();
       }
     },
-    [onClose, closeOnOverlayClick]
+    [requestClose, closeOnOverlayClick]
   );
 
   const motionProps = prefersReducedMotion
@@ -202,8 +219,11 @@ export function Modal({
             <motion.div
               ref={modalRef}
               {...contentMotionProps}
+              tabIndex={-1}
+              data-gamepad-container="true"
               className={cn(
                 "bg-background border rounded-lg shadow-xl pointer-events-auto w-full",
+                "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
                 sizeClasses[size],
                 className
               )}
@@ -221,8 +241,9 @@ export function Modal({
                   )}
                   {showCloseButton && (
                     <button
-                      onClick={onClose}
-                      className="text-muted-foreground hover:text-foreground transition-colors p-1 rounded-md hover:bg-muted"
+                      onClick={requestClose}
+                      data-gamepad-action="close"
+                      className="text-muted-foreground hover:text-foreground transition-colors p-1 rounded-md hover:bg-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                       aria-label="Close modal"
                     >
                       <X className="h-5 w-5" />
@@ -276,6 +297,13 @@ export function useModalStack() {
       setModalStack((prev) => prev.slice(0, -1));
     }
   }, [modalStack]);
+
+  // Gamepad/switch: cancel closes only the top-most modal
+  useGamepadNavigation({
+    enabled: modalStack.length > 0,
+    onCancel: closeModal,
+    trapFocus: false,
+  });
 
   return {
     modalStack,
