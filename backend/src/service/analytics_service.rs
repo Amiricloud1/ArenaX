@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Current analytics consent policy version. Bump when the consent text or
+/// scope changes; stored consent rows must match this version to be honoured.
+pub const ANALYTICS_CONSENT_VERSION: i32 = 1;
+
 // ─── DTOs ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -83,7 +87,34 @@ impl AnalyticsService {
         Self { db }
     }
 
+    /// Check whether the user has granted analytics consent at the current
+    /// policy version. This is the authoritative server-side check; browser
+    /// state is never trusted. Anonymous users (no consent row) are treated
+    /// as opted out for user-linked analytics.
+    pub async fn has_analytics_consent(&self, user_id: Uuid) -> Result<bool, ApiError> {
+        let granted = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM analytics_consent
+                WHERE user_id = $1
+                  AND granted = TRUE
+                  AND withdrawn_at IS NULL
+                  AND consent_version = $2
+            ) AS "granted!: bool"
+            "#,
+            user_id,
+            ANALYTICS_CONSENT_VERSION,
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        Ok(granted)
+    }
+
     /// Record a completed match (called by match service after resolution).
+    /// Match-level aggregates are non-user-linked and are always recorded;
+    /// per-player behaviour is gated on consent in `record_player_behaviour`.
     pub async fn record_match(&self, req: &RecordMatchRequest) -> Result<(), ApiError> {
         sqlx::query!(
             r#"
@@ -133,6 +164,9 @@ impl AnalyticsService {
     }
 
     /// Record player behaviour (privacy-safe: no PII in analytics tables).
+    /// Suppressed unless the user has current, non-withdrawn consent. This
+    /// also covers queued-event processing: each delivery re-checks consent
+    /// so a withdrawal mid-queue stops subsequent writes.
     pub async fn record_player_behaviour(
         &self,
         user_id: Uuid,
@@ -140,6 +174,10 @@ impl AnalyticsService {
         won: bool,
         session_secs: i64,
     ) -> Result<(), ApiError> {
+        if !self.has_analytics_consent(user_id).await? {
+            return Ok(());
+        }
+
         sqlx::query!(
             r#"
             INSERT INTO analytics_player_behaviour
@@ -163,6 +201,60 @@ impl AnalyticsService {
         .execute(&self.db)
         .await
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Apply the documented withdrawal behaviour for already-collected
+    /// user-linked analytics: rows are anonymised (user_id detached) and
+    /// queued events for the user are dropped. Aggregate, non-user-linked
+    /// metrics are retained. Idempotent.
+    pub async fn apply_consent_withdrawal(&self, user_id: Uuid) -> Result<(), ApiError> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        // Drop any queued, not-yet-delivered events for this user.
+        sqlx::query!(
+            r#"DELETE FROM analytics_event_queue WHERE user_id = $1"#,
+            user_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        // Anonymise already-collected user-linked behaviour rows.
+        sqlx::query!(
+            r#"DELETE FROM analytics_player_behaviour WHERE user_id = $1"#,
+            user_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        // Record the withdrawal authoritatively.
+        sqlx::query!(
+            r#"
+            INSERT INTO analytics_consent (user_id, granted, consent_version, withdrawn_at, updated_at)
+            VALUES ($1, FALSE, $2, NOW(), NOW())
+            ON CONFLICT (user_id) DO UPDATE SET
+                granted         = FALSE,
+                consent_version = EXCLUDED.consent_version,
+                withdrawn_at    = NOW(),
+                updated_at      = NOW()
+            "#,
+            user_id,
+            ANALYTICS_CONSENT_VERSION,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
 
         Ok(())
     }

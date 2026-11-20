@@ -1,8 +1,7 @@
 "use client";
 
-import { useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { PageError } from "@/components/common/PageError";
+import { RouteErrorBoundary } from "@/components/common/RouteErrorBoundary";
 
 export default function MatchHubError({
   error,
@@ -13,18 +12,18 @@ export default function MatchHubError({
 }) {
   const router = useRouter();
 
-  useEffect(() => {
-    console.error("[MatchHubPage]", error);
-  }, [error]);
-
   return (
-    <div className="min-h-screen bg-background flex items-center justify-center px-4">
-      <PageError
-        title="Failed to load match"
-        message="We couldn't fetch the match data. The match may no longer exist or there was a connection issue."
-        onRetry={reset}
-        retryLabel="Reload match"
-      />
-    </div>
+    <RouteErrorBoundary
+      error={error}
+      reset={reset}
+      context="matches/[id]"
+      title="Failed to load match"
+      message="We couldn't fetch the match data. The match may no longer exist or there was a connection issue."
+      retryLabel="Reload match"
+      secondaryAction={{
+        label: "Back to matches",
+        onClick: () => router.push("/matches"),
+      }}
+    />
   );
 }

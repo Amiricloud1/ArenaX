@@ -1,7 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
-import { PageError } from "@/components/common/PageError";
+import { RouteErrorBoundary } from "@/components/common/RouteErrorBoundary";
 
 export default function DashboardError({
   error,
@@ -10,17 +9,13 @@ export default function DashboardError({
   error: Error & { digest?: string };
   reset: () => void;
 }) {
-  useEffect(() => {
-    console.error("[DashboardPage]", error);
-  }, [error]);
-
   return (
-    <div className="flex min-h-[60vh] items-center justify-center">
-      <PageError
-        title="Dashboard unavailable"
-        message="We couldn't load your dashboard data. Try refreshing the page."
-        onRetry={reset}
-      />
-    </div>
+    <RouteErrorBoundary
+      error={error}
+      reset={reset}
+      routeGroup="dashboard"
+      title="Dashboard unavailable"
+      message="We couldn't load your dashboard data. Try refreshing the page."
+    />
   );
 }

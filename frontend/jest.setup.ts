@@ -79,6 +79,48 @@ if (typeof global.ResizeObserver === "undefined") {
   } as unknown as typeof ResizeObserver;
 }
 
+// jsdom doesn't implement crypto.randomUUID — provide a deterministic fallback
+// so error boundaries can mint correlation IDs in tests.
+if (typeof globalThis.crypto === "undefined") {
+  (globalThis as { crypto?: unknown }).crypto = {};
+}
+if (typeof globalThis.crypto.randomUUID !== "function") {
+  let uuidCounter = 0;
+  Object.defineProperty(globalThis.crypto, "randomUUID", {
+    writable: true,
+    configurable: true,
+    value: () => {
+      uuidCounter += 1;
+      const suffix = uuidCounter.toString(16).padStart(12, "0");
+      return `00000000-0000-4000-8000-${suffix}`;
+    },
+  });
+}
+
+// Provide a fetch stub for analytics API route tests. Suites that need to
+// assert on requests override `global.fetch` themselves.
+if (typeof global.fetch === "undefined") {
+  global.fetch = jest.fn(async () =>
+    new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  ) as unknown as typeof fetch;
+}
+
+// Reset consent and session storage between tests so consent-transition and
+// logout flows start from a clean, deterministic state.
+beforeEach(() => {
+  if (typeof window !== "undefined") {
+    try {
+      window.localStorage.clear();
+      window.sessionStorage.clear();
+    } catch {
+      // Storage may be unavailable in some jsdom configurations.
+    }
+  }
+});
+
 // Global next/navigation mock so components using useRouter, useSearchParams,
 // or usePathname (such as MatchHistory) mount cleanly in tests without requiring
 // every single test suite to manually declare the same mock.

@@ -1,7 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
-import { PageError } from "@/components/common/PageError";
+import { RouteErrorBoundary } from "@/components/common/RouteErrorBoundary";
 
 export default function GovernanceError({
   error,
@@ -10,17 +9,13 @@ export default function GovernanceError({
   error: Error & { digest?: string };
   reset: () => void;
 }) {
-  useEffect(() => {
-    console.error("[GovernancePage]", error);
-  }, [error]);
-
   return (
-    <div className="flex min-h-[60vh] items-center justify-center">
-      <PageError
-        title="Failed to load governance"
-        message="We couldn't fetch governance proposals. Check your connection and try again."
-        onRetry={reset}
-      />
-    </div>
+    <RouteErrorBoundary
+      error={error}
+      reset={reset}
+      routeGroup="governance"
+      title="Failed to load governance"
+      message="We couldn't fetch governance proposals. Check your connection and try again."
+    />
   );
 }

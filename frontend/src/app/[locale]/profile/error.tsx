@@ -1,7 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
-import { PageError } from "@/components/common/PageError";
+import { RouteErrorBoundary } from "@/components/common/RouteErrorBoundary";
 
 export default function ProfileError({
   error,
@@ -10,17 +9,13 @@ export default function ProfileError({
   error: Error & { digest?: string };
   reset: () => void;
 }) {
-  useEffect(() => {
-    console.error("[ProfilePage]", error);
-  }, [error]);
-
   return (
-    <div className="flex min-h-[60vh] items-center justify-center">
-      <PageError
-        title="Failed to load profile"
-        message="We couldn't fetch your profile data. Try refreshing the page."
-        onRetry={reset}
-      />
-    </div>
+    <RouteErrorBoundary
+      error={error}
+      reset={reset}
+      routeGroup="profile"
+      title="Failed to load profile"
+      message="We couldn't fetch your profile data. Try refreshing the page."
+    />
   );
 }

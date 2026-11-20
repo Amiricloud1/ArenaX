@@ -57,10 +57,31 @@ const nextConfig = {
   // can be uploaded to Datadog (Issue #1100). The upload runs as `postbuild`.
   productionBrowserSourceMaps: true,
   experimental: {
-    optimizePackageImports: ["lucide-react", "framer-motion", "recharts", "@tanstack/react-query"],
+    optimizePackageImports: [
+      "lucide-react",
+      "framer-motion",
+      "recharts",
+      "@tanstack/react-query",
+      // Heavy feature modules (#247): barrel imports are rewritten to
+      // per-symbol imports so only the used code lands in the route chunk.
+      "@stellar/stellar-sdk",
+    ],
   },
-  
+
   // Webpack configuration for code splitting
+  //
+  // ── Server/client boundary for heavy feature modules (#247) ─────────────
+  // Governance, analytics and game-only modules are *client* code. They must
+  // never be imported from a Server Component, middleware, or any module that
+  // runs on the server: private/financial state stays server-authoritative and
+  // is fetched through the API boundary, never bundled into these chunks.
+  //
+  // On the client, these modules are only reachable via `next/dynamic`
+  // (or an equivalent lazy import) from the route/interaction that needs them.
+  // The cache groups below isolate them into async-only chunks: `chunks:
+  // 'async'` plus `enforce: true` guarantees webpack will not hoist them into
+  // the shared entry chunk, so public entry routes never download them.
+  // ────────────────────────────────────────────────────────────────────────
   webpack: (config, { isServer }) => {
     // Split chunks for better caching
     if (!isServer) {
@@ -71,6 +92,43 @@ const nextConfig = {
           cacheGroups: {
             default: false,
             vendors: false,
+            // ── Heavy feature chunks (#247) ──────────────────────────────
+            // Async-only: these groups are restricted to `chunks: 'async'`
+            // and `enforce: true`, so they are emitted as separate lazy
+            // chunks and never merged into the shared entry bundle.
+            featureGovernance: {
+              name: 'feature-governance',
+              chunks: 'async',
+              test: /[\\/]src[\\/](features|components|app)[\\/](governance|proposals|voting|dao)[\\/]/,
+              priority: 45,
+              enforce: true,
+              reuseExistingChunk: true,
+            },
+            featureAnalytics: {
+              name: 'feature-analytics',
+              chunks: 'async',
+              test: /[\\/]src[\\/](features|components|app)[\\/](analytics|charts|insights|metrics)[\\/]/,
+              priority: 45,
+              enforce: true,
+              reuseExistingChunk: true,
+            },
+            featureGame: {
+              name: 'feature-game',
+              chunks: 'async',
+              test: /[\\/]src[\\/](features|components|app)[\\/](game|games|play|arena)[\\/]/,
+              priority: 45,
+              enforce: true,
+              reuseExistingChunk: true,
+            },
+            // Chart libraries are only used by analytics/game routes; keep
+            // them async-only so entry routes don't pay for recharts/d3.
+            charts: {
+              name: 'charts',
+              chunks: 'async',
+              test: /[\\/]node_modules[\\/](recharts|d3-)[\\/]/,
+              priority: 33,
+              enforce: true,
+            },
             // Framework chunks
             framework: {
               name: 'framework',
@@ -95,18 +153,11 @@ const nextConfig = {
               priority: 34,
               enforce: true,
             },
-            // Chart library chunks
-            charts: {
-              name: 'charts',
-              chunks: 'all',
-              test: /[\\/]node_modules[\\/](recharts|d3-)[\\/]/,
-              priority: 33,
-              enforce: true,
-            },
-            // Stellar SDK chunks
+            // Stellar SDK chunks — async-only (#247): only wallet/transaction
+            // interactions need the SDK, so it must not sit in the entry chunk.
             stellar: {
               name: 'stellar',
-              chunks: 'all',
+              chunks: 'async',
               test: /[\\/]node_modules[\\/](@stellar)[\\/]/,
               priority: 32,
               enforce: true,
@@ -149,6 +200,9 @@ const nextConfig = {
       },
     ];
   },
+  // Bundle budget regression check (#247): `npm run build` writes the
+  // bundle-analysis artifact, and `scripts/check-bundle-budget.mjs` fails the
+  // build when a route exceeds its documented transfer/LCP budget.
   async rewrites() {
     const apiUrl = process.env.NEXT_PUBLIC_API_URL;
     if (apiUrl) {

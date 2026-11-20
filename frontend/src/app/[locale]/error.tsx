@@ -1,8 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
-import { PageError } from "@/components/common/PageError";
-import { logError } from "@/lib/errorLogger";
+import { RouteErrorBoundary } from "@/components/common/RouteErrorBoundary";
 
 export default function RootError({
   error,
@@ -11,15 +9,13 @@ export default function RootError({
   error: Error & { digest?: string };
   reset: () => void;
 }) {
-  useEffect(() => {
-    logError(error, { digest: error.digest });
-  }, [error]);
-
   return (
-    <PageError
+    <RouteErrorBoundary
+      error={error}
+      reset={reset}
+      routeGroup="root"
       title="Something went wrong"
-      message={error.message}
-      onRetry={reset}
+      message="We couldn't load this page. Please try again or return to the home page."
       retryLabel="Try again"
     />
   );
