@@ -152,6 +152,52 @@ export class AnalyticsService {
 
     this.adapters.forEach((a) => a.track(payload));
   }
+
+  // ── Operational observability ─────────────────────────────────────────────
+  // These helpers funnel client-side consistency flows (realtime resync,
+  // offline queue, optimistic reconciliation, auth redirects) through the
+  // same consent gate and adapter fan-out as regular tracking. They never
+  // carry secrets (tokens, raw URLs, payload bodies) — only coarse metadata.
+
+  /** A realtime snapshot/event gap was detected and a resync was requested. */
+  trackRealtimeResync(props: {
+    reason: "gap" | "stale_event" | "reconnect" | "retention_expired";
+    streamId?: string;
+    expectedSeq?: number;
+    receivedSeq?: number;
+    watermark?: number;
+  }): void {
+    this.track("realtime_resync", { ...props });
+  }
+
+  /** An offline command could not be replayed cleanly. */
+  trackOfflineQueueConflict(props: {
+    commandType: string;
+    conflictStrategy: string;
+    outcome: "conflict" | "expired" | "rejected" | "duplicate";
+    resource?: string;
+  }): void {
+    this.track("offline_queue_conflict", { ...props });
+  }
+
+  /** An optimistic mutation was rolled back or reconciled with the server. */
+  trackOptimisticRollback(props: {
+    mutation: string;
+    reason: "timeout" | "validation_error" | "conflict" | "reordered" | "superseded";
+    resource?: string;
+    hadIdempotencyKey?: boolean;
+  }): void {
+    this.track("optimistic_rollback", { ...props });
+  }
+
+  /** A validated post-auth return destination was restored (or rejected). */
+  trackAuthRedirectRestore(props: {
+    flow: "login" | "register" | "oauth_callback";
+    outcome: "restored" | "rejected" | "expired" | "unavailable";
+    locale?: string;
+  }): void {
+    this.track("auth_redirect_restore", { ...props });
+  }
 }
 
 // Singleton

@@ -262,6 +262,11 @@ impl IdempotencyMiddleware {
     }
 
     /// Build a 422 Unprocessable Entity response for hash conflicts.
+    ///
+    /// The response is explicitly marked as a conflict so offline clients can
+    /// reconcile (surface the conflict to the user) instead of silently
+    /// overwriting newer server state. It also carries replay indicators so
+    /// the client can distinguish a conflict from a fresh server response.
     fn build_conflict_response(&self, original_hash: &str, new_hash: &str) -> HttpResponse {
         let error_body = json!({
             "error": "IdempotencyKeyConflict",
@@ -269,10 +274,15 @@ impl IdempotencyMiddleware {
             "message": "Idempotency key reused with different request parameters",
             "original_request_hash": original_hash,
             "new_request_hash": new_hash,
+            "conflict": true,
+            "replayed": false,
             "resolution": "Use a new idempotency key for this request with different parameters"
         });
 
-        HttpResponse::UnprocessableEntity().json(error_body)
+        HttpResponse::UnprocessableEntity()
+            .insert_header(("Idempotency-Replayed", "false"))
+            .insert_header(("Idempotency-Conflict", "true"))
+            .json(error_body)
     }
 
     /// Build cached response with appropriate headers.
@@ -299,8 +309,10 @@ impl IdempotencyMiddleware {
             }
         }
 
-        // Mark as replayed
+        // Mark as replayed so the client can reconcile against newer server
+        // state rather than treating the cached body as authoritative.
         response.insert_header(("Idempotency-Replayed", "true"));
+        response.insert_header(("Idempotency-Conflict", "false"));
 
         response.json(&cached.body)
     }
@@ -476,9 +488,14 @@ where
             }
 
             // Step 9: Return response with Idempotency-Replayed: false header
+            // (and an explicit non-conflict indicator for reconciliation).
             let (req, mut res) = response.into_parts();
             res.headers_mut().insert(
                 actix_web::http::header::HeaderName::from_static("idempotency-replayed"),
+                actix_web::http::header::HeaderValue::from_static("false"),
+            );
+            res.headers_mut().insert(
+                actix_web::http::header::HeaderName::from_static("idempotency-conflict"),
                 actix_web::http::header::HeaderValue::from_static("false"),
             );
             Ok(dev::ServiceResponse::new(req, res).map_into_left_body())
@@ -547,6 +564,66 @@ mod tests {
         let size_kb = cached.size_kb();
         assert!(size_kb > 0);
     }
+
+    #[test]
+    fn test_conflict_response_marks_conflict_and_replay_headers() {
+        let middleware = IdempotencyMiddleware {
+            policy: IdempotencyPolicy::default(),
+            redis_conn: None,
+            db_pool: None,
+            metrics: IdempotencyMetrics::new(),
+        };
+
+        let response = middleware.build_conflict_response("hash-a", "hash-b");
+        assert_eq!(response.status(), actix_web::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response
+                .headers()
+                .get("Idempotency-Conflict")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("Idempotency-Replayed")
+                .and_then(|v| v.to_str().ok()),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn test_cached_response_marks_replayed_and_non_conflict() {
+        let middleware = IdempotencyMiddleware {
+            policy: IdempotencyPolicy::default(),
+            redis_conn: None,
+            db_pool: None,
+            metrics: IdempotencyMetrics::new(),
+        };
+
+        let cached = CachedResponse::new(
+            "hash123".to_string(),
+            200,
+            json!({"content-type": "application/json"}),
+            json!({"data": "test"}),
+        );
+
+        let response = middleware.build_cached_response_http(&cached);
+        assert_eq!(
+            response
+                .headers()
+                .get("Idempotency-Replayed")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("Idempotency-Conflict")
+                .and_then(|v| v.to_str().ok()),
+            Some("false")
+        );
+    }
 }
 
 
@@ -605,6 +682,18 @@ mod integration_tests {
         // - Response: 422 Unprocessable Entity
         // - metrics.increment_conflicts() called
         // - Message: "Idempotency key reused with different request parameters"
+        // - Headers: Idempotency-Conflict: true, Idempotency-Replayed: false
+        // - Body includes conflict: true so the client surfaces a recoverable
+        //   conflict instead of overwriting newer server state.
+    }
+
+    /// Test scenario: Replayed offline command with mismatched payload surfaces conflict
+    #[test]
+    fn test_replayed_offline_command_mismatch_surfaces_conflict() {
+        // Offline queue replays command with Idempotency-Key=X, payload P1
+        // Server previously processed Idempotency-Key=X with payload P2
+        // - Response: 422 with Idempotency-Conflict: true
+        // - Client must reconcile (refetch) rather than overwrite server state
     }
 
     /// Test scenario: PUT requests also support idempotency

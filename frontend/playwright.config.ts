@@ -2,6 +2,9 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./e2e",
+  // The state-sync project owns its own specs; keep them out of the default
+  // chromium projects so each scenario runs exactly once per run.
+  testIgnore: /state-sync\/.*\.spec\.ts/,
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
@@ -45,6 +48,16 @@ export default defineConfig({
     {
       name: "chromium-mobile",
       use: { ...devices["Pixel 5"] },
+    },
+    {
+      // Browser-level coverage for realtime snapshot/event reconciliation,
+      // the offline command queue, optimistic rollback, and deep-link
+      // preservation. These specs drive the app through mocked network and
+      // websocket boundaries, so they run on a single deterministic project
+      // and are excluded from the visual-regression projects above.
+      name: "state-sync",
+      testMatch: /state-sync\/.*\.spec\.ts/,
+      use: { ...devices["Desktop Chrome"] },
     },
   ],
   webServer: {

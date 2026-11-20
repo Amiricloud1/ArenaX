@@ -52,6 +52,78 @@ On connect, you are automatically subscribed to your own user channel (`user:<yo
 
 All events are JSON objects with a `type` discriminator field.
 
+### Sequence fields (watermark)
+
+Every server → client event carries a monotonically increasing sequence number for its channel:
+
+```json
+{
+  "type": "balance_update",
+  "channel": "user:550e8400-...",
+  "seq": 1042,
+  "timestamp": "2026-04-24T12:00:00Z"
+}
+```
+
+- `seq` is scoped per channel and increases by exactly 1 for each event published to that channel.
+- Events are only guaranteed to be retained for a limited window (see [Event retention](#event-retention)). A client that falls behind the retention window cannot be replayed and must fetch a fresh snapshot.
+
+---
+
+## Bootstrap Protocol (snapshot + stream)
+
+REST snapshot endpoints return a `stream` watermark alongside the data. The watermark identifies the last event sequence number reflected in the snapshot, so the client can apply subsequent WebSocket events without gaps or duplicates.
+
+### Snapshot response shape
+
+```json
+{
+  "data": { "...": "..." },
+  "stream": {
+    "channel": "user:550e8400-...",
+    "seq": 1042
+  }
+}
+```
+
+- `stream.channel` is the channel the watermark applies to.
+- `stream.seq` is the sequence number of the last event already included in `data`. Events with `seq <= stream.seq` are already reflected in the snapshot and **must be discarded** by the client.
+
+### Client algorithm
+
+1. Open the WebSocket and subscribe to the channel(s) **before** (or concurrently with) fetching the snapshot, buffering any events received.
+2. Fetch the snapshot and read `stream.seq` as the watermark.
+3. Apply buffered events with `seq > watermark` in ascending `seq` order. Discard events with `seq <= watermark` (stale) and any event whose `seq` was already applied (duplicate).
+4. For each subsequent event, expect `seq === lastAppliedSeq + 1`:
+   - **Match** → apply the event and set `lastAppliedSeq = seq`.
+   - **Gap** (`seq > lastAppliedSeq + 1`) → a message was missed. Stop applying events, request a replacement snapshot (see below), and re-run the bootstrap from step 2.
+   - **Stale/duplicate** (`seq <= lastAppliedSeq`) → discard the event; do not re-apply optimistic updates.
+
+### Requesting a replacement snapshot
+
+When a gap is detected, or when the server reports that the requested sequence has expired, the client must re-bootstrap rather than guessing:
+
+```json
+{ "type": "resync", "channel": "user:550e8400-...", "from_seq": 1042 }
+```
+
+The server responds with a `resync_required` event if the requested `from_seq` is older than the retention window, after which the client should re-fetch the REST snapshot:
+
+```json
+{
+  "type": "resync_required",
+  "channel": "user:550e8400-...",
+  "oldest_retained_seq": 2000,
+  "timestamp": "2026-04-24T12:00:00Z"
+}
+```
+
+> Replacement snapshots are authoritative. Any optimistic updates applied locally since the last snapshot must be reconciled against the replacement snapshot instead of being replayed on top of it.
+
+### Event retention
+
+Events are retained per channel for **5 minutes** (or the last **10,000** events, whichever is smaller). A `resync` request for a `from_seq` older than the oldest retained sequence returns `resync_required`; the client must then fetch a fresh snapshot.
+
 ### `balance_update`
 Fired when the user's wallet balance changes.
 ```json
@@ -128,6 +200,17 @@ In-app notification pushed in real time.
 }
 ```
 
+### `resync_required`
+Sent in response to a `resync` request whose `from_seq` is older than the retention window. The client must fetch a fresh snapshot.
+```json
+{
+  "type": "resync_required",
+  "channel": "user:550e8400-...",
+  "oldest_retained_seq": 2000,
+  "timestamp": "2026-04-24T12:00:00Z"
+}
+```
+
 ### `error`
 Sent when the server cannot process a client message.
 ```json
@@ -156,6 +239,12 @@ Sent when the server cannot process a client message.
 { "type": "ping" }
 ```
 
+### `resync`
+Request replay from a given sequence number. If `from_seq` is older than the retention window, the server replies with `resync_required`.
+```json
+{ "type": "resync", "channel": "user:<uuid>", "from_seq": 1042 }
+```
+
 ---
 
 ## JavaScript Example
@@ -170,8 +259,25 @@ ws.onopen = () => {
   ws.send(JSON.stringify({ type: 'subscribe', channel: 'match:550e8400-...' }));
 };
 
+// lastAppliedSeq is seeded from the REST snapshot's stream.seq watermark.
+let lastAppliedSeq = null;
+
 ws.onmessage = ({ data }) => {
   const event = JSON.parse(data);
+  if (typeof event.seq === 'number') {
+    if (lastAppliedSeq === null) {
+      // Snapshot not yet loaded: buffer until bootstrap completes.
+      buffer.push(event);
+      return;
+    }
+    if (event.seq <= lastAppliedSeq) return; // stale or duplicate
+    if (event.seq > lastAppliedSeq + 1) {
+      // Gap detected: request a replacement snapshot.
+      ws.send(JSON.stringify({ type: 'resync', channel: event.channel, from_seq: lastAppliedSeq }));
+      return;
+    }
+    lastAppliedSeq = event.seq;
+  }
   switch (event.type) {
     case 'match_found':
       console.log('Match found!', event.match_id);
@@ -181,6 +287,10 @@ ws.onmessage = ({ data }) => {
       break;
     case 'notification':
       showToast(event.title, event.body);
+      break;
+    case 'resync_required':
+      // Retention expired: re-fetch the REST snapshot and re-bootstrap.
+      refetchSnapshot();
       break;
   }
 };
@@ -212,3 +322,7 @@ function connect() {
 ```
 
 > If the access token expires while connected, the server will close the connection. Refresh the token before reconnecting.
+
+### Reconnect and re-bootstrap
+
+After a reconnect, the client must not assume its `lastAppliedSeq` is still valid. Re-run the bootstrap protocol: fetch a fresh snapshot, read its `stream.seq` watermark, and discard any buffered events with `seq <= watermark`. If the server cannot replay from `lastAppliedSeq` (retention expired), it responds with `resync_required` and the client fetches a replacement snapshot.

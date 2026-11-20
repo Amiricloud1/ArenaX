@@ -95,3 +95,110 @@ jest.mock("next/navigation", () => ({
   useSearchParams: () => new URLSearchParams(),
   useParams: () => ({ locale: "en" }),
 }));
+
+// ---------------------------------------------------------------------------
+// Realtime snapshot / event-stream helpers
+// ---------------------------------------------------------------------------
+// Tests need a deterministic clock and a controllable websocket so they can
+// simulate sequence gaps, out-of-order delivery, reconnect, and retention
+// expiry without real timers or network access.
+
+if (typeof global.WebSocket === "undefined") {
+  class TestWebSocket {
+    static readonly CONNECTING = 0;
+    static readonly OPEN = 1;
+    static readonly CLOSING = 2;
+    static readonly CLOSED = 3;
+
+    readonly url: string;
+    readyState = TestWebSocket.CONNECTING;
+    onopen: ((ev: unknown) => void) | null = null;
+    onclose: ((ev: unknown) => void) | null = null;
+    onerror: ((ev: unknown) => void) | null = null;
+    onmessage: ((ev: { data: string }) => void) | null = null;
+    sent: string[] = [];
+
+    constructor(url: string) {
+      this.url = url;
+    }
+
+    send(data: string): void {
+      this.sent.push(data);
+    }
+
+    close(): void {
+      this.readyState = TestWebSocket.CLOSED;
+      this.onclose?.({});
+    }
+
+    // Test-only helpers.
+    open(): void {
+      this.readyState = TestWebSocket.OPEN;
+      this.onopen?.({});
+    }
+
+    emit(payload: unknown): void {
+      this.onmessage?.({ data: JSON.stringify(payload) });
+    }
+  }
+  (globalThis as { WebSocket?: unknown }).WebSocket = TestWebSocket;
+}
+
+// ---------------------------------------------------------------------------
+// Offline command queue helpers
+// ---------------------------------------------------------------------------
+// Provide a minimal in-memory localStorage when jsdom omits it (e.g. in node
+// test environments) so the scoped offline queue can persist and purge commands.
+
+if (typeof global.localStorage === "undefined") {
+  class MemoryStorage implements Storage {
+    private store = new Map<string, string>();
+
+    get length(): number {
+      return this.store.size;
+    }
+
+    clear(): void {
+      this.store.clear();
+    }
+
+    getItem(key: string): string | null {
+      return this.store.has(key) ? (this.store.get(key) as string) : null;
+    }
+
+    key(index: number): string | null {
+      return Array.from(this.store.keys())[index] ?? null;
+    }
+
+    removeItem(key: string): void {
+      this.store.delete(key);
+    }
+
+    setItem(key: string, value: string): void {
+      this.store.set(key, String(value));
+    }
+  }
+  (globalThis as { localStorage?: unknown }).localStorage = new MemoryStorage();
+}
+
+// ---------------------------------------------------------------------------
+// Return-destination validator helpers
+// ---------------------------------------------------------------------------
+// jsdom's default origin is http://localhost; pin it so redirect validation
+// tests have a stable, local-only base to compare against.
+
+if (typeof window !== "undefined" && !window.location.origin) {
+  Object.defineProperty(window, "location", {
+    writable: true,
+    value: { ...window.location, origin: "http://localhost" },
+  });
+}
+
+// Reset per-test state that leaks between suites: queued offline commands,
+// pending optimistic mutations, and any stubbed realtime sockets.
+afterEach(() => {
+  if (typeof global.localStorage !== "undefined") {
+    global.localStorage.clear();
+  }
+  jest.clearAllMocks();
+});

@@ -27,6 +27,49 @@ export interface StandardResponse<T = unknown> {
   message?: string;
   /** Request-scoped metadata injected by the interceptor. */
   meta: ResponseMeta;
+  /**
+   * Optional realtime metadata. Present on snapshot responses that are
+   * backed by an event stream, so clients can bootstrap a consistent view
+   * and then apply subsequent events from the declared sequence window.
+   */
+  realtime?: RealtimeSnapshotMeta;
+}
+
+/**
+ * Realtime bootstrap metadata attached to snapshot responses.
+ *
+ * A snapshot response declares the stream it belongs to and the sequence
+ * watermark up to which its payload is authoritative. Clients must:
+ *  - discard any event whose `seq` is `<= watermark` (already reflected),
+ *  - detect gaps when an event's `seq` is greater than `watermark + 1`
+ *    (or the last applied sequence) and request a replacement snapshot,
+ *  - reject events from a different `streamId` or an older `snapshotVersion`.
+ */
+export interface RealtimeSnapshotMeta {
+  /** Identifier of the event stream this snapshot belongs to. */
+  streamId: string;
+  /**
+   * Sequence number of the last event already reflected in `data`.
+   * Subsequent events with `seq > watermark` may be applied on top.
+   */
+  watermark: number;
+  /**
+   * Convenience alias for `watermark`; the stream sequence from which
+   * subsequent events can be applied. When both are present they must match.
+   */
+  streamSeq?: number;
+  /**
+   * Monotonic version of the snapshot itself. A snapshot with a lower
+   * version than one already applied must be rejected as stale.
+   */
+  snapshotVersion?: number;
+  /** ISO-8601 timestamp when the snapshot was generated server-side. */
+  generatedAt?: string;
+  /**
+   * How long (ms) the server retains events for replay from `watermark`.
+   * Clients that reconnect after this window must request a fresh snapshot.
+   */
+  retentionMs?: number;
 }
 
 /**

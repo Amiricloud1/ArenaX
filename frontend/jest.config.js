@@ -7,6 +7,15 @@ module.exports = {
     "<rootDir>/e2e/",
     "<rootDir>/.next/",
   ],
+  // Collect coverage from the new realtime/offline/optimistic/redirect modules
+  // as well as the existing client and data-boundary code.
+  collectCoverageFrom: [
+    "src/**/*.{ts,tsx,js,jsx}",
+    "!src/**/*.d.ts",
+    "!src/**/__tests__/**",
+    "!src/**/*.test.{ts,tsx,js,jsx}",
+    "!src/**/*.spec.{ts,tsx,js,jsx}",
+  ],
   moduleNameMapper: {
     "^@/(.*)$": "<rootDir>/src/$1",
     "\\.(css|less|scss|sass)$": "<rootDir>/__mocks__/styleMock.js",
@@ -29,4 +38,21 @@ module.exports = {
   globals: {
     NODE_OPTIONS: "--unhandled-rejections=warn",
   },
+  // Explicitly enumerate the test roots for the new feature areas so that
+  // realtime sequencing, offline queue, optimistic reconciliation, and
+  // return-destination validation suites are always discovered even if they
+  // live outside the default `src` tree.
+  roots: [
+    "<rootDir>/src",
+    "<rootDir>/__tests__",
+  ],
+  testMatch: [
+    "<rootDir>/src/**/__tests__/**/*.{ts,tsx,js,jsx}",
+    "<rootDir>/src/**/?(*.)+(spec|test).{ts,tsx,js,jsx}",
+    "<rootDir>/__tests__/**/*.{ts,tsx,js,jsx}",
+    "<rootDir>/__tests__/realtime/**/*.{ts,tsx,js,jsx}",
+    "<rootDir>/__tests__/offline/**/*.{ts,tsx,js,jsx}",
+    "<rootDir>/__tests__/optimistic/**/*.{ts,tsx,js,jsx}",
+    "<rootDir>/__tests__/auth/**/*.{ts,tsx,js,jsx}",
+  ],
 };
