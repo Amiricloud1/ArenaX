@@ -1,5 +1,25 @@
 -- Revert Idempotency Framework and User/Elo schema alignment
 
+-- Revert analytics ingestion, identity stitching, and metric catalog tables
+DROP INDEX IF EXISTS idx_analytics_metric_catalog_owner;
+DROP INDEX IF EXISTS idx_analytics_metric_catalog_deprecated;
+DROP INDEX IF EXISTS idx_analytics_metric_catalog_name_unique;
+DROP TABLE IF EXISTS analytics_metric_catalog;
+
+DROP INDEX IF EXISTS idx_analytics_identity_links_subject;
+DROP INDEX IF EXISTS idx_analytics_identity_links_anonymous;
+DROP INDEX IF EXISTS idx_analytics_identity_links_purpose;
+DROP TABLE IF EXISTS analytics_identity_links;
+
+DROP INDEX IF EXISTS idx_analytics_event_rejections_event_id;
+DROP INDEX IF EXISTS idx_analytics_event_rejections_received_at;
+DROP TABLE IF EXISTS analytics_event_rejections;
+
+DROP INDEX IF EXISTS idx_analytics_events_producer_event_id;
+DROP INDEX IF EXISTS idx_analytics_events_occurred_at;
+DROP INDEX IF EXISTS idx_analytics_events_schema_version;
+DROP TABLE IF EXISTS analytics_events;
+
 DROP VIEW IF EXISTS route_idempotency_stats;
 DROP VIEW IF EXISTS idempotency_conflicts;
 DROP VIEW IF EXISTS idempotency_usage_stats;

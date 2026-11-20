@@ -222,3 +222,172 @@ pub struct IdempotencyMetricsSnapshot {
     pub redis_errors: u64,
     pub hit_rate: f64,
 }
+
+/// Outcome recorded at the analytics ingestion boundary for a single event.
+///
+/// Every producer assigns a stable `event_id`; the ingestion boundary persists
+/// exactly one outcome per `event_id` so retries converge to a single accepted
+/// event and malformed payloads land in a diagnosable rejection path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalyticsIngestionOutcome {
+    /// Event passed validation and was durably accepted.
+    Accepted,
+    /// Event was rejected; see `AnalyticsRejectionReason`.
+    Rejected,
+}
+
+/// Why an analytics event was rejected at the ingestion boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalyticsRejectionReason {
+    /// Payload could not be parsed (invalid JSON, wrong types, etc.).
+    MalformedPayload,
+    /// Payload parsed but failed schema validation.
+    SchemaInvalid,
+    /// Event schema version is not supported by the ingestion boundary.
+    UnsupportedSchemaVersion,
+    /// Event ID was missing or not a stable identifier.
+    InvalidEventId,
+    /// Producer is not authorized to submit analytics events.
+    Unauthorized,
+    /// Event timestamp was outside the accepted window.
+    StaleTimestamp,
+}
+
+impl AnalyticsRejectionReason {
+    /// Stable machine-readable code used for diagnostics and metrics.
+    pub fn code(&self) -> &'static str {
+        match self {
+            AnalyticsRejectionReason::MalformedPayload => "malformed_payload",
+            AnalyticsRejectionReason::SchemaInvalid => "schema_invalid",
+            AnalyticsRejectionReason::UnsupportedSchemaVersion => "unsupported_schema_version",
+            AnalyticsRejectionReason::InvalidEventId => "invalid_event_id",
+            AnalyticsRejectionReason::Unauthorized => "unauthorized",
+            AnalyticsRejectionReason::StaleTimestamp => "stale_timestamp",
+        }
+    }
+}
+
+/// Durable record of an analytics ingestion decision keyed by event identity.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct AnalyticsIngestionRecord {
+    pub id: Uuid,
+    /// Producer-assigned stable event identifier.
+    pub event_id: String,
+    /// Producer identifier (e.g. client instance or service name).
+    pub producer_id: String,
+    /// Schema version of the submitted event payload.
+    pub schema_version: i32,
+    /// Hash of the canonical payload, used to detect conflicting retries.
+    pub payload_hash: String,
+    pub outcome: AnalyticsIngestionOutcome,
+    /// Present only when `outcome` is `Rejected`.
+    pub rejection_reason: Option<AnalyticsRejectionReason>,
+    /// Human-readable diagnostic detail for rejected events.
+    pub rejection_detail: Option<String>,
+    pub received_at: DateTime<Utc>,
+    pub processed_at: Option<DateTime<Utc>>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl AnalyticsIngestionRecord {
+    /// Build an accepted record for a validated event.
+    pub fn accepted(
+        event_id: String,
+        producer_id: String,
+        schema_version: i32,
+        payload_hash: String,
+        ttl_seconds: i64,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            event_id,
+            producer_id,
+            schema_version,
+            payload_hash,
+            outcome: AnalyticsIngestionOutcome::Accepted,
+            rejection_reason: None,
+            rejection_detail: None,
+            received_at: now,
+            processed_at: Some(now),
+            expires_at: now + chrono::Duration::seconds(ttl_seconds),
+        }
+    }
+
+    /// Build a rejected record for a malformed or schema-invalid event.
+    pub fn rejected(
+        event_id: String,
+        producer_id: String,
+        schema_version: i32,
+        payload_hash: String,
+        reason: AnalyticsRejectionReason,
+        detail: Option<String>,
+        ttl_seconds: i64,
+    ) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::new_v4(),
+            event_id,
+            producer_id,
+            schema_version,
+            payload_hash,
+            outcome: AnalyticsIngestionOutcome::Rejected,
+            rejection_reason: Some(reason),
+            rejection_detail: detail,
+            received_at: now,
+            processed_at: Some(now),
+            expires_at: now + chrono::Duration::seconds(ttl_seconds),
+        }
+    }
+
+    pub fn is_accepted(&self) -> bool {
+        self.outcome == AnalyticsIngestionOutcome::Accepted
+    }
+
+    pub fn is_rejected(&self) -> bool {
+        self.outcome == AnalyticsIngestionOutcome::Rejected
+    }
+}
+
+/// Result of attempting to record an analytics event at the ingestion boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalyticsIngestionResult {
+    /// First time this event ID was seen and it was accepted.
+    Accepted(AnalyticsIngestionRecord),
+    /// First time this event ID was seen and it was rejected.
+    Rejected(AnalyticsIngestionRecord),
+    /// Event ID already recorded; the stored outcome is returned unchanged.
+    Duplicate(AnalyticsIngestionRecord),
+    /// Same event ID arrived with a different payload hash.
+    Conflict {
+        event_id: String,
+        original_hash: String,
+        new_hash: String,
+    },
+}
+
+impl AnalyticsIngestionResult {
+    /// The stored record, if any, for replay/inspection.
+    pub fn record(&self) -> Option<&AnalyticsIngestionRecord> {
+        match self {
+            AnalyticsIngestionResult::Accepted(record)
+            | AnalyticsIngestionResult::Rejected(record)
+            | AnalyticsIngestionResult::Duplicate(record) => Some(record),
+            AnalyticsIngestionResult::Conflict { .. } => None,
+        }
+    }
+
+    /// Whether the event is durably accepted (including duplicate replays).
+    pub fn is_accepted(&self) -> bool {
+        matches!(
+            self,
+            AnalyticsIngestionResult::Accepted(_) | AnalyticsIngestionResult::Duplicate(_)
+        ) && self
+            .record()
+            .map(|record| record.is_accepted())
+            .unwrap_or(false)
+    }
+}

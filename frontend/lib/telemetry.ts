@@ -70,6 +70,23 @@ const SENSITIVE_KEY_PATTERNS: RegExp[] = [
   /evidence/i,
   /payload/i,
   /body/i,
+  // Analytics identity stitching (issue #252): raw auth identifiers and
+  // identity-link material must never reach spans, logs, or Sentry/Datadog.
+  /^user[-_]?id$/i,
+  /^account[-_]?id$/i,
+  /^session[-_]?id$/i,
+  /^anonymous[-_]?id$/i,
+  /^anon[-_]?id$/i,
+  /^device[-_]?id$/i,
+  /^distinct[-_]?id$/i,
+  /^identity[-_]?id$/i,
+  /identity[-_]?link/i,
+  /stitch/i,
+  /^email$/i,
+  /^phone$/i,
+  /^wallet[-_]?address$/i,
+  /^ip[-_]?address$/i,
+  /^remote[-_]?addr$/i,
 ];
 
 const REDACTED = "[REDACTED]";
@@ -211,4 +228,93 @@ export function buildTelemetryEvent(
     event: name,
     context: redact(context),
   };
+}
+
+/** Outcome of a single analytics ingestion attempt (issue #251). */
+export type IngestionOutcome = "accepted" | "duplicate" | "rejected";
+
+/** Reason a batch or event was rejected; safe to emit (no payload contents). */
+export type IngestionRejectionReason =
+  | "schema_invalid"
+  | "schema_version_unsupported"
+  | "malformed"
+  | "unauthorized"
+  | "rate_limited"
+  | "internal_error";
+
+export interface IngestionOutcomeCounts {
+  accepted: number;
+  duplicate: number;
+  rejected: number;
+}
+
+export interface IngestionOutcomeSummary extends IngestionOutcomeCounts {
+  /** Rejection counts keyed by reason; never includes event payloads. */
+  rejectedByReason: Partial<Record<IngestionRejectionReason, number>>;
+  /** Number of distinct batches observed in this summary. */
+  batches: number;
+}
+
+/**
+ * Accumulates analytics ingestion outcomes so operators can observe accepted,
+ * deduplicated, and rejected events without exposing payload contents.
+ *
+ * Only counts and enumerated reasons are retained; event IDs, identity links,
+ * and raw payloads are intentionally never stored here.
+ */
+export class IngestionOutcomeRecorder {
+  private counts: IngestionOutcomeCounts = {
+    accepted: 0,
+    duplicate: 0,
+    rejected: 0,
+  };
+  private rejectedByReason: Partial<Record<IngestionRejectionReason, number>> =
+    {};
+  private batches = 0;
+
+  record(outcome: IngestionOutcome, count = 1): void {
+    if (!Number.isFinite(count) || count <= 0) return;
+    const safeCount = Math.floor(count);
+    if (outcome === "accepted") this.counts.accepted += safeCount;
+    else if (outcome === "duplicate") this.counts.duplicate += safeCount;
+    else this.counts.rejected += safeCount;
+  }
+
+  recordRejection(reason: IngestionRejectionReason, count = 1): void {
+    if (!Number.isFinite(count) || count <= 0) return;
+    const safeCount = Math.floor(count);
+    this.counts.rejected += safeCount;
+    this.rejectedByReason[reason] =
+      (this.rejectedByReason[reason] ?? 0) + safeCount;
+  }
+
+  recordBatch(): void {
+    this.batches += 1;
+  }
+
+  summary(): IngestionOutcomeSummary {
+    return {
+      ...this.counts,
+      rejectedByReason: { ...this.rejectedByReason },
+      batches: this.batches,
+    };
+  }
+}
+
+/**
+ * Emit an ingestion outcome summary as a telemetry event. The summary contains
+ * only counts and enumerated reasons, so it is safe to attach to spans/logs.
+ */
+export function buildIngestionOutcomeEvent(
+  summary: IngestionOutcomeSummary,
+  context: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return buildTelemetryEvent("analytics.ingestion.outcome", {
+    ...context,
+    accepted: summary.accepted,
+    duplicate: summary.duplicate,
+    rejected: summary.rejected,
+    batches: summary.batches,
+    rejected_by_reason: summary.rejectedByReason,
+  });
 }

@@ -379,3 +379,251 @@ ALTER TABLE api_key_usage_logs ALTER COLUMN scopes_used SET NOT NULL;
 -- Align reputation_events
 ALTER TABLE reputation_events ALTER COLUMN user_id SET NOT NULL;
 
+-- ============================================================================
+-- Analytics ingestion: durable event identity and deduplication (#251)
+-- ============================================================================
+
+-- Accepted analytics events. The (producer_id, event_id) unique constraint is
+-- the deduplication boundary: retries of the same producer event converge to a
+-- single accepted row regardless of delivery order or producer restarts.
+CREATE TABLE IF NOT EXISTS analytics_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    producer_id VARCHAR(128) NOT NULL,
+    event_id VARCHAR(128) NOT NULL,
+    event_name VARCHAR(128) NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    -- Pseudonymous subject reference; never a raw auth identifier.
+    subject_id UUID,
+    session_id UUID,
+    properties JSONB NOT NULL DEFAULT '{}'::jsonb,
+    payload_hash VARCHAR(64) NOT NULL,
+    CONSTRAINT analytics_events_producer_event_unique UNIQUE (producer_id, event_id),
+    CONSTRAINT analytics_events_schema_version_positive CHECK (schema_version > 0),
+    CONSTRAINT analytics_events_event_name_not_empty CHECK (length(event_name) > 0)
+);
+
+CREATE INDEX IF NOT EXISTS idx_analytics_events_producer_event
+    ON analytics_events(producer_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_analytics_events_event_name_occurred
+    ON analytics_events(event_name, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_events_occurred_at
+    ON analytics_events(occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_events_received_at
+    ON analytics_events(received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_events_subject_occurred
+    ON analytics_events(subject_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_events_session_occurred
+    ON analytics_events(session_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_events_schema_version
+    ON analytics_events(schema_version);
+
+-- Diagnosable rejection path for malformed or schema-invalid events. Rejected
+-- deliveries are recorded (not silently dropped) so operators can inspect and
+-- replay them. A rejection is keyed by producer+event so repeated bad retries
+-- increment attempt_count instead of flooding the table.
+CREATE TABLE IF NOT EXISTS analytics_event_rejections (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    producer_id VARCHAR(128) NOT NULL,
+    event_id VARCHAR(128),
+    event_name VARCHAR(128),
+    schema_version INTEGER,
+    rejection_code VARCHAR(64) NOT NULL,
+    rejection_reason TEXT NOT NULL,
+    raw_payload JSONB,
+    payload_hash VARCHAR(64),
+    attempt_count INTEGER NOT NULL DEFAULT 1,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ,
+    resolved_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    CONSTRAINT analytics_event_rejections_producer_event_unique
+        UNIQUE (producer_id, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_analytics_event_rejections_producer_event
+    ON analytics_event_rejections(producer_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_analytics_event_rejections_code
+    ON analytics_event_rejections(rejection_code);
+CREATE INDEX IF NOT EXISTS idx_analytics_event_rejections_last_seen
+    ON analytics_event_rejections(last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_event_rejections_unresolved
+    ON analytics_event_rejections(last_seen_at DESC)
+    WHERE resolved_at IS NULL;
+
+-- ============================================================================
+-- Privacy-safe identity stitching (#252)
+-- ============================================================================
+
+-- Links a pseudonymous analytics subject to an authenticated account. Stored
+-- separately from event payloads so exports never expose raw auth identifiers.
+-- Consent state and purpose limit how a link may be used; unlink/merge are
+-- deterministic via the status + effective/ended timestamps.
+CREATE TABLE IF NOT EXISTS analytics_identity_links (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    -- Pseudonymous subject id used in analytics_events.subject_id.
+    subject_id UUID NOT NULL,
+    -- Pseudonymous account reference (never the raw user id in exports).
+    account_ref UUID NOT NULL,
+    -- Internal FK used only for server-side authorization/merge resolution.
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    purpose VARCHAR(64) NOT NULL,
+    consent_state VARCHAR(16) NOT NULL DEFAULT 'pending',
+    consent_version VARCHAR(32),
+    consent_granted_at TIMESTAMPTZ,
+    consent_withdrawn_at TIMESTAMPTZ,
+    status VARCHAR(16) NOT NULL DEFAULT 'active',
+    -- Deterministic merge: when two subjects resolve to one account the
+    -- surviving link is canonical and merged links point at it.
+    canonical_link_id UUID REFERENCES analytics_identity_links(id) ON DELETE SET NULL,
+    merged_into_link_id UUID REFERENCES analytics_identity_links(id) ON DELETE SET NULL,
+    effective_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ended_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT analytics_identity_links_consent_state_valid
+        CHECK (consent_state IN ('pending', 'granted', 'withdrawn')),
+    CONSTRAINT analytics_identity_links_status_valid
+        CHECK (status IN ('active', 'merged', 'unlinked', 'expired')),
+    CONSTRAINT analytics_identity_links_purpose_not_empty
+        CHECK (length(purpose) > 0)
+);
+
+-- At most one active link per (subject, purpose) so stitching is deterministic.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_analytics_identity_links_active_subject_purpose
+    ON analytics_identity_links(subject_id, purpose)
+    WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_analytics_identity_links_subject
+    ON analytics_identity_links(subject_id);
+CREATE INDEX IF NOT EXISTS idx_analytics_identity_links_account_ref
+    ON analytics_identity_links(account_ref);
+CREATE INDEX IF NOT EXISTS idx_analytics_identity_links_user
+    ON analytics_identity_links(user_id);
+CREATE INDEX IF NOT EXISTS idx_analytics_identity_links_purpose_status
+    ON analytics_identity_links(purpose, status);
+CREATE INDEX IF NOT EXISTS idx_analytics_identity_links_consent
+    ON analytics_identity_links(consent_state);
+CREATE INDEX IF NOT EXISTS idx_analytics_identity_links_canonical
+    ON analytics_identity_links(canonical_link_id);
+CREATE INDEX IF NOT EXISTS idx_analytics_identity_links_effective
+    ON analytics_identity_links(effective_at, ended_at);
+
+-- ============================================================================
+-- Governed metric catalog (#253) and query budgets (#254)
+-- ============================================================================
+
+-- Single source of truth for metric definitions referenced by dashboards.
+-- Duplicate active names are rejected by a partial unique index so CI and the
+-- database agree on what "duplicate" means.
+CREATE TABLE IF NOT EXISTS analytics_metric_catalog (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    metric_name VARCHAR(128) NOT NULL,
+    display_name VARCHAR(255) NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    owner VARCHAR(128) NOT NULL,
+    -- Canonical query definition (SQL or structured query) for the metric.
+    query_definition TEXT NOT NULL,
+    -- Source events/tables the metric reads from.
+    source_events TEXT[] NOT NULL DEFAULT '{}',
+    source_tables TEXT[] NOT NULL DEFAULT '{}',
+    -- Freshness target in seconds; dashboards exceeding it must show stale.
+    freshness_target_seconds INTEGER NOT NULL DEFAULT 3600,
+    -- Latency budget in milliseconds for the dashboard query.
+    latency_budget_ms INTEGER NOT NULL DEFAULT 5000,
+    -- Bounded time range enforced on dashboard queries.
+    max_time_range_seconds INTEGER NOT NULL DEFAULT 2592000,
+    privacy_class VARCHAR(32) NOT NULL DEFAULT 'internal',
+    deprecation_state VARCHAR(16) NOT NULL DEFAULT 'active',
+    deprecated_at TIMESTAMPTZ,
+    replacement_metric_name VARCHAR(128),
+    definition_hash VARCHAR(64) NOT NULL,
+    reviewed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    reviewed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT analytics_metric_catalog_privacy_class_valid
+        CHECK (privacy_class IN ('public', 'internal', 'confidential', 'restricted')),
+    CONSTRAINT analytics_metric_catalog_deprecation_state_valid
+        CHECK (deprecation_state IN ('active', 'deprecated', 'retired')),
+    CONSTRAINT analytics_metric_catalog_budgets_positive
+        CHECK (freshness_target_seconds > 0 AND latency_budget_ms > 0 AND max_time_range_seconds > 0)
+);
+
+-- Only one active definition per metric name; deprecated/retired rows may
+-- coexist for history.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_analytics_metric_catalog_active_name
+    ON analytics_metric_catalog(metric_name)
+    WHERE deprecation_state = 'active';
+CREATE INDEX IF NOT EXISTS idx_analytics_metric_catalog_name
+    ON analytics_metric_catalog(metric_name);
+CREATE INDEX IF NOT EXISTS idx_analytics_metric_catalog_owner
+    ON analytics_metric_catalog(owner);
+CREATE INDEX IF NOT EXISTS idx_analytics_metric_catalog_deprecation
+    ON analytics_metric_catalog(deprecation_state);
+CREATE INDEX IF NOT EXISTS idx_analytics_metric_catalog_definition_hash
+    ON analytics_metric_catalog(definition_hash);
+CREATE INDEX IF NOT EXISTS idx_analytics_metric_catalog_source_events
+    ON analytics_metric_catalog USING GIN (source_events);
+CREATE INDEX IF NOT EXISTS idx_analytics_metric_catalog_source_tables
+    ON analytics_metric_catalog USING GIN (source_tables);
+
+-- Records each dashboard query execution against a catalogued metric so
+-- budget breaches are observable and can surface a stale/incomplete state.
+CREATE TABLE IF NOT EXISTS analytics_query_budget_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    metric_id UUID REFERENCES analytics_metric_catalog(id) ON DELETE SET NULL,
+    metric_name VARCHAR(128) NOT NULL,
+    dashboard_id VARCHAR(128),
+    requested_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    time_range_seconds INTEGER NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    row_count BIGINT NOT NULL DEFAULT 0,
+    data_freshness_seconds INTEGER,
+    latency_budget_exceeded BOOLEAN NOT NULL DEFAULT FALSE,
+    freshness_budget_exceeded BOOLEAN NOT NULL DEFAULT FALSE,
+    time_range_exceeded BOOLEAN NOT NULL DEFAULT FALSE,
+    outcome VARCHAR(16) NOT NULL DEFAULT 'ok',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT analytics_query_budget_events_outcome_valid
+        CHECK (outcome IN ('ok', 'stale', 'incomplete', 'timeout', 'error'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_analytics_query_budget_events_metric_created
+    ON analytics_query_budget_events(metric_name, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_query_budget_events_created
+    ON analytics_query_budget_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analytics_query_budget_events_breaches
+    ON analytics_query_budget_events(created_at DESC)
+    WHERE latency_budget_exceeded OR freshness_budget_exceeded OR time_range_exceeded;
+CREATE INDEX IF NOT EXISTS idx_analytics_query_budget_events_outcome
+    ON analytics_query_budget_events(outcome);
+
+-- Keep metric catalog updated_at fresh.
+CREATE OR REPLACE FUNCTION update_analytics_metric_catalog_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS update_analytics_metric_catalog_updated_at ON analytics_metric_catalog;
+CREATE TRIGGER update_analytics_metric_catalog_updated_at
+    BEFORE UPDATE ON analytics_metric_catalog
+    FOR EACH ROW EXECUTE FUNCTION update_analytics_metric_catalog_updated_at();
+
+-- Keep identity link updated_at fresh.
+CREATE OR REPLACE FUNCTION update_analytics_identity_link_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS update_analytics_identity_link_updated_at ON analytics_identity_links;
+CREATE TRIGGER update_analytics_identity_link_updated_at
+    BEFORE UPDATE ON analytics_identity_links
+    FOR EACH ROW EXECUTE FUNCTION update_analytics_identity_link_updated_at();
+

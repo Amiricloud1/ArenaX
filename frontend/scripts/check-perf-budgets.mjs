@@ -15,6 +15,7 @@ const rootDir = path.resolve(__dirname, '..');
 
 const budgetFile = path.join(rootDir, 'lighthouse-budget.json');
 const rcFile = path.join(rootDir, 'lighthouserc.json');
+const queryBudgetFile = path.join(rootDir, 'analytics-query-budgets.json');
 
 console.log('🔍 Validating frontend performance budgets...');
 
@@ -54,5 +55,80 @@ for (const req of requiredAssertions) {
     process.exit(1);
   }
 }
+
+// Verify analytics dashboard query budgets (#254)
+if (!fs.existsSync(queryBudgetFile)) {
+  console.error('❌ Missing analytics-query-budgets.json');
+  process.exit(1);
+}
+
+const queryBudgets = JSON.parse(fs.readFileSync(queryBudgetFile, 'utf8'));
+const queries = Array.isArray(queryBudgets.queries) ? queryBudgets.queries : [];
+
+if (queries.length === 0) {
+  console.error('❌ analytics-query-budgets.json declares no dashboard queries');
+  process.exit(1);
+}
+
+const requiredQueryFields = [
+  'id',
+  'latencyTargetMs',
+  'freshnessTargetMs',
+  'maxRangeDays',
+  'maxPageSize',
+];
+
+const seenQueryIds = new Set();
+const queryErrors = [];
+
+for (const query of queries) {
+  const label = query?.id || '<unnamed query>';
+
+  for (const field of requiredQueryFields) {
+    if (query?.[field] === undefined || query?.[field] === null) {
+      queryErrors.push(`${label}: missing ${field}`);
+    }
+  }
+
+  if (typeof query?.latencyTargetMs === 'number' && !(query.latencyTargetMs > 0)) {
+    queryErrors.push(`${label}: latencyTargetMs must be > 0`);
+  }
+
+  if (typeof query?.freshnessTargetMs === 'number' && !(query.freshnessTargetMs > 0)) {
+    queryErrors.push(`${label}: freshnessTargetMs must be > 0`);
+  }
+
+  if (typeof query?.maxRangeDays === 'number' && !(query.maxRangeDays > 0)) {
+    queryErrors.push(`${label}: maxRangeDays must be > 0`);
+  }
+
+  if (typeof query?.maxPageSize === 'number' && !(query.maxPageSize > 0)) {
+    queryErrors.push(`${label}: maxPageSize must be > 0`);
+  }
+
+  if (query?.id) {
+    if (seenQueryIds.has(query.id)) {
+      queryErrors.push(`${label}: duplicate query id`);
+    }
+    seenQueryIds.add(query.id);
+  }
+}
+
+const requiredQueryIds = queryBudgets.requiredQueries || [];
+for (const requiredId of requiredQueryIds) {
+  if (!seenQueryIds.has(requiredId)) {
+    queryErrors.push(`missing required dashboard query: ${requiredId}`);
+  }
+}
+
+if (queryErrors.length > 0) {
+  console.error('❌ Analytics dashboard query budget violations:');
+  for (const err of queryErrors) {
+    console.error(`   - ${err}`);
+  }
+  process.exit(1);
+}
+
+console.log(`✅ Validated ${queries.length} analytics dashboard query budget(s).`);
 
 console.log('✅ All performance budget configuration checks passed successfully.');

@@ -1,5 +1,8 @@
 // Service layer module for ArenaX
 pub mod achievement_service;
+pub mod analytics_budget_service;
+pub mod analytics_catalog_service;
+pub mod analytics_identity_service;
 pub mod analytics_service;
 pub mod api_key_service;
 pub mod audit_service;
@@ -38,6 +41,15 @@ pub mod wallet_service;
 
 pub use crate::realtime::event_bus::EventBus;
 pub use achievement_service::AchievementService;
+pub use analytics_budget_service::{
+    AnalyticsBudgetService, BudgetEvaluation, BudgetStatus, QueryBudget,
+};
+pub use analytics_catalog_service::{
+    AnalyticsCatalogService, CatalogEntry, CatalogError, MetricPrivacyClass,
+};
+pub use analytics_identity_service::{
+    AnalyticsIdentityService, IdentityLink, IdentityLinkError, IdentityLinkPurpose,
+};
 pub use audit_service::{AuditAction, AuditEntryInput, AuditFilter, AuditService};
 pub use dispute_service::DisputeService;
 pub use feature_flags::FeatureFlagService;

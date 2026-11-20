@@ -243,6 +243,128 @@ pub static SOROBAN_DLQ_DEPTH: Lazy<IntGauge> = Lazy::new(|| {
     gauge
 });
 
+// ── Analytics ingestion (#251) ───────────────────────────────────────────────
+/// Outcomes of analytics event ingestion at the canonical boundary.
+/// `outcome` is one of `accepted`, `deduplicated`, or `rejected`; `reason`
+/// is only meaningful for `rejected` (e.g. `malformed`, `schema_invalid`,
+/// `unsupported_schema_version`, `unauthorized`) and is `none` otherwise.
+pub static ANALYTICS_EVENTS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "analytics_events_total",
+            "Analytics events processed at the ingestion boundary by outcome",
+        ),
+        &["outcome", "reason"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("metric can be registered");
+    counter
+});
+
+/// Analytics events that were retried (same stable event ID delivered again)
+/// and converged to a single accepted event.
+pub static ANALYTICS_EVENTS_DEDUPLICATED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "analytics_events_deduplicated_total",
+            "Analytics events rejected as duplicates of an already-accepted event ID",
+        ),
+        &["schema_version"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("metric can be registered");
+    counter
+});
+
+/// Analytics events that entered the diagnosable rejection path.
+pub static ANALYTICS_EVENTS_REJECTED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "analytics_events_rejected_total",
+            "Analytics events rejected at ingestion, labeled by reason",
+        ),
+        &["reason"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("metric can be registered");
+    counter
+});
+
+/// Identity link/unlink operations recorded by the analytics boundary.
+pub static ANALYTICS_IDENTITY_LINKS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "analytics_identity_links_total",
+            "Analytics identity link/unlink operations by action and outcome",
+        ),
+        &["action", "outcome"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("metric can be registered");
+    counter
+});
+
+// ── Analytics dashboard query budgets (#254) ─────────────────────────────────
+/// Dashboard query latency in seconds, labeled by dashboard query name.
+pub static ANALYTICS_DASHBOARD_QUERY_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    let histogram = HistogramVec::new(
+        prometheus::HistogramOpts::new(
+            "analytics_dashboard_query_duration_seconds",
+            "Analytics dashboard query latency in seconds, labeled by query name",
+        )
+        .buckets(vec![
+            0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 30.0,
+        ]),
+        &["query_name"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(histogram.clone()))
+        .expect("metric can be registered");
+    histogram
+});
+
+/// Dashboard query budget violations. `budget` is `latency` or `freshness`;
+/// `query_name` identifies the dashboard query that exceeded its budget.
+pub static ANALYTICS_DASHBOARD_BUDGET_VIOLATIONS_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "analytics_dashboard_budget_violations_total",
+            "Analytics dashboard queries that exceeded their latency or freshness budget",
+        ),
+        &["query_name", "budget"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("metric can be registered");
+    counter
+});
+
+/// Dashboard responses served in a degraded (stale or incomplete) state.
+pub static ANALYTICS_DASHBOARD_DEGRADED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "analytics_dashboard_degraded_total",
+            "Analytics dashboard responses served with a stale or incomplete state",
+        ),
+        &["query_name", "state"],
+    )
+    .expect("metric can be created");
+    REGISTRY
+        .register(Box::new(counter.clone()))
+        .expect("metric can be registered");
+    counter
+});
+
 /// Count of WebSocket messages dropped for exceeding the per-connection
 /// rate limit (#1083), labeled by user so a single flooding user stands out.
 pub static WS_MESSAGES_RATE_LIMITED_TOTAL: Lazy<IntCounterVec> = Lazy::new(|| {
@@ -346,6 +468,13 @@ pub fn init_metrics() {
     Lazy::force(&SOROBAN_TX_RETRIES_TOTAL);
     Lazy::force(&SOROBAN_TX_LATENCY_SECONDS);
     Lazy::force(&SOROBAN_DLQ_DEPTH);
+    Lazy::force(&ANALYTICS_EVENTS_TOTAL);
+    Lazy::force(&ANALYTICS_EVENTS_DEDUPLICATED_TOTAL);
+    Lazy::force(&ANALYTICS_EVENTS_REJECTED_TOTAL);
+    Lazy::force(&ANALYTICS_IDENTITY_LINKS_TOTAL);
+    Lazy::force(&ANALYTICS_DASHBOARD_QUERY_DURATION_SECONDS);
+    Lazy::force(&ANALYTICS_DASHBOARD_BUDGET_VIOLATIONS_TOTAL);
+    Lazy::force(&ANALYTICS_DASHBOARD_DEGRADED_TOTAL);
 
     // Process-level metrics (process_resident_memory_bytes, process_cpu_seconds_total,
     // open fds, ...) — only available on Linux in prometheus crate.
@@ -453,6 +582,87 @@ pub fn set_soroban_dlq_depth(depth: i64) {
     SOROBAN_DLQ_DEPTH.set(depth);
 }
 
+/// Record an analytics event accepted at the ingestion boundary.
+pub fn record_analytics_event_accepted(schema_version: &str) {
+    ANALYTICS_EVENTS_TOTAL
+        .with_label_values(&["accepted", "none"])
+        .inc();
+    let _ = schema_version;
+}
+
+/// Record an analytics event that was a duplicate of an already-accepted
+/// stable event ID (retry converged to one accepted event).
+pub fn record_analytics_event_deduplicated(schema_version: &str) {
+    ANALYTICS_EVENTS_TOTAL
+        .with_label_values(&["deduplicated", "none"])
+        .inc();
+    ANALYTICS_EVENTS_DEDUPLICATED_TOTAL
+        .with_label_values(&[schema_version])
+        .inc();
+}
+
+/// Record an analytics event that entered the diagnosable rejection path.
+pub fn record_analytics_event_rejected(reason: &str) {
+    ANALYTICS_EVENTS_TOTAL
+        .with_label_values(&["rejected", reason])
+        .inc();
+    ANALYTICS_EVENTS_REJECTED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Record an analytics identity link/unlink operation.
+/// `action` is `link` or `unlink`; `outcome` is `accepted` or `rejected`.
+pub fn record_analytics_identity_link(action: &str, outcome: &str) {
+    ANALYTICS_IDENTITY_LINKS_TOTAL
+        .with_label_values(&[action, outcome])
+        .inc();
+}
+
+/// Record a dashboard query's latency and flag a latency budget violation
+/// when it exceeds `budget_secs`.
+pub fn record_analytics_dashboard_query(query_name: &str, elapsed_secs: f64, budget_secs: f64) {
+    ANALYTICS_DASHBOARD_QUERY_DURATION_SECONDS
+        .with_label_values(&[query_name])
+        .observe(elapsed_secs);
+    if elapsed_secs > budget_secs {
+        ANALYTICS_DASHBOARD_BUDGET_VIOLATIONS_TOTAL
+            .with_label_values(&[query_name, "latency"])
+            .inc();
+        tracing::warn!(
+            query_name,
+            elapsed_secs,
+            budget_secs,
+            "Analytics dashboard query exceeded its latency budget"
+        );
+    }
+}
+
+/// Record a dashboard query that exceeded its freshness budget (the data
+/// returned is older than the documented target).
+pub fn record_analytics_dashboard_stale(query_name: &str, age_secs: f64, budget_secs: f64) {
+    ANALYTICS_DASHBOARD_BUDGET_VIOLATIONS_TOTAL
+        .with_label_values(&[query_name, "freshness"])
+        .inc();
+    ANALYTICS_DASHBOARD_DEGRADED_TOTAL
+        .with_label_values(&[query_name, "stale"])
+        .inc();
+    tracing::warn!(
+        query_name,
+        age_secs,
+        budget_secs,
+        "Analytics dashboard query exceeded its freshness budget"
+    );
+}
+
+/// Record a dashboard response served in a degraded (incomplete) state,
+/// e.g. because a bounded time range or pagination limit was hit.
+pub fn record_analytics_dashboard_incomplete(query_name: &str) {
+    ANALYTICS_DASHBOARD_DEGRADED_TOTAL
+        .with_label_values(&[query_name, "incomplete"])
+        .inc();
+}
+
 pub async fn metrics_handler() -> Result<HttpResponse> {
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();
@@ -496,6 +706,106 @@ mod time_query_tests {
                 .with_label_values(&["test.err_query"])
                 .get_sample_count()
                 >= 1
+        );
+    }
+}
+
+#[cfg(test)]
+mod analytics_metrics_tests {
+    use super::*;
+
+    #[test]
+    fn accepted_and_deduplicated_events_are_counted_separately() {
+        record_analytics_event_accepted("v1");
+        record_analytics_event_deduplicated("v1");
+
+        assert!(
+            ANALYTICS_EVENTS_TOTAL
+                .with_label_values(&["accepted", "none"])
+                .get() >= 1
+        );
+        assert!(
+            ANALYTICS_EVENTS_TOTAL
+                .with_label_values(&["deduplicated", "none"])
+                .get() >= 1
+        );
+        assert!(
+            ANALYTICS_EVENTS_DEDUPLICATED_TOTAL
+                .with_label_values(&["v1"])
+                .get() >= 1
+        );
+    }
+
+    #[test]
+    fn rejected_events_are_labeled_by_reason() {
+        record_analytics_event_rejected("schema_invalid");
+
+        assert!(
+            ANALYTICS_EVENTS_REJECTED_TOTAL
+                .with_label_values(&["schema_invalid"])
+                .get() >= 1
+        );
+        assert!(
+            ANALYTICS_EVENTS_TOTAL
+                .with_label_values(&["rejected", "schema_invalid"])
+                .get() >= 1
+        );
+    }
+
+    #[test]
+    fn identity_links_are_labeled_by_action_and_outcome() {
+        record_analytics_identity_link("link", "accepted");
+        record_analytics_identity_link("unlink", "rejected");
+
+        assert!(
+            ANALYTICS_IDENTITY_LINKS_TOTAL
+                .with_label_values(&["link", "accepted"])
+                .get() >= 1
+        );
+        assert!(
+            ANALYTICS_IDENTITY_LINKS_TOTAL
+                .with_label_values(&["unlink", "rejected"])
+                .get() >= 1
+        );
+    }
+
+    #[test]
+    fn latency_budget_violation_is_recorded_only_when_exceeded() {
+        record_analytics_dashboard_query("test.within_budget", 0.1, 1.0);
+        assert_eq!(
+            ANALYTICS_DASHBOARD_BUDGET_VIOLATIONS_TOTAL
+                .with_label_values(&["test.within_budget", "latency"])
+                .get(),
+            0
+        );
+
+        record_analytics_dashboard_query("test.over_budget", 2.5, 1.0);
+        assert!(
+            ANALYTICS_DASHBOARD_BUDGET_VIOLATIONS_TOTAL
+                .with_label_values(&["test.over_budget", "latency"])
+                .get() >= 1
+        );
+    }
+
+    #[test]
+    fn stale_and_incomplete_states_are_recorded() {
+        record_analytics_dashboard_stale("test.stale", 600.0, 300.0);
+        record_analytics_dashboard_incomplete("test.incomplete");
+
+        assert!(
+            ANALYTICS_DASHBOARD_BUDGET_VIOLATIONS_TOTAL
+                .with_label_values(&["test.stale", "freshness"])
+                .get() >= 1
+        );
+        assert!(
+            ANALYTICS_DASHBOARD_DEGRADED_TOTAL
+                .with_label_values(&["test.stale", "stale"])
+                .get() >= 1
+        );
+        assert!(
+            ANALYTICS_DASHBOARD_DEGRADED_TOTAL
+                .with_label_values(&["test.incomplete", "incomplete"])
+                .get() >= 1
         );
     }
 }

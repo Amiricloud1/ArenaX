@@ -280,6 +280,104 @@ impl IdempotencyService {
         format!("idemp_{}", Uuid::new_v4().to_string().replace("-", ""))
     }
 
+    /// Build the canonical dedupe key for an analytics event.
+    ///
+    /// Producers assign a stable `event_id`; combined with the `producer_id`
+    /// this yields a deterministic key so that retries (including after a
+    /// producer restart) converge on the same ingestion record.
+    pub fn analytics_dedupe_key(producer_id: &str, event_id: &str) -> String {
+        format!("analytics:{}:{}", producer_id, event_id)
+    }
+
+    /// Record the outcome of an analytics ingestion attempt.
+    ///
+    /// Returns `Ok(true)` when this call created the record (i.e. the event
+    /// was processed for the first time) and `Ok(false)` when a record for the
+    /// same `producer_id` + `event_id` already existed. Callers should treat
+    /// `Ok(false)` as "already handled" and return the previously stored
+    /// outcome instead of re-processing the event.
+    ///
+    /// The insert is guarded by `ON CONFLICT DO NOTHING` so concurrent
+    /// duplicate deliveries race safely and only one wins.
+    pub async fn record_analytics_outcome(
+        &self,
+        producer_id: &str,
+        event_id: &str,
+        outcome: &AnalyticsIngestOutcome,
+    ) -> Result<bool, ApiError> {
+        if producer_id.trim().is_empty() {
+            return Err(ApiError::bad_request("producer_id must not be empty"));
+        }
+        if event_id.trim().is_empty() {
+            return Err(ApiError::bad_request("event_id must not be empty"));
+        }
+
+        let key = Self::analytics_dedupe_key(producer_id, event_id);
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::seconds(self.policy.default_ttl_seconds as i64);
+
+        let result = sqlx::query!(
+            r#"
+            INSERT INTO idempotency_keys (
+                id, key, request_hash, response_status,
+                response_headers, response_body, created_at, expires_at, used_at
+            ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9
+            ) ON CONFLICT (key) DO NOTHING
+            "#,
+            Uuid::new_v4(),
+            key,
+            format!("{}:{}", producer_id, event_id),
+            outcome.status_code() as i16,
+            serde_json::json!({ "content-type": "application/json" }),
+            serde_json::to_vec(outcome).map_err(|e| ApiError::bad_request(&e.to_string()))?,
+            now,
+            expires_at,
+            now
+        )
+        .execute(&self.db_pool)
+        .await
+        .map_err(|e| ApiError::database_error(e))?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Fetch the previously recorded analytics ingestion outcome, if any.
+    ///
+    /// Used on retries to return the original accepted/rejected result rather
+    /// than re-processing the event.
+    pub async fn get_analytics_outcome(
+        &self,
+        producer_id: &str,
+        event_id: &str,
+    ) -> Result<Option<AnalyticsIngestOutcome>, ApiError> {
+        let key = Self::analytics_dedupe_key(producer_id, event_id);
+
+        let row = sqlx::query!(
+            r#"
+            SELECT response_body
+            FROM idempotency_keys
+            WHERE key = $1
+            AND expires_at > NOW()
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            key
+        )
+        .fetch_optional(&self.db_pool)
+        .await
+        .map_err(|e| ApiError::database_error(e))?;
+
+        match row {
+            Some(record) => {
+                let outcome = serde_json::from_slice::<AnalyticsIngestOutcome>(&record.response_body)
+                    .map_err(|e| ApiError::database_error(e))?;
+                Ok(Some(outcome))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Validate idempotency key format
     pub fn validate_key_format(key: &str) -> Result<(), ApiError> {
         if key.len() < 8 {
@@ -296,6 +394,43 @@ impl IdempotencyService {
         }
 
         Ok(())
+    }
+}
+
+/// Outcome of an analytics ingestion attempt, persisted for deduplication.
+///
+/// Retries for the same `producer_id` + `event_id` return the stored outcome
+/// so that accepted events are not double-counted and rejected events remain
+/// diagnosable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AnalyticsIngestOutcome {
+    /// Event was accepted and recorded.
+    Accepted {
+        /// Schema version the event was validated against.
+        schema_version: String,
+    },
+    /// Event was rejected (malformed or schema-invalid) and is diagnosable.
+    Rejected {
+        /// Machine-readable rejection reason.
+        reason: String,
+        /// Schema version the event was validated against.
+        schema_version: String,
+    },
+}
+
+impl AnalyticsIngestOutcome {
+    /// HTTP status code associated with this outcome.
+    pub fn status_code(&self) -> u16 {
+        match self {
+            AnalyticsIngestOutcome::Accepted { .. } => 202,
+            AnalyticsIngestOutcome::Rejected { .. } => 422,
+        }
+    }
+
+    /// Whether the event was accepted.
+    pub fn is_accepted(&self) -> bool {
+        matches!(self, AnalyticsIngestOutcome::Accepted { .. })
     }
 }
 

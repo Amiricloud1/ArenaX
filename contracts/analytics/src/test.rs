@@ -83,6 +83,84 @@ fn test_get_platform_snapshot_single_call() {
 }
 
 #[test]
+fn test_duplicate_event_delivery_accepted_once() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let reporter = Address::generate(&env);
+    let id = Symbol::new(&env, "match");
+    client.register_contract(&id, &reporter);
+
+    let event_id = BytesN::from_array(&env, &[1u8; 32]);
+    client.record_event(&id, &Symbol::new(&env, "volume"), &100, &event_id, &1);
+    // Duplicate delivery of the same event identity must not double-count.
+    client.record_event(&id, &Symbol::new(&env, "volume"), &100, &event_id, &1);
+
+    let snap = client.get_platform_snapshot();
+    assert_eq!(snap.total_transactions, 1);
+    assert_eq!(snap.total_volume, 100);
+}
+
+#[test]
+fn test_out_of_order_batch_converges() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let reporter = Address::generate(&env);
+    let id = Symbol::new(&env, "match");
+    client.register_contract(&id, &reporter);
+
+    let e1 = BytesN::from_array(&env, &[1u8; 32]);
+    let e2 = BytesN::from_array(&env, &[2u8; 32]);
+    let e3 = BytesN::from_array(&env, &[3u8; 32]);
+
+    // Deliver out of order, then replay in a different order.
+    client.record_event(&id, &Symbol::new(&env, "volume"), &30, &e3, &1);
+    client.record_event(&id, &Symbol::new(&env, "volume"), &10, &e1, &1);
+    client.record_event(&id, &Symbol::new(&env, "volume"), &20, &e2, &1);
+    client.record_event(&id, &Symbol::new(&env, "volume"), &10, &e1, &1);
+    client.record_event(&id, &Symbol::new(&env, "volume"), &30, &e3, &1);
+
+    let snap = client.get_platform_snapshot();
+    assert_eq!(snap.total_transactions, 3);
+    assert_eq!(snap.total_volume, 60);
+}
+
+#[test]
+fn test_producer_restart_replay_accepted_once() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let reporter = Address::generate(&env);
+    let id = Symbol::new(&env, "match");
+    client.register_contract(&id, &reporter);
+
+    let event_id = BytesN::from_array(&env, &[9u8; 32]);
+    client.record_event(&id, &Symbol::new(&env, "users"), &2, &event_id, &1);
+    // Producer restarts and replays the same buffered event.
+    client.record_event(&id, &Symbol::new(&env, "users"), &2, &event_id, &1);
+
+    let snap = client.get_platform_snapshot();
+    assert_eq!(snap.total_transactions, 1);
+    assert_eq!(snap.total_users, 2);
+}
+
+#[test]
+fn test_schema_version_rollout_dedupes_across_versions() {
+    let env = Env::default();
+    let (client, _admin) = setup(&env);
+    let reporter = Address::generate(&env);
+    let id = Symbol::new(&env, "match");
+    client.register_contract(&id, &reporter);
+
+    let event_id = BytesN::from_array(&env, &[5u8; 32]);
+    client.record_event(&id, &Symbol::new(&env, "volume"), &40, &event_id, &1);
+    // Same identity re-delivered under a newer schema version is still a duplicate.
+    client.record_event(&id, &Symbol::new(&env, "volume"), &40, &event_id, &2);
+
+    let snap = client.get_platform_snapshot();
+    assert_eq!(snap.total_transactions, 1);
+    assert_eq!(snap.total_volume, 40);
+}
+
+#[test]
 fn test_hourly_circular_overwrite_168_slots() {
     let env = Env::default();
     let (client, _admin) = setup(&env);
