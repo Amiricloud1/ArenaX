@@ -8,86 +8,25 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Maximum number of events accepted in a single ingestion batch.
-const MAX_EVENT_BATCH: usize = 500;
-/// Maximum accepted event payload size (bytes) before rejection.
-const MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
-/// Supported analytics schema versions. Unknown versions are rejected.
-const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2];
-/// Default dashboard freshness budget (seconds) when not supplied.
-const DEFAULT_FRESHNESS_BUDGET_SECS: i64 = 300;
-/// Default dashboard latency budget (milliseconds) when not supplied.
-const DEFAULT_LATENCY_BUDGET_MS: i64 = 2_000;
-/// Hard bound on the queryable time range (seconds) to keep queries cheap.
-const MAX_QUERY_RANGE_SECS: i64 = 90 * 24 * 60 * 60;
+/// Current consent policy version. Bump when the consent text/scope changes so
+/// that stale consent records are treated as not-granted.
+pub const ANALYTICS_CONSENT_VERSION: i32 = 1;
 
-#[derive(Deserialize)]
-pub struct AnalyticsEvent {
-    pub event_id: String,
-    pub schema_version: u32,
-    pub name: String,
-    #[serde(default)]
-    pub occurred_at: Option<i64>,
-    #[serde(default)]
-    pub payload: Option<serde_json::Value>,
+/// Versioned consent record supplied by the client (or resolved from the
+/// authenticated subject). `granted == false` means the user has withdrawn
+/// consent; any record whose `version` is stale is treated as not granted.
+#[derive(Deserialize, Clone, Debug)]
+pub struct ConsentRecord {
+    pub version: i32,
+    pub granted: bool,
 }
 
-#[derive(Deserialize)]
-pub struct IngestEventsBody {
-    pub producer_id: String,
-    #[serde(default)]
-    pub events: Vec<AnalyticsEvent>,
-}
-
-#[derive(Serialize)]
-pub struct EventOutcome {
-    pub event_id: String,
-    pub status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct IngestEventsResponse {
-    pub accepted: usize,
-    pub rejected: usize,
-    pub outcomes: Vec<EventOutcome>,
-}
-
-#[derive(Deserialize)]
-pub struct IdentityLinkBody {
-    pub subject_id: String,
-    pub account_id: String,
-    #[serde(default)]
-    pub consent: bool,
-}
-
-#[derive(Deserialize)]
-pub struct IdentityUnlinkBody {
-    pub subject_id: String,
-}
-
-#[derive(Serialize)]
-pub struct IdentityResponse {
-    pub status: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct BudgetMetadata {
-    pub freshness_budget_secs: i64,
-    pub latency_budget_ms: i64,
-    pub max_range_secs: i64,
-    pub range_secs: i64,
-}
-
-#[derive(Serialize)]
-pub struct DashboardResponse<T> {
-    pub data: T,
-    pub stale: bool,
-    pub incomplete: bool,
-    pub budget: BudgetMetadata,
+impl ConsentRecord {
+    /// Consent is only effective when it is explicitly granted *and* matches
+    /// the current policy version.
+    pub fn is_effective(&self) -> bool {
+        self.granted && self.version == ANALYTICS_CONSENT_VERSION
+    }
 }
 
 #[derive(Deserialize)]
@@ -98,6 +37,9 @@ pub struct RecordMatchBody {
     pub wager_amount: i64,
     pub reward_amount: i64,
     pub player_count: i32,
+    /// Optional consent record. When absent the event is treated as
+    /// non-consented and suppressed.
+    pub consent: Option<ConsentRecord>,
 }
 
 #[derive(Deserialize)]
@@ -106,6 +48,28 @@ pub struct PlayerBehaviourBody {
     pub game_id: i32,
     pub won: bool,
     pub session_secs: i64,
+    /// Optional consent record. When absent the event is treated as
+    /// non-consented and suppressed.
+    pub consent: Option<ConsentRecord>,
+}
+
+/// Resolve whether non-essential analytics may be recorded for this request.
+///
+/// Consent is authoritative and versioned: a missing record, a withdrawn
+/// record, or a stale version all result in suppression. This is the single
+/// gate used by every producer path so withdrawal halts future events.
+fn consent_allows_analytics(consent: &Option<ConsentRecord>) -> bool {
+    consent.as_ref().map(ConsentRecord::is_effective).unwrap_or(false)
+}
+
+/// Response returned when a non-essential analytics write is suppressed
+/// because consent is absent, withdrawn, or stale.
+fn consent_suppressed_response() -> HttpResponse {
+    HttpResponse::Accepted().json(serde_json::json!({
+        "status": "suppressed",
+        "reason": "analytics_consent_not_granted",
+        "consent_version": ANALYTICS_CONSENT_VERSION,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -126,6 +90,13 @@ pub async fn record_match(
     db: web::Data<PgPool>,
     body: web::Json<RecordMatchBody>,
 ) -> Result<HttpResponse, ApiError> {
+    // Consent gate: non-essential analytics are suppressed unless the caller
+    // presents an effective (granted + current version) consent record.
+    // Financial/private state is unaffected and remains server-authoritative.
+    if !consent_allows_analytics(&body.consent) {
+        return Ok(consent_suppressed_response());
+    }
+
     let match_id = validate_uuid(&body.match_id)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
@@ -146,6 +117,12 @@ pub async fn record_player_behaviour(
     db: web::Data<PgPool>,
     body: web::Json<PlayerBehaviourBody>,
 ) -> Result<HttpResponse, ApiError> {
+    // Consent gate: player-linked behaviour analytics are non-essential and
+    // must be suppressed on withdrawal or stale consent.
+    if !consent_allows_analytics(&body.consent) {
+        return Ok(consent_suppressed_response());
+    }
+
     let user_id = validate_uuid(&body.user_id)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
 

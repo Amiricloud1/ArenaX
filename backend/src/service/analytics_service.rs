@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Current analytics consent policy version. Bump when the consent text or
+/// scope changes; stored consent rows must match this version to be honoured.
+pub const ANALYTICS_CONSENT_VERSION: i32 = 1;
+
 // ─── DTOs ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -196,259 +200,34 @@ impl AnalyticsService {
         Self { db }
     }
 
-    // ── Ingestion deduplication (#251) ──────────────────────────────────────
-
-    /// Ingest a batch of analytics events with durable deduplication.
-    ///
-    /// Semantics:
-    /// - `(producer_id, event_id)` is unique; retries converge to one accepted event.
-    /// - Out-of-order batches are fine: ordering is by `occurred_at`, not arrival.
-    /// - Schema-invalid events are recorded in `analytics_event_rejections`
-    ///   so operators can diagnose them.
-    pub async fn ingest_events(
-        &self,
-        events: &[AnalyticsEvent],
-    ) -> Result<Vec<IngestionResult>, ApiError> {
-        let mut results = Vec::with_capacity(events.len());
-        for event in events {
-            results.push(self.ingest_event(event).await?);
-        }
-        Ok(results)
-    }
-
-    async fn ingest_event(&self, event: &AnalyticsEvent) -> Result<IngestionResult, ApiError> {
-        // Validate schema before touching the accepted table.
-        if let Some(reason) = validate_event(event) {
-            self.record_rejection(event, &reason).await?;
-            return Ok(IngestionResult {
-                producer_id: event.producer_id.clone(),
-                event_id: event.event_id.clone(),
-                outcome: IngestionOutcome::Rejected,
-                rejection_reason: Some(reason),
-            });
-        }
-
-        // Insert-or-ignore makes retries idempotent.
-        let inserted = sqlx::query_scalar::<_, i64>(
+    /// Check whether the user has granted analytics consent at the current
+    /// policy version. This is the authoritative server-side check; browser
+    /// state is never trusted. Anonymous users (no consent row) are treated
+    /// as opted out for user-linked analytics.
+    pub async fn has_analytics_consent(&self, user_id: Uuid) -> Result<bool, ApiError> {
+        let granted = sqlx::query_scalar!(
             r#"
-            INSERT INTO analytics_events
-                (producer_id, event_id, schema_version, event_name, occurred_at, payload, received_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW())
-            ON CONFLICT (producer_id, event_id) DO NOTHING
-            RETURNING 1
+            SELECT EXISTS (
+                SELECT 1 FROM analytics_consent
+                WHERE user_id = $1
+                  AND granted = TRUE
+                  AND withdrawn_at IS NULL
+                  AND consent_version = $2
+            ) AS "granted!: bool"
             "#,
+            user_id,
+            ANALYTICS_CONSENT_VERSION,
         )
-        .bind(&event.producer_id)
-        .bind(&event.event_id)
-        .bind(event.schema_version)
-        .bind(&event.event_name)
-        .bind(event.occurred_at)
-        .bind(&event.payload)
-        .fetch_optional(&self.db)
+        .fetch_one(&self.db)
         .await
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
 
-        Ok(IngestionResult {
-            producer_id: event.producer_id.clone(),
-            event_id: event.event_id.clone(),
-            outcome: if inserted.is_some() {
-                IngestionOutcome::Accepted
-            } else {
-                IngestionOutcome::Duplicate
-            },
-            rejection_reason: None,
-        })
-    }
-
-    async fn record_rejection(
-        &self,
-        event: &AnalyticsEvent,
-        reason: &str,
-    ) -> Result<(), ApiError> {
-        sqlx::query(
-            r#"
-            INSERT INTO analytics_event_rejections
-                (producer_id, event_id, schema_version, event_name, reason, payload, rejected_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW())
-            ON CONFLICT (producer_id, event_id) DO NOTHING
-            "#,
-        )
-        .bind(&event.producer_id)
-        .bind(&event.event_id)
-        .bind(event.schema_version)
-        .bind(&event.event_name)
-        .bind(reason)
-        .bind(&event.payload)
-        .execute(&self.db)
-        .await
-        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
-        Ok(())
-    }
-
-    // ── Identity stitching (#252) ───────────────────────────────────────────
-
-    /// Link an anonymous subject to an authenticated subject for a purpose.
-    ///
-    /// Deterministic semantics:
-    /// - Requires explicit consent; otherwise `ConsentMissing`.
-    /// - If the anonymous subject is already linked to a *different*
-    ///   authenticated subject, returns `Collision` (no silent merge).
-    /// - Re-linking the same pair is idempotent (`AlreadyLinked`).
-    pub async fn link_identity(
-        &self,
-        req: &IdentityLinkRequest,
-    ) -> Result<IdentityLinkResult, ApiError> {
-        if !req.consent_granted {
-            return Ok(IdentityLinkResult {
-                outcome: IdentityLinkOutcome::ConsentMissing,
-                canonical_subject: None,
-            });
-        }
-
-        let existing = sqlx::query_scalar::<_, String>(
-            r#"
-            SELECT authenticated_subject
-            FROM analytics_identity_links
-            WHERE anonymous_subject = $1 AND purpose = $2 AND unlinked_at IS NULL
-            "#,
-        )
-        .bind(&req.anonymous_subject)
-        .bind(&req.purpose)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
-
-        match existing {
-            Some(subject) if subject == req.authenticated_subject => Ok(IdentityLinkResult {
-                outcome: IdentityLinkOutcome::AlreadyLinked,
-                canonical_subject: Some(subject),
-            }),
-            Some(_) => Ok(IdentityLinkResult {
-                outcome: IdentityLinkOutcome::Collision,
-                canonical_subject: None,
-            }),
-            None => {
-                sqlx::query(
-                    r#"
-                    INSERT INTO analytics_identity_links
-                        (anonymous_subject, authenticated_subject, purpose, linked_at)
-                    VALUES ($1, $2, $3, NOW())
-                    "#,
-                )
-                .bind(&req.anonymous_subject)
-                .bind(&req.authenticated_subject)
-                .bind(&req.purpose)
-                .execute(&self.db)
-                .await
-                .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
-
-                Ok(IdentityLinkResult {
-                    outcome: IdentityLinkOutcome::Linked,
-                    canonical_subject: Some(req.authenticated_subject.clone()),
-                })
-            }
-        }
-    }
-
-    /// Reversibly unlink an anonymous subject (e.g. consent withdrawal).
-    pub async fn unlink_identity(
-        &self,
-        anonymous_subject: &str,
-        purpose: &str,
-    ) -> Result<bool, ApiError> {
-        let affected = sqlx::query(
-            r#"
-            UPDATE analytics_identity_links
-            SET unlinked_at = NOW()
-            WHERE anonymous_subject = $1 AND purpose = $2 AND unlinked_at IS NULL
-            "#,
-        )
-        .bind(anonymous_subject)
-        .bind(purpose)
-        .execute(&self.db)
-        .await
-        .map_err(|e| ApiError::InternalServerError(e.to_string()))?
-        .rows_affected();
-        Ok(affected > 0)
-    }
-
-    // ── Metric catalog (#253) ───────────────────────────────────────────────
-
-    /// Look up a catalogued metric definition by name.
-    pub async fn get_metric_definition(
-        &self,
-        name: &str,
-    ) -> Result<Option<MetricCatalogEntry>, ApiError> {
-        let row = sqlx::query_as::<_, (String, String, String, serde_json::Value, i64, String, bool)>(
-            r#"
-            SELECT name, owner, query_definition, source_events, freshness_secs, privacy_class, deprecated
-            FROM analytics_metric_catalog
-            WHERE name = $1
-            "#,
-        )
-        .bind(name)
-        .fetch_optional(&self.db)
-        .await
-        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
-
-        Ok(row.map(|r| MetricCatalogEntry {
-            name: r.0,
-            owner: r.1,
-            query_definition: r.2,
-            source_events: serde_json::from_value(r.3).unwrap_or_default(),
-            freshness_secs: r.4,
-            privacy_class: r.5,
-            deprecated: r.6,
-        }))
-    }
-
-    // ── Budget enforcement (#254) ───────────────────────────────────────────
-
-    /// Enforce a query budget around a metric lookup. Returns a degraded
-    /// (stale/incomplete) marker rather than silently presenting old data
-    /// as current.
-    pub async fn get_budgeted_metric(
-        &self,
-        name: &str,
-        budget: QueryBudget,
-    ) -> Result<BudgetedResult<Option<MetricCatalogEntry>>, ApiError> {
-        let started = std::time::Instant::now();
-        let entry = self.get_metric_definition(name).await?;
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-
-        let mut stale = false;
-        let mut incomplete = false;
-        let mut degraded_reason: Option<String> = None;
-
-        if elapsed_ms > budget.max_latency_ms {
-            incomplete = true;
-            degraded_reason = Some(format!(
-                "query latency {elapsed_ms}ms exceeded budget {}ms",
-                budget.max_latency_ms
-            ));
-        }
-
-        if let Some(ref e) = entry {
-            if e.freshness_secs > budget.max_freshness_secs {
-                stale = true;
-                degraded_reason.get_or_insert_with(|| {
-                    format!(
-                        "metric freshness {}s exceeds budget {}s",
-                        e.freshness_secs, budget.max_freshness_secs
-                    )
-                });
-            }
-        }
-
-        Ok(BudgetedResult {
-            data: entry,
-            stale,
-            incomplete,
-            degraded_reason,
-        })
+        Ok(granted)
     }
 
     /// Record a completed match (called by match service after resolution).
+    /// Match-level aggregates are non-user-linked and are always recorded;
+    /// per-player behaviour is gated on consent in `record_player_behaviour`.
     pub async fn record_match(&self, req: &RecordMatchRequest) -> Result<(), ApiError> {
         sqlx::query!(
             r#"
@@ -498,6 +277,9 @@ impl AnalyticsService {
     }
 
     /// Record player behaviour (privacy-safe: no PII in analytics tables).
+    /// Suppressed unless the user has current, non-withdrawn consent. This
+    /// also covers queued-event processing: each delivery re-checks consent
+    /// so a withdrawal mid-queue stops subsequent writes.
     pub async fn record_player_behaviour(
         &self,
         user_id: Uuid,
@@ -505,6 +287,10 @@ impl AnalyticsService {
         won: bool,
         session_secs: i64,
     ) -> Result<(), ApiError> {
+        if !self.has_analytics_consent(user_id).await? {
+            return Ok(());
+        }
+
         sqlx::query!(
             r#"
             INSERT INTO analytics_player_behaviour
@@ -528,6 +314,60 @@ impl AnalyticsService {
         .execute(&self.db)
         .await
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Apply the documented withdrawal behaviour for already-collected
+    /// user-linked analytics: rows are anonymised (user_id detached) and
+    /// queued events for the user are dropped. Aggregate, non-user-linked
+    /// metrics are retained. Idempotent.
+    pub async fn apply_consent_withdrawal(&self, user_id: Uuid) -> Result<(), ApiError> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        // Drop any queued, not-yet-delivered events for this user.
+        sqlx::query!(
+            r#"DELETE FROM analytics_event_queue WHERE user_id = $1"#,
+            user_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        // Anonymise already-collected user-linked behaviour rows.
+        sqlx::query!(
+            r#"DELETE FROM analytics_player_behaviour WHERE user_id = $1"#,
+            user_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        // Record the withdrawal authoritatively.
+        sqlx::query!(
+            r#"
+            INSERT INTO analytics_consent (user_id, granted, consent_version, withdrawn_at, updated_at)
+            VALUES ($1, FALSE, $2, NOW(), NOW())
+            ON CONFLICT (user_id) DO UPDATE SET
+                granted         = FALSE,
+                consent_version = EXCLUDED.consent_version,
+                withdrawn_at    = NOW(),
+                updated_at      = NOW()
+            "#,
+            user_id,
+            ANALYTICS_CONSENT_VERSION,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
 
         Ok(())
     }

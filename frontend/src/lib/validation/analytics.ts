@@ -67,172 +67,222 @@ export interface ValidationAnalyticsSnapshot {
   lastUpdated: string;
 }
 
-// ─── Event schema validation ──────────────────────────────────────────────────
+// ─── Cross-client event schema registry (#249) ────────────────────────────────
 
-/** Current analytics event schema version accepted by the ingestion boundary. */
-export const ANALYTICS_SCHEMA_VERSION = "1";
+/**
+ * Current schema version for analytics events. Bump this whenever a breaking
+ * change is introduced and register a migration in `registerEventMigration`.
+ */
+export const SCHEMA_VERSION = 1;
 
-/** Schema versions the ingestion boundary still accepts (rollout window). */
-export const SUPPORTED_SCHEMA_VERSIONS: readonly string[] = ["1"];
+export type EventProducer = "frontend" | "server";
 
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-/** Keys that must never appear in an analytics payload (raw auth identifiers). */
-const FORBIDDEN_IDENTITY_KEYS = new Set([
-  "email",
-  "useremail",
-  "accesstoken",
-  "refreshtoken",
-  "idtoken",
-  "token",
-  "authorization",
-  "userid",
-  "useruuid",
-  "accountid",
-  "authid",
-  "sessiontoken",
-  "password",
-]);
-
-export type AnalyticsEventRejectionReason =
-  | "missing-event-id"
-  | "invalid-event-id"
-  | "missing-schema-version"
-  | "unsupported-schema-version"
-  | "missing-producer-id"
-  | "missing-subject-id"
-  | "invalid-subject-id"
-  | "raw-auth-identifier";
-
-export interface AnalyticsEventValidationResult {
-  ok: boolean;
-  /** Populated when `ok` is false. */
-  reason?: AnalyticsEventRejectionReason;
-  /** Human-readable diagnostic message for the rejection path. */
-  message?: string;
-  /** Dotted path of the offending field, when applicable. */
-  field?: string;
+export interface AnalyticsEventFieldSpec {
+  /** Field name (dot notation for nested fields). */
+  name: string;
+  /** Whether the field is required. */
+  required: boolean;
+  /** Allowed primitive type. */
+  type: "string" | "number" | "boolean" | "object" | "array";
 }
 
-function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
+export interface AnalyticsEventContract {
+  /** Unique event name, e.g. "validation.attempt". */
+  name: string;
+  /** Owning team or module. */
+  owner: string;
+  /** Human-readable purpose of the event. */
+  purpose: string;
+  /** Schema version this contract describes. */
+  version: number;
+  /** Required and optional fields. */
+  fields: AnalyticsEventFieldSpec[];
+  /** Attribute names that must never be emitted (PII, secrets, etc.). */
+  prohibited: string[];
 }
 
-function findForbiddenIdentityKey(
-  value: unknown,
-  path: string,
-  depth = 0,
-): { path: string; key: string } | null {
-  if (depth > 8 || value === null || typeof value !== "object") return null;
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) {
-      const found = findForbiddenIdentityKey(value[i], `${path}[${i}]`, depth + 1);
-      if (found) return found;
-    }
-    return null;
-  }
-  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    const normalized = key.toLowerCase().replace(/[^a-z]/g, "");
-    if (FORBIDDEN_IDENTITY_KEYS.has(normalized)) {
-      return { path: path ? `${path}.${key}` : key, key };
-    }
-    const found = findForbiddenIdentityKey(child, path ? `${path}.${key}` : key, depth + 1);
-    if (found) return found;
-  }
-  return null;
+export interface AnalyticsEvent {
+  /** Event name matching a registered contract. */
+  name: string;
+  /** Schema version the producer emitted. */
+  version: number;
+  /** Producer that emitted the event. */
+  producer: EventProducer;
+  /** Event payload. */
+  payload: Record<string, unknown>;
+}
+
+export interface EventValidationResult {
+  valid: boolean;
+  /** Event name (or "<unknown>" if missing). */
+  name: string;
+  /** Human-readable error messages. */
+  errors: string[];
+  /** Prohibited attributes that were found in the payload. */
+  prohibitedFound: string[];
+  /** True when the event version differs from the contract version. */
+  versionMismatch: boolean;
+}
+
+const _contracts = new Map<string, AnalyticsEventContract>();
+const _migrations = new Map<string, (payload: Record<string, unknown>) => Record<string, unknown>>();
+
+/** Registers (or replaces) an event contract. */
+export function registerEventContract(contract: AnalyticsEventContract): void {
+  _contracts.set(contract.name, contract);
+}
+
+/** Returns a registered contract, if any. */
+export function getEventContract(name: string): AnalyticsEventContract | undefined {
+  return _contracts.get(name);
+}
+
+/** Lists all registered contracts. */
+export function listEventContracts(): AnalyticsEventContract[] {
+  return Array.from(_contracts.values());
 }
 
 /**
- * Validates an analytics event before it is enqueued in the outbox or
- * accepted by the ingestion boundary.
- *
- * Requires a stable `eventId` (UUID), a supported `schemaVersion`, a
- * `producerId`, and a pseudonymous `subjectId`. Rejects payloads that carry
- * raw authentication identifiers (email, tokens, user UUIDs) so identity
- * stitching stays purpose-limited and separate from event payloads.
+ * Registers a migration hook that upgrades a payload from `fromVersion` to
+ * `fromVersion + 1`. Breaking changes must ship with a migration.
  */
-export function validateAnalyticsEvent(
-  event: unknown,
-): AnalyticsEventValidationResult {
-  if (event === null || typeof event !== "object" || Array.isArray(event)) {
-    return { ok: false, reason: "missing-event-id", message: "Event must be an object" };
-  }
-
-  const record = event as Record<string, unknown>;
-
-  if (!isNonEmptyString(record.eventId)) {
-    return {
-      ok: false,
-      reason: "missing-event-id",
-      field: "eventId",
-      message: "Analytics event is missing a stable eventId",
-    };
-  }
-  if (!UUID_RE.test(record.eventId)) {
-    return {
-      ok: false,
-      reason: "invalid-event-id",
-      field: "eventId",
-      message: `eventId "${record.eventId}" is not a valid UUID`,
-    };
-  }
-
-  if (!isNonEmptyString(record.schemaVersion)) {
-    return {
-      ok: false,
-      reason: "missing-schema-version",
-      field: "schemaVersion",
-      message: "Analytics event is missing schemaVersion",
-    };
-  }
-  if (!SUPPORTED_SCHEMA_VERSIONS.includes(record.schemaVersion)) {
-    return {
-      ok: false,
-      reason: "unsupported-schema-version",
-      field: "schemaVersion",
-      message: `schemaVersion "${record.schemaVersion}" is not supported (supported: ${SUPPORTED_SCHEMA_VERSIONS.join(", ")})`,
-    };
-  }
-
-  if (!isNonEmptyString(record.producerId)) {
-    return {
-      ok: false,
-      reason: "missing-producer-id",
-      field: "producerId",
-      message: "Analytics event is missing producerId",
-    };
-  }
-
-  if (!isNonEmptyString(record.subjectId)) {
-    return {
-      ok: false,
-      reason: "missing-subject-id",
-      field: "subjectId",
-      message: "Analytics event is missing a pseudonymous subjectId",
-    };
-  }
-  if (UUID_RE.test(record.subjectId) && record.subjectId === record.eventId) {
-    return {
-      ok: false,
-      reason: "invalid-subject-id",
-      field: "subjectId",
-      message: "subjectId must be pseudonymous and distinct from eventId",
-    };
-  }
-
-  const forbidden = findForbiddenIdentityKey(record, "");
-  if (forbidden) {
-    return {
-      ok: false,
-      reason: "raw-auth-identifier",
-      field: forbidden.path,
-      message: `Analytics payload must not contain raw auth identifier "${forbidden.key}"`,
-    };
-  }
-
-  return { ok: true };
+export function registerEventMigration(
+  eventName: string,
+  fromVersion: number,
+  migrate: (payload: Record<string, unknown>) => Record<string, unknown>,
+): void {
+  _migrations.set(`${eventName}@${fromVersion}`, migrate);
 }
+
+/**
+ * Applies registered migrations to bring an event payload up to the current
+ * contract version. Returns the migrated event, or the original if no
+ * migration path exists.
+ */
+export function migrateEvent(event: AnalyticsEvent): AnalyticsEvent {
+  const contract = _contracts.get(event.name);
+  if (!contract) return event;
+
+  let version = event.version;
+  let payload = event.payload;
+
+  while (version < contract.version) {
+    const migrate = _migrations.get(`${event.name}@${version}`);
+    if (!migrate) break;
+    try {
+      payload = migrate(payload);
+    } catch {
+      break;
+    }
+    version += 1;
+  }
+
+  return { ...event, version, payload };
+}
+
+function typeOf(value: unknown): AnalyticsEventFieldSpec["type"] | "null" | "undefined" {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (Array.isArray(value)) return "array";
+  return typeof value as AnalyticsEventFieldSpec["type"];
+}
+
+/**
+ * Validates a single analytics event against the registry: required/optional
+ * fields, prohibited sensitive attributes, and schema version.
+ */
+export function validateEvent(event: AnalyticsEvent): EventValidationResult {
+  const errors: string[] = [];
+  const prohibitedFound: string[] = [];
+  const name = typeof event?.name === "string" && event.name ? event.name : "<unknown>";
+
+  const contract = _contracts.get(name);
+  if (!contract) {
+    return {
+      valid: false,
+      name,
+      errors: [`No contract registered for event "${name}"`],
+      prohibitedFound,
+      versionMismatch: false,
+    };
+  }
+
+  const versionMismatch = event.version !== contract.version;
+  if (versionMismatch) {
+    errors.push(
+      `Event "${name}" version ${event.version} does not match contract version ${contract.version}`,
+    );
+  }
+
+  const payload = event.payload ?? {};
+
+  for (const field of contract.fields) {
+    const value = payload[field.name];
+    const actual = typeOf(value);
+    if (actual === "undefined" || actual === "null") {
+      if (field.required) errors.push(`Missing required field "${field.name}"`);
+      continue;
+    }
+    if (actual !== field.type) {
+      errors.push(
+        `Field "${field.name}" expected ${field.type} but received ${actual}`,
+      );
+    }
+  }
+
+  for (const attr of contract.prohibited) {
+    if (Object.prototype.hasOwnProperty.call(payload, attr) && payload[attr] !== undefined) {
+      prohibitedFound.push(attr);
+      errors.push(`Prohibited attribute "${attr}" must not be emitted`);
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    name,
+    errors,
+    prohibitedFound,
+    versionMismatch,
+  };
+}
+
+/** Validates a batch of events, returning per-event results in order. */
+export function validateBatch(events: AnalyticsEvent[]): EventValidationResult[] {
+  return events.map(validateEvent);
+}
+
+// ─── Built-in contracts ───────────────────────────────────────────────────────
+
+registerEventContract({
+  name: "validation.attempt",
+  owner: "frontend-platform",
+  purpose: "Track schema validation attempts for UX and reliability monitoring",
+  version: SCHEMA_VERSION,
+  fields: [
+    { name: "schemaName", required: true, type: "string" },
+    { name: "success", required: true, type: "boolean" },
+    { name: "failedFields", required: true, type: "array" },
+    { name: "durationMs", required: true, type: "number" },
+    { name: "timestamp", required: true, type: "string" },
+    { name: "context", required: false, type: "string" },
+  ],
+  prohibited: ["email", "password", "token", "ssn", "cardNumber", "cvv", "authorization"],
+});
+
+registerEventContract({
+  name: "validation.governance-violation",
+  owner: "frontend-platform",
+  purpose: "Track governance policy violations for operator review",
+  version: SCHEMA_VERSION,
+  fields: [
+    { name: "policy", required: true, type: "string" },
+    { name: "message", required: true, type: "string" },
+    { name: "severity", required: true, type: "string" },
+    { name: "schemaName", required: true, type: "string" },
+    { name: "timestamp", required: true, type: "string" },
+  ],
+  prohibited: ["email", "password", "token", "ssn", "cardNumber", "cvv", "authorization"],
+});
 
 // ─── Governance ───────────────────────────────────────────────────────────────
 
@@ -315,24 +365,16 @@ export function registerGovernancePolicy(policy: ValidationGovernancePolicy): vo
  * Called by `createValidationResolver` automatically.
  */
 export function recordValidationAttempt(event: ValidationAttemptEvent): void {
-  // Reject malformed or identity-leaking events at the ingestion boundary.
-  const validation = validateAnalyticsEvent(event);
-  if (!validation.ok) {
-    const violation: ValidationGovernanceViolation = {
-      policy: "analytics-event-schema",
-      message: validation.message ?? "Invalid analytics event",
-      severity: "error",
-      schemaName: event?.schemaName ?? "unknown",
-      timestamp: new Date().toISOString(),
-    };
-    _violations.unshift(violation);
-    if (_violations.length > 200) _violations.length = 200;
-
+  // Validate against the cross-client contract before recording (#249).
+  const result = validateEvent({
+    name: "validation.attempt",
+    version: SCHEMA_VERSION,
+    producer: "frontend",
+    payload: event as unknown as Record<string, unknown>,
+  });
+  if (!result.valid) {
     if (process.env.NODE_ENV === "development") {
-      console.error(
-        `[ArenaX Validation] [analytics-event-schema] ${violation.message}`,
-        { field: validation.field, reason: validation.reason },
-      );
+      console.warn("[ArenaX Validation] Rejected analytics event", result.errors);
     }
     return;
   }

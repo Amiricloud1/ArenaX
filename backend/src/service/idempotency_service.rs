@@ -6,6 +6,45 @@ use serde::{Deserialize, Serialize};
 use sqlx;
 use uuid::Uuid;
 
+/// Conflict strategy declared by a queued (offline) command.
+///
+/// The strategy determines how a replay is reconciled against newer server
+/// state. It never allows a replay to silently overwrite newer state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictStrategy {
+    /// Reject the replay if the server already has a newer version.
+    Reject,
+    /// Surface the conflict to the client for manual resolution.
+    SurfaceConflict,
+    /// Only apply if the request hash matches the original (pure idempotent replay).
+    MatchOriginal,
+}
+
+impl ConflictStrategy {
+    pub fn parse(value: &str) -> Result<Self, ApiError> {
+        match value {
+            "reject" => Ok(ConflictStrategy::Reject),
+            "surface_conflict" => Ok(ConflictStrategy::SurfaceConflict),
+            "match_original" => Ok(ConflictStrategy::MatchOriginal),
+            _ => Err(ApiError::bad_request(&format!(
+                "Unknown conflict strategy: {}",
+                value
+            ))),
+        }
+    }
+}
+
+/// A user-scoped, expiring idempotency key used for offline replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopedIdempotencyKey {
+    pub key: String,
+    pub user_id: Uuid,
+    pub request_hash: String,
+    pub conflict_strategy: ConflictStrategy,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Clone)]
 pub struct IdempotencyService {
     pub db_pool: DbPool,
@@ -21,13 +60,21 @@ impl IdempotencyService {
         Self::new(db_pool, IdempotencyPolicy::default())
     }
 
-    /// Store a new idempotency key with response data
+    /// Store a new idempotency key with response data.
+    ///
+    /// The key is scoped to `user_id` so that logout/account switch can purge
+    /// only the affected user's commands. `expires_at` is bounded by the
+    /// policy TTL; callers cannot extend it beyond the policy.
     pub async fn store_key(
         &self,
+        user_id: Uuid,
         key: String,
         request_hash: String,
         response: CachedResponse,
+        conflict_strategy: ConflictStrategy,
     ) -> Result<(), ApiError> {
+        Self::validate_key_format(&key)?;
+
         // Check response size
         if response.size_kb() > self.policy.max_response_size_kb {
             return Err(ApiError::bad_request(&format!(
@@ -38,13 +85,17 @@ impl IdempotencyService {
 
         let expires_at = Utc::now() + chrono::Duration::seconds(self.policy.default_ttl_seconds as i64);
 
-        sqlx::query!(
+        // ON CONFLICT DO NOTHING: never overwrite an existing key. If a key
+        // already exists we surface a conflict rather than silently replacing
+        // newer server state.
+        let result = sqlx::query!(
             r#"
             INSERT INTO idempotency_keys (
                 id, key, request_hash, response_status, 
-                response_headers, response_body, created_at, expires_at
+                response_headers, response_body, created_at, expires_at,
+                user_id, conflict_strategy
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
             ) ON CONFLICT (key) DO NOTHING
             "#,
             Uuid::new_v4(),
@@ -54,17 +105,32 @@ impl IdempotencyService {
             response.headers,
             response.body,
             Utc::now(),
-            expires_at
+            expires_at,
+            user_id,
+            conflict_strategy.to_string()
         )
         .execute(&self.db_pool)
         .await
         .map_err(|e| ApiError::database_error(e))?;
 
+        if result.rows_affected() == 0 {
+            return Err(ApiError::conflict(
+                "Idempotency key already exists; refusing to overwrite newer state",
+            ));
+        }
+
         Ok(())
     }
 
-    /// Get cached response for an idempotency key
-    pub async fn get_cached_response(&self, key: &str) -> Result<Option<IdempotencyKey>, ApiError> {
+    /// Get cached response for an idempotency key, scoped to the user.
+    ///
+    /// Returns `None` for expired keys or keys belonging to another user so
+    /// that a replay can never read another account's cached response.
+    pub async fn get_cached_response(
+        &self,
+        user_id: Uuid,
+        key: &str,
+    ) -> Result<Option<IdempotencyKey>, ApiError> {
         let result = sqlx::query_as!(
             IdempotencyKey,
             r#"
@@ -73,12 +139,14 @@ impl IdempotencyService {
                 created_at, expires_at, used_at
             FROM idempotency_keys 
             WHERE key = $1 
+            AND user_id = $2
             AND expires_at > NOW()
             AND used_at IS NOT NULL
             ORDER BY created_at DESC
             LIMIT 1
             "#,
-            key
+            key,
+            user_id
         )
         .fetch_optional(&self.db_pool)
         .await
@@ -87,9 +155,11 @@ impl IdempotencyService {
         Ok(result)
     }
 
-    /// Check if there's a conflict with existing idempotency key
+    /// Check if there's a conflict with existing idempotency key, scoped to
+    /// the user. Expired keys are treated as absent (no conflict).
     pub async fn check_conflict(
         &self,
+        user_id: Uuid,
         key: &str,
         new_hash: &str,
     ) -> Result<Option<IdempotencyConflict>, ApiError> {
@@ -98,11 +168,13 @@ impl IdempotencyService {
             SELECT key, request_hash, created_at 
             FROM idempotency_keys 
             WHERE key = $1 
+            AND user_id = $2
             AND expires_at > NOW()
             ORDER BY created_at DESC
             LIMIT 1
             "#,
-            key
+            key,
+            user_id
         )
         .fetch_optional(&self.db_pool)
         .await
@@ -123,11 +195,85 @@ impl IdempotencyService {
         Ok(None)
     }
 
-    /// Mark an idempotency key as used
-    pub async fn mark_key_used(&self, key: &str) -> Result<(), ApiError> {
+    /// Reconcile a replay against newer server state.
+    ///
+    /// Returns `Ok(None)` when the replay is safe to apply (matching hash and
+    /// not expired). Returns `Ok(Some(conflict))` when the replay must be
+    /// surfaced to the client rather than silently overwriting newer state.
+    pub async fn reconcile_replay(
+        &self,
+        user_id: Uuid,
+        key: &str,
+        new_hash: &str,
+        strategy: ConflictStrategy,
+    ) -> Result<Option<IdempotencyConflict>, ApiError> {
+        let existing = sqlx::query!(
+            r#"
+            SELECT key, request_hash, created_at, expires_at, conflict_strategy
+            FROM idempotency_keys 
+            WHERE key = $1 
+            AND user_id = $2
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            key,
+            user_id
+        )
+        .fetch_optional(&self.db_pool)
+        .await
+        .map_err(|e| ApiError::database_error(e))?;
+
+        let Some(existing) = existing else {
+            return Ok(None);
+        };
+
+        // Expired commands must not be replayed.
+        if existing.expires_at <= Utc::now() {
+            return Ok(Some(IdempotencyConflict {
+                key: key.to_string(),
+                original_hash: existing.request_hash,
+                new_hash: new_hash.to_string(),
+                original_timestamp: existing.created_at,
+                conflict_type: ConflictType::Expired,
+            }));
+        }
+
+        if existing.request_hash == new_hash {
+            return Ok(None);
+        }
+
+        // Hash mismatch: never silently overwrite. Surface the conflict
+        // regardless of strategy; the strategy only affects how the client
+        // should resolve it.
+        let _ = strategy;
+        Ok(Some(IdempotencyConflict {
+            key: key.to_string(),
+            original_hash: existing.request_hash,
+            new_hash: new_hash.to_string(),
+            original_timestamp: existing.created_at,
+            conflict_type: ConflictType::PayloadMismatch,
+        }))
+    }
+
+    /// Purge all queued commands for a user (logout / account switch).
+    pub async fn purge_user_keys(&self, user_id: Uuid) -> Result<i64, ApiError> {
+        let result = sqlx::query!(
+            "DELETE FROM idempotency_keys WHERE user_id = $1",
+            user_id
+        )
+        .execute(&self.db_pool)
+        .await
+        .map_err(|e| ApiError::database_error(e))?;
+
+        Ok(result.rows_affected() as i64)
+    }
+
+    /// Mark an idempotency key as used, scoped to the user.
+    pub async fn mark_key_used(&self, user_id: Uuid, key: &str) -> Result<(), ApiError> {
         sqlx::query!(
-            "UPDATE idempotency_keys SET used_at = NOW() WHERE key = $1",
-            key
+            "UPDATE idempotency_keys SET used_at = NOW() WHERE key = $1 AND user_id = $2",
+            key,
+            user_id
         )
         .execute(&self.db_pool)
         .await
@@ -217,11 +363,12 @@ impl IdempotencyService {
         Ok(keys)
     }
 
-    /// Invalidate an idempotency key (admin function)
-    pub async fn invalidate_key(&self, key: &str) -> Result<(), ApiError> {
+    /// Invalidate an idempotency key (admin function), scoped to the user.
+    pub async fn invalidate_key(&self, user_id: Uuid, key: &str) -> Result<(), ApiError> {
         sqlx::query!(
-            "DELETE FROM idempotency_keys WHERE key = $1",
-            key
+            "DELETE FROM idempotency_keys WHERE key = $1 AND user_id = $2",
+            key,
+            user_id
         )
         .execute(&self.db_pool)
         .await
@@ -280,102 +427,24 @@ impl IdempotencyService {
         format!("idemp_{}", Uuid::new_v4().to_string().replace("-", ""))
     }
 
-    /// Build the canonical dedupe key for an analytics event.
-    ///
-    /// Producers assign a stable `event_id`; combined with the `producer_id`
-    /// this yields a deterministic key so that retries (including after a
-    /// producer restart) converge on the same ingestion record.
-    pub fn analytics_dedupe_key(producer_id: &str, event_id: &str) -> String {
-        format!("analytics:{}:{}", producer_id, event_id)
-    }
-
-    /// Record the outcome of an analytics ingestion attempt.
-    ///
-    /// Returns `Ok(true)` when this call created the record (i.e. the event
-    /// was processed for the first time) and `Ok(false)` when a record for the
-    /// same `producer_id` + `event_id` already existed. Callers should treat
-    /// `Ok(false)` as "already handled" and return the previously stored
-    /// outcome instead of re-processing the event.
-    ///
-    /// The insert is guarded by `ON CONFLICT DO NOTHING` so concurrent
-    /// duplicate deliveries race safely and only one wins.
-    pub async fn record_analytics_outcome(
+    /// Build a scoped key descriptor for an offline command, enforcing the
+    /// policy TTL so callers cannot extend expiry beyond the policy.
+    pub fn scoped_key(
         &self,
-        producer_id: &str,
-        event_id: &str,
-        outcome: &AnalyticsIngestOutcome,
-    ) -> Result<bool, ApiError> {
-        if producer_id.trim().is_empty() {
-            return Err(ApiError::bad_request("producer_id must not be empty"));
-        }
-        if event_id.trim().is_empty() {
-            return Err(ApiError::bad_request("event_id must not be empty"));
-        }
-
-        let key = Self::analytics_dedupe_key(producer_id, event_id);
-        let now = Utc::now();
-        let expires_at = now + chrono::Duration::seconds(self.policy.default_ttl_seconds as i64);
-
-        let result = sqlx::query!(
-            r#"
-            INSERT INTO idempotency_keys (
-                id, key, request_hash, response_status,
-                response_headers, response_body, created_at, expires_at, used_at
-            ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9
-            ) ON CONFLICT (key) DO NOTHING
-            "#,
-            Uuid::new_v4(),
+        user_id: Uuid,
+        key: String,
+        request_hash: String,
+        conflict_strategy: ConflictStrategy,
+    ) -> Result<ScopedIdempotencyKey, ApiError> {
+        Self::validate_key_format(&key)?;
+        Ok(ScopedIdempotencyKey {
             key,
-            format!("{}:{}", producer_id, event_id),
-            outcome.status_code() as i16,
-            serde_json::json!({ "content-type": "application/json" }),
-            serde_json::to_vec(outcome).map_err(|e| ApiError::bad_request(&e.to_string()))?,
-            now,
-            expires_at,
-            now
-        )
-        .execute(&self.db_pool)
-        .await
-        .map_err(|e| ApiError::database_error(e))?;
-
-        Ok(result.rows_affected() == 1)
-    }
-
-    /// Fetch the previously recorded analytics ingestion outcome, if any.
-    ///
-    /// Used on retries to return the original accepted/rejected result rather
-    /// than re-processing the event.
-    pub async fn get_analytics_outcome(
-        &self,
-        producer_id: &str,
-        event_id: &str,
-    ) -> Result<Option<AnalyticsIngestOutcome>, ApiError> {
-        let key = Self::analytics_dedupe_key(producer_id, event_id);
-
-        let row = sqlx::query!(
-            r#"
-            SELECT response_body
-            FROM idempotency_keys
-            WHERE key = $1
-            AND expires_at > NOW()
-            ORDER BY created_at DESC
-            LIMIT 1
-            "#,
-            key
-        )
-        .fetch_optional(&self.db_pool)
-        .await
-        .map_err(|e| ApiError::database_error(e))?;
-
-        match row {
-            Some(record) => {
-                let outcome = serde_json::from_slice::<AnalyticsIngestOutcome>(&record.response_body)
-                    .map_err(|e| ApiError::database_error(e))?;
-                Ok(Some(outcome))
-            }
-            None => Ok(None),
-        }
+            user_id,
+            request_hash,
+            conflict_strategy,
+            expires_at: Utc::now()
+                + chrono::Duration::seconds(self.policy.default_ttl_seconds as i64),
+        })
     }
 
     /// Validate idempotency key format
@@ -397,40 +466,13 @@ impl IdempotencyService {
     }
 }
 
-/// Outcome of an analytics ingestion attempt, persisted for deduplication.
-///
-/// Retries for the same `producer_id` + `event_id` return the stored outcome
-/// so that accepted events are not double-counted and rejected events remain
-/// diagnosable.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum AnalyticsIngestOutcome {
-    /// Event was accepted and recorded.
-    Accepted {
-        /// Schema version the event was validated against.
-        schema_version: String,
-    },
-    /// Event was rejected (malformed or schema-invalid) and is diagnosable.
-    Rejected {
-        /// Machine-readable rejection reason.
-        reason: String,
-        /// Schema version the event was validated against.
-        schema_version: String,
-    },
-}
-
-impl AnalyticsIngestOutcome {
-    /// HTTP status code associated with this outcome.
-    pub fn status_code(&self) -> u16 {
+impl ConflictStrategy {
+    pub fn to_string(&self) -> String {
         match self {
-            AnalyticsIngestOutcome::Accepted { .. } => 202,
-            AnalyticsIngestOutcome::Rejected { .. } => 422,
+            ConflictStrategy::Reject => "reject".to_string(),
+            ConflictStrategy::SurfaceConflict => "surface_conflict".to_string(),
+            ConflictStrategy::MatchOriginal => "match_original".to_string(),
         }
-    }
-
-    /// Whether the event was accepted.
-    pub fn is_accepted(&self) -> bool {
-        matches!(self, AnalyticsIngestOutcome::Accepted { .. })
     }
 }
 

@@ -6,11 +6,39 @@ use uuid::Uuid;
 
 use crate::api_error::ApiError;
 use crate::auth::middleware::ClaimsExt;
+use crate::contract_errors::{self, ContractError, RecoveryClass};
 use crate::models::{
     DepositRequest, PaginatedResponse, PaginationParams, TransactionResponse, TransactionStatus,
     TransactionType, WalletResponse, WithdrawalRequest,
 };
 use crate::service::WalletService;
+
+/// Map a service-layer error to a stable public contract error response.
+///
+/// Known errors resolve through the canonical catalog; unknown errors are
+/// logged with transaction context (never signing material) and returned as a
+/// distinguishable `UNKNOWN_CONTRACT_ERROR` code.
+fn map_service_error(err: &crate::service::wallet_service::WalletError, context: &str) -> ApiError {
+    let contract_error = ContractError::from_wallet_error(err);
+    if matches!(contract_error, ContractError::Unknown { .. }) {
+        tracing::error!(
+            context = %context,
+            error = %err,
+            "Unmapped wallet/contract error encountered"
+        );
+    }
+    contract_error.to_api_error()
+}
+
+/// Build the JSON body describing a contract error for clients.
+fn contract_error_body(err: &ContractError) -> serde_json::Value {
+    serde_json::json!({
+        "code": err.code(),
+        "message": err.safe_message(),
+        "recovery": err.recovery().as_str(),
+        "retryable": matches!(err.recovery(), RecoveryClass::Retry),
+    })
+}
 
 #[derive(Deserialize)]
 pub struct PaymentVerificationRequest {
@@ -57,7 +85,7 @@ pub async fn get_transaction_history(
     let (transactions, total) = service
         .get_transaction_history_paginated(user_id, limit, offset)
         .await
-        .map_err(|e| ApiError::internal_error(format!("Failed to fetch transactions: {}", e)))?;
+        .map_err(|e| map_service_error(&e, "get_transaction_history"))?;
 
     let data: Vec<TransactionResponse> = transactions
         .into_iter()
@@ -102,7 +130,8 @@ pub async fn initiate_deposit(
             format!("Wallet deposit via {}", body.payment_method),
             None,
         )
-        .await?;
+        .await
+        .map_err(|e| map_service_error(&e, "initiate_deposit"))?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "transaction_id": transaction.id,
@@ -128,11 +157,15 @@ pub async fn verify_deposit(
 
     let transaction = service
         .get_transaction_by_reference(&body.reference)
-        .await?;
+        .await
+        .map_err(|e| map_service_error(&e, "verify_deposit:lookup"))?;
 
+    // Duplicate delivery: an already-completed transaction is idempotent and
+    // must not be re-verified or re-applied.
     if transaction.status == TransactionStatus::Completed {
         return Ok(HttpResponse::Ok().json(serde_json::json!({
             "status": "completed",
+            "duplicate": true,
             "transaction": transaction
         })));
     }
@@ -141,17 +174,20 @@ pub async fn verify_deposit(
     // that isn't enabled verifies as false, as an unknown one always did.
     let verified = service
         .verify_payment(&body.provider, &body.reference, transaction.amount.to_i64().unwrap_or(0))
-        .await?;
+        .await
+        .map_err(|e| map_service_error(&e, "verify_deposit:verify"))?;
 
     if verified {
         service
             .update_transaction_status(transaction.id, TransactionStatus::Completed)
-            .await?;
+            .await
+            .map_err(|e| map_service_error(&e, "verify_deposit:finalize"))?;
     }
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "status": if verified { "completed" } else { "failed" },
-        "verified": verified
+        "verified": verified,
+        "duplicate": false
     })))
 }
 
@@ -171,15 +207,10 @@ pub async fn initiate_withdrawal(
 
     let service = WalletService::new(pool.get_ref().clone().into(), None);
 
-    let wallet = service.get_wallet(user_id).await.map_err(|e| match e {
-        crate::service::wallet_service::WalletError::InsufficientBalance { required, available } => {
-            ApiError::bad_request(format!(
-                "Insufficient balance: required {}, available {}",
-                required, available
-            ))
-        }
-        _ => ApiError::not_found("Wallet not found"),
-    })?;
+    let wallet = service
+        .get_wallet(user_id)
+        .await
+        .map_err(|e| map_service_error(&e, "initiate_withdrawal:wallet"))?;
 
     let available_balance = match body.currency.as_str() {
         "NGN" => wallet.balance_ngn.unwrap_or(0),
@@ -210,7 +241,8 @@ pub async fn initiate_withdrawal(
             format!("Withdrawal to {}", body.destination),
             None,
         )
-        .await?;
+        .await
+        .map_err(|e| map_service_error(&e, "initiate_withdrawal:create"))?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "transaction_id": transaction.id,
@@ -222,4 +254,55 @@ pub async fn initiate_withdrawal(
         "payment_method": body.payment_method,
         "message": "Withdrawal initiated. Processing may take a few minutes."
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::wallet_service::WalletError;
+
+    #[test]
+    fn known_errors_map_to_stable_codes() {
+        let err = WalletError::InsufficientBalance {
+            required: 100,
+            available: 10,
+        };
+        let contract_error = ContractError::from_wallet_error(&err);
+        let body = contract_error_body(&contract_error);
+        assert_eq!(body["code"], contract_error.code());
+        assert_eq!(body["recovery"], contract_error.recovery().as_str());
+        assert!(body["message"].as_str().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn unknown_error_is_distinguishable_and_retryable() {
+        let err = WalletError::Internal("boom: secret=abc".to_string());
+        let contract_error = ContractError::from_wallet_error(&err);
+        let body = contract_error_body(&contract_error);
+        assert_eq!(body["code"], "UNKNOWN_CONTRACT_ERROR");
+        assert_eq!(body["retryable"], true);
+        // Safe message must not leak raw internal detail.
+        assert!(!body["message"].as_str().unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn retry_classification_is_exposed() {
+        let err = WalletError::NetworkTimeout;
+        let contract_error = ContractError::from_wallet_error(&err);
+        let body = contract_error_body(&contract_error);
+        assert_eq!(body["retryable"], true);
+        assert_eq!(body["recovery"], RecoveryClass::Retry.as_str());
+    }
+
+    #[test]
+    fn failure_classification_is_not_retryable() {
+        let err = WalletError::InsufficientBalance {
+            required: 100,
+            available: 10,
+        };
+        let contract_error = ContractError::from_wallet_error(&err);
+        let body = contract_error_body(&contract_error);
+        assert_eq!(body["retryable"], false);
+        assert_eq!(body["recovery"], RecoveryClass::Manual.as_str());
+    }
 }

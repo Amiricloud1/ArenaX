@@ -2,6 +2,9 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./e2e",
+  // The state-sync project owns its own specs; keep them out of the default
+  // chromium projects so each scenario runs exactly once per run.
+  testIgnore: /state-sync\/.*\.spec\.ts/,
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
@@ -41,14 +44,38 @@ export default defineConfig({
     {
       name: "chromium",
       use: { ...devices["Desktop Chrome"] },
+      // Failure-injection and consent specs run against the production build
+      // (see webServer below) so bundle-budget assertions reflect shipped code.
+      testMatch: [
+        "**/error-boundaries.spec.ts",
+        "**/analytics-consent.spec.ts",
+        "**/bundle-budget.spec.ts",
+      ],
     },
     {
       name: "chromium-mobile",
       use: { ...devices["Pixel 5"] },
+      testMatch: [
+        "**/error-boundaries.spec.ts",
+        "**/analytics-consent.spec.ts",
+        "**/bundle-budget.spec.ts",
+      ],
+    },
+    {
+      // Browser-level coverage for realtime snapshot/event reconciliation,
+      // the offline command queue, optimistic rollback, and deep-link
+      // preservation. These specs drive the app through mocked network and
+      // websocket boundaries, so they run on a single deterministic project
+      // and are excluded from the visual-regression projects above.
+      name: "state-sync",
+      testMatch: /state-sync\/.*\.spec\.ts/,
+      use: { ...devices["Desktop Chrome"] },
     },
   ],
   webServer: {
-    command: "npm run dev",
+    // Build and serve the production bundle so bundle-budget and
+    // hydration-cost checks measure the shipped output, not the dev server.
+    command: "npm run build && npm run start",
     // NOTE: with next-intl `localePrefix: "always"`, "/" is a 307 redirect to
     // "/en", so probing "/" never yields a 200 and Playwright waits until
     // timeout. Probe the default-locale home (public, renders 200) instead.

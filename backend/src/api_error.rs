@@ -1,5 +1,6 @@
 use actix_web::{HttpResponse, ResponseError};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use thiserror::Error;
 use tracing::error;
 
@@ -84,6 +85,184 @@ pub enum ApiError {
     /// "something is broken in a way retrying will not help".
     #[error("Service unavailable: {0}")]
     ServiceUnavailable(String),
+
+    /// A contract call failed. Carries the stable public code, a safe
+    /// user-facing message, and the recovery classification so clients and
+    /// support can act on it without interpreting raw contract errors.
+    #[error("Contract error: {message}")]
+    ContractError {
+        code: String,
+        message: String,
+        recovery: RecoveryClass,
+    },
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public contract error catalog (Issue #235)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How a client (or operator) should recover from a contract error.
+///
+/// This is deliberately coarse: three buckets are enough to drive automated
+/// retry logic and support escalation without leaking internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryClass {
+    /// Transient — the same request may succeed if retried (with backoff).
+    Retry,
+    /// Not retryable automatically; a human must intervene (e.g. reconcile a
+    /// duplicate delivery or top up a balance).
+    ManualRecovery,
+    /// Terminal — retrying will never help; the request is rejected for good.
+    Fatal,
+}
+
+/// Stable code emitted when a contract returns an error we do not recognise.
+///
+/// Kept distinct from every known code so clients can tell "we know what went
+/// wrong" from "something new happened" and route it to support.
+pub const UNKNOWN_CONTRACT_ERROR: &str = "CONTRACT_UNKNOWN_ERROR";
+
+/// One entry in the public contract error catalog.
+///
+/// Serializable so the frontend and generated docs can consume the exact same
+/// mapping the backend uses — there is one source of truth.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ContractErrorEntry {
+    /// Stable, machine-readable code. Never changes once published.
+    pub code: &'static str,
+    /// Safe, user-facing message. Contains no internal details.
+    pub message: &'static str,
+    /// How to recover from this error.
+    pub recovery: RecoveryClass,
+}
+
+/// The full public contract error catalog.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ContractErrorCatalog {
+    pub entries: Vec<ContractErrorEntry>,
+}
+
+impl ContractErrorCatalog {
+    /// Look up a catalog entry by its stable code.
+    pub fn get(&self, code: &str) -> Option<&ContractErrorEntry> {
+        self.entries.iter().find(|e| e.code == code)
+    }
+}
+
+/// Every public contract error, mapped to a stable code, safe message, and
+/// recovery classification.
+///
+/// Codes are derived from `AntiCheatError` and `VirtualEconomyError` variants.
+/// Once published a code must never be reused for a different meaning.
+pub fn contract_error_catalog() -> ContractErrorCatalog {
+    use RecoveryClass::*;
+
+    let entries = vec![
+        // ── AntiCheatError ────────────────────────────────────────────────
+        ContractErrorEntry {
+            code: "ANTICHEAT_UNAUTHORIZED",
+            message: "You are not authorized to perform this action.",
+            recovery: Fatal,
+        },
+        ContractErrorEntry {
+            code: "ANTICHEAT_INVALID_PROOF",
+            message: "The submitted proof could not be verified.",
+            recovery: Fatal,
+        },
+        ContractErrorEntry {
+            code: "ANTICHEAT_PROOF_EXPIRED",
+            message: "The submitted proof has expired. Please request a new one.",
+            recovery: Retry,
+        },
+        ContractErrorEntry {
+            code: "ANTICHEAT_DUPLICATE_SUBMISSION",
+            message: "This submission was already recorded.",
+            recovery: ManualRecovery,
+        },
+        ContractErrorEntry {
+            code: "ANTICHEAT_RATE_LIMITED",
+            message: "Too many submissions. Please try again later.",
+            recovery: Retry,
+        },
+        ContractErrorEntry {
+            code: "ANTICHEAT_INVALID_STATE",
+            message: "The contract is not in a state that allows this action.",
+            recovery: Fatal,
+        },
+        ContractErrorEntry {
+            code: "ANTICHEAT_NOT_INITIALIZED",
+            message: "The anti-cheat contract has not been initialized.",
+            recovery: ManualRecovery,
+        },
+        // ── VirtualEconomyError ───────────────────────────────────────────
+        ContractErrorEntry {
+            code: "ECONOMY_UNAUTHORIZED",
+            message: "You are not authorized to perform this action.",
+            recovery: Fatal,
+        },
+        ContractErrorEntry {
+            code: "ECONOMY_INSUFFICIENT_BALANCE",
+            message: "Insufficient balance for this transaction.",
+            recovery: ManualRecovery,
+        },
+        ContractErrorEntry {
+            code: "ECONOMY_INVALID_AMOUNT",
+            message: "The amount is not valid for this transaction.",
+            recovery: Fatal,
+        },
+        ContractErrorEntry {
+            code: "ECONOMY_OVERFLOW",
+            message: "The transaction would overflow the allowed range.",
+            recovery: Fatal,
+        },
+        ContractErrorEntry {
+            code: "ECONOMY_DUPLICATE_TRANSACTION",
+            message: "This transaction was already processed.",
+            recovery: ManualRecovery,
+        },
+        ContractErrorEntry {
+            code: "ECONOMY_ITEM_NOT_FOUND",
+            message: "The requested item does not exist.",
+            recovery: Fatal,
+        },
+        ContractErrorEntry {
+            code: "ECONOMY_NOT_INITIALIZED",
+            message: "The economy contract has not been initialized.",
+            recovery: ManualRecovery,
+        },
+        // ── Unknown ───────────────────────────────────────────────────────
+        ContractErrorEntry {
+            code: UNKNOWN_CONTRACT_ERROR,
+            message: "An unexpected contract error occurred. Please contact support.",
+            recovery: ManualRecovery,
+        },
+    ];
+
+    ContractErrorCatalog { entries }
+}
+
+/// Context attached to a contract error for logging. Never contains signing
+/// material — only identifiers safe to log.
+#[derive(Debug, Clone, Default)]
+pub struct ContractTxContext {
+    pub transaction_hash: Option<String>,
+    pub contract_id: Option<String>,
+    pub method: Option<String>,
+}
+
+impl ContractTxContext {
+    pub fn new(
+        transaction_hash: impl Into<String>,
+        contract_id: impl Into<String>,
+        method: impl Into<String>,
+    ) -> Self {
+        Self {
+            transaction_hash: Some(transaction_hash.into()),
+            contract_id: Some(contract_id.into()),
+            method: Some(method.into()),
+        }
+    }
 }
 
 // Helper methods for convenience
@@ -137,6 +316,44 @@ impl ApiError {
             retry_after: 60,
         }
     }
+
+    /// Translate a raw contract error code into a public `ApiError`.
+    ///
+    /// Known codes map to their catalog entry (stable code, safe message,
+    /// recovery class). Unknown codes are logged at ERROR with transaction
+    /// context — never signing material — and surface as
+    /// `UNKNOWN_CONTRACT_ERROR` so they stay distinguishable from known
+    /// failures.
+    pub fn from_contract_error(code: &str, tx_context: &ContractTxContext) -> Self {
+        let catalog = contract_error_catalog();
+
+        if let Some(entry) = catalog.get(code) {
+            return ApiError::ContractError {
+                code: entry.code.to_string(),
+                message: entry.message.to_string(),
+                recovery: entry.recovery,
+            };
+        }
+
+        // Unknown: log with context so support can trace it, but never echo
+        // the raw code or any signing material back to the client.
+        error!(
+            contract.error.code = %code,
+            transaction.hash = tx_context.transaction_hash.as_deref().unwrap_or(""),
+            contract.id = tx_context.contract_id.as_deref().unwrap_or(""),
+            contract.method = tx_context.method.as_deref().unwrap_or(""),
+            "Unknown contract error"
+        );
+
+        let unknown = catalog
+            .get(UNKNOWN_CONTRACT_ERROR)
+            .expect("unknown contract error entry must exist");
+        ApiError::ContractError {
+            code: unknown.code.to_string(),
+            message: unknown.message.to_string(),
+            recovery: unknown.recovery,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -148,6 +365,12 @@ struct ErrorResponse {
     /// response shape stays unchanged for every existing consumer.
     #[serde(skip_serializing_if = "Option::is_none")]
     fields: Option<Vec<FieldError>>,
+    /// Stable contract error code. Present only for contract errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    contract_code: Option<String>,
+    /// Recovery classification for contract errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery: Option<RecoveryClass>,
 }
 
 impl ResponseError for ApiError {
@@ -192,6 +415,25 @@ impl ResponseError for ApiError {
                 actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
                 self.to_string(),
             ),
+            // Contract errors are classified by recovery: retryable ones answer
+            // 503 so clients back off; manual/fatal ones answer 409 so they are
+            // not retried blindly.
+            ApiError::ContractError { message, recovery, .. } => {
+                let status = match recovery {
+                    RecoveryClass::Retry => actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+                    RecoveryClass::ManualRecovery | RecoveryClass::Fatal => {
+                        actix_web::http::StatusCode::CONFLICT
+                    }
+                };
+                (status, message.clone())
+            }
+        };
+
+        let (contract_code, recovery) = match self {
+            ApiError::ContractError { code, recovery, .. } => {
+                (Some(code.clone()), Some(*recovery))
+            }
+            _ => (None, None),
         };
 
         let error_response = ErrorResponse {
@@ -206,6 +448,8 @@ impl ResponseError for ApiError {
                 ApiError::ValidationFailed(fields) => Some(fields.clone()),
                 _ => None,
             },
+            contract_code,
+            recovery,
         };
 
         let mut builder = HttpResponse::build(status);
@@ -447,6 +691,133 @@ mod validation_tests {
         let response = ApiError::NotFound.error_response();
 
         assert_eq!(response.status().as_u16(), 404);
+    }
+}
+
+#[cfg(test)]
+mod contract_error_tests {
+    use super::*;
+    use actix_web::ResponseError;
+
+    /// Every public contract error code the catalog must cover.
+    const PUBLIC_CODES: &[&str] = &[
+        "ANTICHEAT_UNAUTHORIZED",
+        "ANTICHEAT_INVALID_PROOF",
+        "ANTICHEAT_PROOF_EXPIRED",
+        "ANTICHEAT_DUPLICATE_SUBMISSION",
+        "ANTICHEAT_RATE_LIMITED",
+        "ANTICHEAT_INVALID_STATE",
+        "ANTICHEAT_NOT_INITIALIZED",
+        "ECONOMY_UNAUTHORIZED",
+        "ECONOMY_INSUFFICIENT_BALANCE",
+        "ECONOMY_INVALID_AMOUNT",
+        "ECONOMY_OVERFLOW",
+        "ECONOMY_DUPLICATE_TRANSACTION",
+        "ECONOMY_ITEM_NOT_FOUND",
+        "ECONOMY_NOT_INITIALIZED",
+    ];
+
+    fn ctx() -> ContractTxContext {
+        ContractTxContext::new("deadbeef", "CABC", "submit")
+    }
+
+    #[test]
+    fn every_public_error_maps_to_a_stable_code_message_and_recovery() {
+        let catalog = contract_error_catalog();
+
+        for code in PUBLIC_CODES {
+            let entry = catalog
+                .get(code)
+                .unwrap_or_else(|| panic!("missing catalog entry for {code}"));
+            assert_eq!(entry.code, *code);
+            assert!(!entry.message.is_empty(), "{code} has empty message");
+        }
+    }
+
+    #[test]
+    fn catalog_codes_are_unique() {
+        let catalog = contract_error_catalog();
+        let mut seen = BTreeMap::new();
+        for entry in &catalog.entries {
+            assert!(
+                seen.insert(entry.code, ()).is_none(),
+                "duplicate code {}",
+                entry.code
+            );
+        }
+    }
+
+    #[test]
+    fn known_code_translates_to_contract_error() {
+        let err = ApiError::from_contract_error("ECONOMY_INSUFFICIENT_BALANCE", &ctx());
+
+        match err {
+            ApiError::ContractError { code, recovery, .. } => {
+                assert_eq!(code, "ECONOMY_INSUFFICIENT_BALANCE");
+                assert_eq!(recovery, RecoveryClass::ManualRecovery);
+            }
+            other => panic!("expected ContractError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_code_stays_distinguishable() {
+        let err = ApiError::from_contract_error("SOME_FUTURE_ERROR", &ctx());
+
+        match err {
+            ApiError::ContractError { code, recovery, .. } => {
+                assert_eq!(code, UNKNOWN_CONTRACT_ERROR);
+                assert_eq!(recovery, RecoveryClass::ManualRecovery);
+            }
+            other => panic!("expected ContractError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retryable_errors_answer_503() {
+        let err = ApiError::from_contract_error("ANTICHEAT_RATE_LIMITED", &ctx());
+
+        assert_eq!(err.error_response().status().as_u16(), 503);
+    }
+
+    #[test]
+    fn fatal_errors_answer_409() {
+        let err = ApiError::from_contract_error("ECONOMY_INVALID_AMOUNT", &ctx());
+
+        assert_eq!(err.error_response().status().as_u16(), 409);
+    }
+
+    #[test]
+    fn duplicate_delivery_is_manual_recovery() {
+        let err = ApiError::from_contract_error("ECONOMY_DUPLICATE_TRANSACTION", &ctx());
+
+        match err {
+            ApiError::ContractError { recovery, .. } => {
+                assert_eq!(recovery, RecoveryClass::ManualRecovery);
+            }
+            other => panic!("expected ContractError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_submission_is_manual_recovery() {
+        let err = ApiError::from_contract_error("ANTICHEAT_DUPLICATE_SUBMISSION", &ctx());
+
+        match err {
+            ApiError::ContractError { recovery, .. } => {
+                assert_eq!(recovery, RecoveryClass::ManualRecovery);
+            }
+            other => panic!("expected ContractError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catalog_serializes_for_frontend_consumption() {
+        let catalog = contract_error_catalog();
+        let json = serde_json::to_string(&catalog).expect("catalog must serialize");
+
+        assert!(json.contains("ANTICHEAT_UNAUTHORIZED"));
+        assert!(json.contains("manual_recovery"));
     }
 }
 

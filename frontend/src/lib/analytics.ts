@@ -7,7 +7,20 @@ import type {
   ConsentState,
   SessionProperties,
 } from "@/types/analytics";
-import { getAnalyticsConsentCookie, setAnalyticsConsentCookie } from "@/lib/consentCookie";
+import {
+  getAnalyticsConsentCookie,
+  setAnalyticsConsentCookie,
+} from "@/lib/consentCookie";
+import {
+  CONSENT_VERSION,
+  loadConsentRecord,
+  saveConsentRecord,
+  type ConsentRecord,
+} from "@/lib/consentRecord";
+import {
+  validateEvent,
+  type EventValidationResult,
+} from "@/lib/analyticsSchema";
 
 const SESSION_KEY = "arenax:analytics:session";
 const SUBJECT_KEY = "arenax:analytics:subject";
@@ -31,6 +44,210 @@ interface IdentityLink {
   accountRef: string;
   purpose: "product-analytics";
   consentAt: number;
+}
+
+/**
+ * Resource families whose caches are scoped by identity/permissions.
+ * Only these identifiers are ever broadcast across tabs — never payloads.
+ */
+export type ResourceFamily =
+  | "wallet"
+  | "profile"
+  | "membership"
+  | "notifications"
+  | "analytics";
+
+const RESOURCE_FAMILIES: readonly ResourceFamily[] = [
+  "wallet",
+  "profile",
+  "membership",
+  "notifications",
+  "analytics",
+];
+
+/** Minimum stable security scope for a cache key. */
+export interface CacheScope {
+  accountId: string | null;
+  workspaceId: string | null;
+  permissions: readonly string[];
+}
+
+/**
+ * Build a stable, security-scoped query key. Authenticated keys always include
+ * the account/workspace scope and a sorted permission fingerprint so a cached
+ * response can never be served across identities or privilege changes.
+ */
+export function buildScopedQueryKey(
+  family: ResourceFamily,
+  scope: CacheScope,
+  ...parts: readonly (string | number | boolean | null)[]
+): readonly unknown[] {
+  const permissions = [...scope.permissions].sort().join(",");
+  return [
+    family,
+    scope.accountId ?? "anon",
+    scope.workspaceId ?? "none",
+    permissions,
+    ...parts,
+  ] as const;
+}
+
+/** True when the scope represents an authenticated, permission-bearing user. */
+export function isAuthenticatedScope(scope: CacheScope): boolean {
+  return Boolean(scope.accountId);
+}
+
+/** True when the scope is authorized to view a given resource family. */
+export function canViewFamily(scope: CacheScope, family: ResourceFamily): boolean {
+  if (!scope.accountId) return false;
+  if (family === "analytics") return true;
+  return scope.permissions.includes(family) || scope.permissions.includes("*");
+}
+
+// ── Cross-tab invalidation protocol ─────────────────────────────────────────
+
+const CROSS_TAB_CHANNEL = "arenax:invalidation";
+const CROSS_TAB_VERSION = 1;
+const MAX_MESSAGE_BYTES = 512;
+const MAX_FAMILIES_PER_MESSAGE = RESOURCE_FAMILIES.length;
+
+interface InvalidationMessage {
+  v: number;
+  type: "invalidate";
+  families: ResourceFamily[];
+  ts: number;
+}
+
+function isResourceFamily(value: unknown): value is ResourceFamily {
+  return typeof value === "string" && (RESOURCE_FAMILIES as readonly string[]).includes(value);
+}
+
+/** Parse an untrusted cross-tab message; returns null when malformed. */
+export function parseInvalidationMessage(raw: unknown): InvalidationMessage | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const candidate = raw as Record<string, unknown>;
+  if (candidate.v !== CROSS_TAB_VERSION) return null;
+  if (candidate.type !== "invalidate") return null;
+  if (typeof candidate.ts !== "number" || !Number.isFinite(candidate.ts)) return null;
+  if (!Array.isArray(candidate.families)) return null;
+  if (candidate.families.length === 0 || candidate.families.length > MAX_FAMILIES_PER_MESSAGE) {
+    return null;
+  }
+  const families: ResourceFamily[] = [];
+  for (const family of candidate.families) {
+    if (!isResourceFamily(family)) return null;
+    if (!families.includes(family)) families.push(family);
+  }
+  return { v: CROSS_TAB_VERSION, type: "invalidate", families, ts: candidate.ts };
+}
+
+type InvalidationHandler = (families: readonly ResourceFamily[]) => void;
+
+/**
+ * Versioned, bounded cross-tab invalidation bus. Uses BroadcastChannel when
+ * available and falls back to a storage event. Messages carry only resource
+ * family identifiers; receivers filter by their own authorization scope.
+ */
+export class CrossTabInvalidation {
+  private channel: BroadcastChannel | null = null;
+  private handlers = new Set<InvalidationHandler>();
+  private scopeProvider: () => CacheScope;
+  private storageKey: string;
+  private onStorage: ((event: StorageEvent) => void) | null = null;
+  private disposed = false;
+
+  constructor(scopeProvider: () => CacheScope, namespace = "default") {
+    this.scopeProvider = scopeProvider;
+    this.storageKey = `${CROSS_TAB_CHANNEL}:${namespace}`;
+    if (typeof window === "undefined") return;
+    try {
+      if (typeof BroadcastChannel !== "undefined") {
+        this.channel = new BroadcastChannel(CROSS_TAB_CHANNEL);
+        this.channel.onmessage = (event: MessageEvent) => this.receive(event.data);
+        return;
+      }
+    } catch {
+      this.channel = null;
+    }
+    // Fallback: storage events are delivered to other tabs but not the sender.
+    this.onStorage = (event: StorageEvent) => {
+      if (event.key !== this.storageKey || !event.newValue) return;
+      try {
+        this.receive(JSON.parse(event.newValue));
+      } catch {
+        // ignore malformed
+      }
+    };
+    window.addEventListener("storage", this.onStorage);
+  }
+
+  subscribe(handler: InvalidationHandler): () => void {
+    this.handlers.add(handler);
+    return () => this.handlers.delete(handler);
+  }
+
+  /** Broadcast invalidation for the given families (no private payloads). */
+  publish(families: readonly ResourceFamily[]): void {
+    if (this.disposed) return;
+    const unique = families.filter((f, i) => families.indexOf(f) === i).slice(0, MAX_FAMILIES_PER_MESSAGE);
+    if (unique.length === 0) return;
+    const message: InvalidationMessage = {
+      v: CROSS_TAB_VERSION,
+      type: "invalidate",
+      families: unique,
+      ts: Date.now(),
+    };
+    const serialized = JSON.stringify(message);
+    if (serialized.length > MAX_MESSAGE_BYTES) return;
+    if (this.channel) {
+      try {
+        this.channel.postMessage(message);
+        return;
+      } catch {
+        // fall through to storage
+      }
+    }
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(this.storageKey, serialized);
+      window.localStorage.removeItem(this.storageKey);
+    } catch {
+      // storage unavailable; nothing else to do
+    }
+  }
+
+  private receive(raw: unknown): void {
+    if (this.disposed) return;
+    const message = parseInvalidationMessage(raw);
+    if (!message) return;
+    const scope = this.scopeProvider();
+    const authorized = message.families.filter((family) => canViewFamily(scope, family));
+    if (authorized.length === 0) return;
+    this.handlers.forEach((handler) => {
+      try {
+        handler(authorized);
+      } catch {
+        // isolate handler failures
+      }
+    });
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.handlers.clear();
+    if (this.channel) {
+      try {
+        this.channel.close();
+      } catch {
+        // ignore
+      }
+      this.channel = null;
+    }
+    if (this.onStorage && typeof window !== "undefined") {
+      window.removeEventListener("storage", this.onStorage);
+      this.onStorage = null;
+    }
+  }
 }
 
 function generateId(): string {
@@ -98,6 +315,10 @@ function clearOutbox(): void {
 }
 
 function loadConsent(): ConsentState {
+  const record = loadConsentRecord();
+  if (record) {
+    return { analytics: record.analytics, updatedAt: record.updatedAt };
+  }
   return { analytics: getAnalyticsConsentCookie(), updatedAt: null };
 }
 
@@ -153,9 +374,9 @@ export class AnalyticsService {
   private adapters: AnalyticsAdapter[] = [];
   private consent: ConsentState;
   private session: SessionProperties;
-  private subjectId: string;
-  private outbox: QueuedEvent[];
-  private flushing = false;
+  private scope: CacheScope = { accountId: null, workspaceId: null, permissions: [] };
+  private invalidation: CrossTabInvalidation | null = null;
+  private invalidationListeners = new Set<(families: readonly ResourceFamily[]) => void>();
 
   constructor() {
     this.consent = loadConsent();
@@ -178,16 +399,51 @@ export class AnalyticsService {
     return { ...this.consent };
   }
 
+  /**
+   * Returns the authoritative, versioned consent record. The record is the
+   * source of truth shared with the server and queued-event processing.
+   */
+  getConsentRecord(): ConsentRecord {
+    const stored = loadConsentRecord();
+    if (stored) return stored;
+    return {
+      analytics: this.consent.analytics,
+      version: CONSENT_VERSION,
+      updatedAt: this.consent.updatedAt,
+    };
+  }
+
   setConsent(analytics: "granted" | "denied"): void {
     this.consent = { analytics, updatedAt: Date.now() };
     saveConsent(this.consent);
+    saveConsentRecord({
+      analytics,
+      version: CONSENT_VERSION,
+      updatedAt: this.consent.updatedAt,
+    });
 
     if (analytics === "denied") {
-      this.scrubSession();
-      this.unlinkIdentity();
-      this.outbox = [];
-      clearOutbox();
+      this.withdrawConsent();
     }
+  }
+
+  /**
+   * Withdraws analytics consent: halts future non-essential events, clears any
+   * queued events, scrubs identifiers, and notifies adapters to reset.
+   */
+  withdrawConsent(): void {
+    const updatedAt = Date.now();
+    this.consent = { analytics: "denied", updatedAt };
+    saveConsent(this.consent);
+    saveConsentRecord({
+      analytics: "denied",
+      version: CONSENT_VERSION,
+      updatedAt,
+    });
+
+    this.queue = [];
+    this.scrubSession();
+    this.adapters.forEach((a) => a.reset?.());
   }
 
   private scrubSession(): void {
@@ -201,6 +457,23 @@ export class AnalyticsService {
       screenHeight: 0,
       sessionStart: 0,
     };
+  }
+
+  /**
+   * Re-reads the authoritative consent record at dispatch time so that
+   * withdrawals made in another tab or by the server take effect immediately.
+   */
+  private isConsentGranted(): boolean {
+    const record = loadConsentRecord();
+    if (record) {
+      this.consent = { analytics: record.analytics, updatedAt: record.updatedAt };
+    } else {
+      this.consent = {
+        analytics: getAnalyticsConsentCookie(),
+        updatedAt: this.consent.updatedAt,
+      };
+    }
+    return this.consent.analytics === "granted";
   }
 
   // ── Session ───────────────────────────────────────────────────────────────
@@ -223,10 +496,81 @@ export class AnalyticsService {
     this.adapters.forEach((a) => a.identify?.(userId, traits));
   }
 
+  // ── Cache scope & cross-tab invalidation ──────────────────────────────────
+
+  getScope(): CacheScope {
+    return { ...this.scope, permissions: [...this.scope.permissions] };
+  }
+
+  /** Scoped query key for a resource family under the current identity. */
+  queryKey(
+    family: ResourceFamily,
+    ...parts: readonly (string | number | boolean | null)[]
+  ): readonly unknown[] {
+    return buildScopedQueryKey(family, this.scope, ...parts);
+  }
+
+  /**
+   * Update the security scope. Any change to account, workspace, or
+   * permissions invalidates all affected families and notifies other tabs.
+   */
+  setScope(next: CacheScope): void {
+    const previous = this.scope;
+    this.scope = {
+      accountId: next.accountId,
+      workspaceId: next.workspaceId,
+      permissions: [...next.permissions],
+    };
+    const changed =
+      previous.accountId !== this.scope.accountId ||
+      previous.workspaceId !== this.scope.workspaceId ||
+      [...previous.permissions].sort().join(",") !== [...this.scope.permissions].sort().join(",");
+    if (!changed) return;
+    const families = RESOURCE_FAMILIES.filter((family) => canViewFamily(this.scope, family));
+    this.notifyInvalidation(families);
+    this.invalidation?.publish(families);
+  }
+
+  /** Subscribe to cross-tab invalidations authorized for this tab's scope. */
+  onInvalidate(handler: (families: readonly ResourceFamily[]) => void): () => void {
+    this.invalidationListeners.add(handler);
+    this.ensureInvalidationBus();
+    return () => this.invalidationListeners.delete(handler);
+  }
+
+  /** Broadcast invalidation for families affected by a local mutation. */
+  invalidate(families: readonly ResourceFamily[]): void {
+    const authorized = families.filter((family) => canViewFamily(this.scope, family));
+    if (authorized.length === 0) return;
+    this.notifyInvalidation(authorized);
+    this.invalidation?.publish(authorized);
+  }
+
+  private notifyInvalidation(families: readonly ResourceFamily[]): void {
+    if (families.length === 0) return;
+    this.invalidationListeners.forEach((handler) => {
+      try {
+        handler(families);
+      } catch {
+        // isolate handler failures
+      }
+    });
+  }
+
+  private ensureInvalidationBus(): void {
+    if (this.invalidation || typeof window === "undefined") return;
+    this.invalidation = new CrossTabInvalidation(() => this.getScope());
+  }
+
   reset(): void {
     this.unlinkIdentity();
     this.scrubSession();
     this.adapters.forEach((a) => a.reset?.());
+    // Logout: drop scope and clear all caches in this and other tabs.
+    const families = [...RESOURCE_FAMILIES];
+    this.scope = { accountId: null, workspaceId: null, permissions: [] };
+    this.notifyInvalidation(families);
+    this.invalidation?.publish(families);
   }
 
   // ── Identity stitching ────────────────────────────────────────────────────
@@ -271,8 +615,28 @@ export class AnalyticsService {
 
   // ── Tracking ──────────────────────────────────────────────────────────────
 
+  /**
+   * Validates an event against the schema registry. Returns the validation
+   * result without dispatching; useful for producers and tests.
+   */
+  validate(event: AnalyticsEventName, props?: Record<string, unknown>): EventValidationResult {
+    return validateEvent(event, props);
+  }
+
   track(event: AnalyticsEventName, props?: Record<string, unknown>): void {
-    if (this.consent.analytics !== "granted") return;
+    // Re-check authoritative consent at dispatch time.
+    if (!this.isConsentGranted()) return;
+
+    const validation = validateEvent(event, props);
+    if (!validation.valid) {
+      // Drop invalid events rather than leaking unvalidated/sensitive data.
+      if (typeof console !== "undefined") {
+        console.warn(
+          `[analytics] dropped invalid event "${event}": ${validation.errors.join("; ")}`,
+        );
+      }
+      return;
+    }
 
     const queued: QueuedEvent = {
       eventId: generateUuid(),
@@ -280,69 +644,72 @@ export class AnalyticsService {
       event,
       timestamp: Date.now(),
       sessionId: this.session.sessionId,
-      subjectId: this.subjectId,
-      props: { ...(props ?? {}) },
-    };
-
-    this.outbox.push(queued);
-    if (this.outbox.length > MAX_OUTBOX) {
-      this.outbox = this.outbox.slice(-MAX_OUTBOX);
-    }
-    saveOutbox(this.outbox);
-
-    // Adapters receive the payload without raw auth identifiers.
-    const payload: AnalyticsPayload = {
-      event,
-      timestamp: queued.timestamp,
-      sessionId: queued.sessionId,
-      ...(props ?? {}),
+      userId: this.session.userId,
+      ...validation.sanitized,
     } as AnalyticsPayload;
-    this.adapters.forEach((a) => a.track(payload));
 
-    void this.flush();
+    this.queue.push(payload);
+    this.flush();
   }
 
-  // ── Durable delivery ──────────────────────────────────────────────────────
-
-  async flush(): Promise<void> {
-    if (this.flushing) return;
-    if (this.consent.analytics !== "granted") return;
-    if (typeof fetch === "undefined") return;
-    if (this.outbox.length === 0) return;
-
-    this.flushing = true;
-    try {
-      while (this.outbox.length > 0) {
-        const batch = this.outbox.slice(0, BATCH_SIZE);
-        const accepted = await this.sendBatch(batch);
-        if (!accepted) break;
-        const acceptedIds = new Set(accepted);
-        this.outbox = this.outbox.filter((e) => !acceptedIds.has(e.eventId));
-        saveOutbox(this.outbox);
-      }
-    } finally {
-      this.flushing = false;
+  private flush(): void {
+    // Re-check consent before delivering queued events; a withdrawal between
+    // enqueue and delivery must suppress delivery.
+    if (!this.isConsentGranted()) {
+      this.queue = [];
+      return;
     }
+    const pending = this.queue;
+    this.queue = [];
+    pending.forEach((payload) => {
+      this.adapters.forEach((a) => a.track(payload));
+    });
   }
 
-  private async sendBatch(batch: QueuedEvent[]): Promise<string[] | null> {
-    try {
-      const res = await fetch("/api/analytics/events", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ schemaVersion: SCHEMA_VERSION, events: batch }),
-      });
-      if (!res.ok) return null;
-      const data = (await res.json().catch(() => ({}))) as {
-        accepted?: string[];
-      };
-      // Server is authoritative: only drop events it explicitly accepted.
-      return Array.isArray(data.accepted)
-        ? data.accepted
-        : batch.map((e) => e.eventId);
-    } catch {
-      return null;
-    }
+  // ── Operational observability ─────────────────────────────────────────────
+  // These helpers funnel client-side consistency flows (realtime resync,
+  // offline queue, optimistic reconciliation, auth redirects) through the
+  // same consent gate and adapter fan-out as regular tracking. They never
+  // carry secrets (tokens, raw URLs, payload bodies) — only coarse metadata.
+
+  /** A realtime snapshot/event gap was detected and a resync was requested. */
+  trackRealtimeResync(props: {
+    reason: "gap" | "stale_event" | "reconnect" | "retention_expired";
+    streamId?: string;
+    expectedSeq?: number;
+    receivedSeq?: number;
+    watermark?: number;
+  }): void {
+    this.track("realtime_resync", { ...props });
+  }
+
+  /** An offline command could not be replayed cleanly. */
+  trackOfflineQueueConflict(props: {
+    commandType: string;
+    conflictStrategy: string;
+    outcome: "conflict" | "expired" | "rejected" | "duplicate";
+    resource?: string;
+  }): void {
+    this.track("offline_queue_conflict", { ...props });
+  }
+
+  /** An optimistic mutation was rolled back or reconciled with the server. */
+  trackOptimisticRollback(props: {
+    mutation: string;
+    reason: "timeout" | "validation_error" | "conflict" | "reordered" | "superseded";
+    resource?: string;
+    hadIdempotencyKey?: boolean;
+  }): void {
+    this.track("optimistic_rollback", { ...props });
+  }
+
+  /** A validated post-auth return destination was restored (or rejected). */
+  trackAuthRedirectRestore(props: {
+    flow: "login" | "register" | "oauth_callback";
+    outcome: "restored" | "rejected" | "expired" | "unavailable";
+    locale?: string;
+  }): void {
+    this.track("auth_redirect_restore", { ...props });
   }
 }
 

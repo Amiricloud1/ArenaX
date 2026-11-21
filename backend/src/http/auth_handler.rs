@@ -7,7 +7,7 @@ use actix_web::cookie::{Cookie, SameSite};
 use actix_web::{web, HttpRequest, HttpResponse, Responder};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 // ── Cookie names ──────────────────────────────────────────────────────────────
@@ -83,6 +83,183 @@ fn response_with_auth_cookies(
         .finish()
 }
 
+// ── Return-destination validation ─────────────────────────────────────────────
+
+/// Query parameters that must never be carried across an authentication
+/// redirect, even when the destination path itself is approved.
+const SECRET_QUERY_PARAMS: &[&str] = &[
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "auth_token",
+    "password",
+    "secret",
+    "api_key",
+    "apikey",
+    "code",
+    "session",
+    "session_id",
+    "sig",
+    "signature",
+];
+
+/// Maximum accepted length of a raw return destination. Anything longer is
+/// rejected outright to avoid pathological parsing / header abuse.
+const MAX_RETURN_TO_LEN: usize = 2048;
+
+/// Top-level path segments that are approved as post-authentication
+/// destinations. Anything else falls back to the default landing page.
+const APPROVED_PATH_PREFIXES: &[&str] = &[
+    "tournaments",
+    "matches",
+    "dashboard",
+    "profile",
+    "settings",
+    "notifications",
+    "leaderboard",
+    "wallet",
+];
+
+/// Locales the client supports for locale-prefixed routes (e.g. `/fr/tournaments/1`).
+const SUPPORTED_LOCALES: &[&str] = &["en", "es", "fr", "de", "pt", "ja", "zh"];
+
+/// Where the user is sent when no valid destination is supplied.
+pub const DEFAULT_RETURN_TO: &str = "/dashboard";
+
+/// Validate and normalise a client-supplied return destination.
+///
+/// Returns `Ok(Some(path))` for a safe, approved local path, `Ok(None)` when
+/// the destination is absent, and `Err(())` when the destination is present
+/// but unsafe (external URL, protocol-relative, scheme, encoded bypass, etc.).
+///
+/// Only local absolute paths are accepted. Query parameters are preserved
+/// except for a denylist of secret-bearing keys. Fragments are dropped.
+pub fn validate_return_to(raw: &str) -> Result<Option<String>, ()> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw.len() > MAX_RETURN_TO_LEN {
+        return Err(());
+    }
+
+    // Reject control characters and whitespace that could smuggle headers.
+    if raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(());
+    }
+
+    // Reject backslashes: browsers treat `\` like `/` in some contexts, which
+    // enables `/\evil.com` style open redirects.
+    if raw.contains('\\') {
+        return Err(());
+    }
+
+    // Must be a local absolute path.
+    if !raw.starts_with('/') {
+        return Err(());
+    }
+
+    // Reject protocol-relative URLs (`//evil.com`) and their encoded forms.
+    let lowered = raw.to_ascii_lowercase();
+    if lowered.starts_with("//") || lowered.starts_with("/%2f") || lowered.starts_with("/%5c") {
+        return Err(());
+    }
+
+    // Reject any scheme smuggled into the path (e.g. `/redirect?to=https://...`
+    // is fine, but `/https://evil.com` is not).
+    if lowered.contains("://") {
+        return Err(());
+    }
+
+    // Split off the fragment (dropped) and query string.
+    let without_fragment = raw.split('#').next().unwrap_or("");
+    let (path, query) = match without_fragment.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (without_fragment, None),
+    };
+
+    // Normalise path segments: reject traversal and empty/`.` segments.
+    let mut segments: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment == "." || segment == ".." {
+            return Err(());
+        }
+        // Reject percent-encoded traversal / separators inside segments.
+        let seg_lower = segment.to_ascii_lowercase();
+        if seg_lower.contains("%2e") || seg_lower.contains("%2f") || seg_lower.contains("%5c") {
+            return Err(());
+        }
+        segments.push(segment);
+    }
+
+    if segments.is_empty() {
+        return Ok(None);
+    }
+
+    // Allow an optional leading locale segment.
+    let mut prefix_index = 0;
+    if SUPPORTED_LOCALES.contains(&segments[0].to_ascii_lowercase().as_str()) {
+        prefix_index = 1;
+    }
+
+    let approved = segments
+        .get(prefix_index)
+        .map(|s| APPROVED_PATH_PREFIXES.contains(&s.to_ascii_lowercase().as_str()))
+        .unwrap_or(false);
+    if !approved {
+        return Err(());
+    }
+
+    // Rebuild the path from validated segments.
+    let mut normalised = String::with_capacity(path.len());
+    for segment in &segments {
+        normalised.push('/');
+        normalised.push_str(segment);
+    }
+
+    // Filter query parameters, dropping secret-bearing keys.
+    if let Some(query) = query {
+        let mut kept: Vec<String> = Vec::new();
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let key = pair.split('=').next().unwrap_or("");
+            let key_lower = key.to_ascii_lowercase();
+            if SECRET_QUERY_PARAMS.contains(&key_lower.as_str()) {
+                continue;
+            }
+            kept.push(pair.to_string());
+        }
+        if !kept.is_empty() {
+            normalised.push('?');
+            normalised.push_str(&kept.join("&"));
+        }
+    }
+
+    Ok(Some(normalised))
+}
+
+/// Resolve a raw return destination to a safe path, falling back to the
+/// default landing page when absent or invalid.
+pub fn resolve_return_to(raw: Option<&str>) -> String {
+    match raw {
+        Some(value) => match validate_return_to(value) {
+            Ok(Some(path)) => path,
+            Ok(None) => DEFAULT_RETURN_TO.to_string(),
+            Err(()) => {
+                warn!(return_to = %value, "Rejected unsafe return destination");
+                DEFAULT_RETURN_TO.to_string()
+            }
+        },
+        None => DEFAULT_RETURN_TO.to_string(),
+    }
+}
+
 // ── Request / response DTOs ───────────────────────────────────────────────────
 
 /// Refresh token request — accepted from JSON body as a fallback, but the
@@ -116,6 +293,9 @@ pub struct AuthSuccessResponse {
     /// Access token TTL in seconds — the frontend uses this to proactively
     /// refresh before expiry without ever touching the token value itself.
     pub expires_in: i64,
+    /// Validated local path the client should navigate to after auth.
+    /// Always present; falls back to `DEFAULT_RETURN_TO`.
+    pub return_to: String,
 }
 
 /// Short-lived token for WebSocket authentication handshakes.
@@ -134,6 +314,7 @@ pub struct WsTokenResponse {
 pub async fn register(
     auth_service: web::Data<AuthService>,
     jwt_service: web::Data<Arc<JwtService>>,
+    req: HttpRequest,
     request: web::Json<CreateUserRequest>,
 ) -> Result<impl Responder, ApiError> {
     info!(
@@ -141,6 +322,9 @@ pub async fn register(
         email = %request.email.as_deref().unwrap_or("(none)"),
         "Registration request received"
     );
+
+    // Capture the intended destination before consuming the request body.
+    let return_to = resolve_return_to(extract_return_to(&req));
 
     let response: AuthResponse = auth_service.register(request.into_inner()).await?;
 
@@ -157,6 +341,7 @@ pub async fn register(
             // the expires_in field.
             jwt_service.access_token_expiry_secs()
         },
+        return_to,
     };
 
     let tokens = TokenPair {
@@ -177,9 +362,13 @@ pub async fn register(
 pub async fn login(
     auth_service: web::Data<AuthService>,
     jwt_service: web::Data<Arc<JwtService>>,
+    req: HttpRequest,
     request: web::Json<LoginRequest>,
 ) -> Result<impl Responder, ApiError> {
     info!(email = %request.email, "Login request received");
+
+    // Capture the intended destination before consuming the request body.
+    let return_to = resolve_return_to(extract_return_to(&req));
 
     let response: AuthResponse = auth_service.login(request.into_inner()).await?;
 
@@ -189,6 +378,7 @@ pub async fn login(
     let body = AuthSuccessResponse {
         user: response.user,
         expires_in: access_expires_in,
+        return_to,
     };
 
     let tokens = TokenPair {
@@ -203,6 +393,24 @@ pub async fn login(
         .cookie(build_access_cookie(&tokens.access_token, tokens.expires_in))
         .cookie(build_refresh_cookie(&tokens.refresh_token, refresh_max_age));
     Ok(builder.json(body))
+}
+
+/// Extract the raw return destination from the query string or the
+/// `X-Return-To` header. The query string takes precedence.
+fn extract_return_to(req: &HttpRequest) -> Option<&str> {
+    if let Some(value) = req.query_string().split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        if key == "return_to" || key == "redirect" {
+            Some(value)
+        } else {
+            None
+        }
+    }) {
+        return Some(value);
+    }
+    req.headers()
+        .get("X-Return-To")
+        .and_then(|h| h.to_str().ok())
 }
 
 /// POST /api/auth/refresh
@@ -233,6 +441,18 @@ pub async fn refresh_token(
         .cookie(build_access_cookie(&token_pair.access_token, token_pair.expires_in))
         .cookie(build_refresh_cookie(&token_pair.refresh_token, refresh_max_age));
     Ok(builder.json(serde_json::json!({ "expires_in": token_pair.expires_in })))
+}
+
+/// GET /api/auth/oauth/callback
+///
+/// Completes an OAuth login and returns the validated post-auth destination
+/// so the client can restore it exactly once. The destination is validated
+/// with the same rules as password login/registration.
+pub async fn oauth_callback(req: HttpRequest) -> Result<impl Responder, ApiError> {
+    // The OAuth exchange itself is handled by the provider adapter; this
+    // endpoint only resolves the return destination for the client.
+    let return_to = resolve_return_to(extract_return_to(&req));
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "return_to": return_to })))
 }
 
 /// POST /api/auth/logout
@@ -422,6 +642,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
         web::scope("/auth")
             .route("/register", web::post().to(register))
             .route("/login", web::post().to(login))
+            .route("/oauth/callback", web::get().to(oauth_callback))
             .route("/refresh", web::post().to(refresh_token))
             .route("/logout", web::post().to(logout))
             .route("/me", web::get().to(get_current_user))
@@ -457,5 +678,96 @@ mod tests {
         let req: ChangePasswordRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.old_password, "old123");
         assert_eq!(req.new_password, "new456");
+    }
+
+    #[test]
+    fn accepts_approved_local_paths() {
+        assert_eq!(
+            validate_return_to("/tournaments/42").unwrap().as_deref(),
+            Some("/tournaments/42")
+        );
+        assert_eq!(
+            validate_return_to("/matches/abc-123").unwrap().as_deref(),
+            Some("/matches/abc-123")
+        );
+    }
+
+    #[test]
+    fn accepts_locale_prefixed_routes() {
+        assert_eq!(
+            validate_return_to("/fr/tournaments/42").unwrap().as_deref(),
+            Some("/fr/tournaments/42")
+        );
+        assert_eq!(
+            validate_return_to("/ja/matches/9").unwrap().as_deref(),
+            Some("/ja/matches/9")
+        );
+    }
+
+    #[test]
+    fn rejects_open_redirect_attempts() {
+        for raw in [
+            "https://evil.com",
+            "//evil.com",
+            "/\\evil.com",
+            "/%2f%2fevil.com",
+            "/%5cevil.com",
+            "javascript:alert(1)",
+            "/tournaments/../../etc/passwd",
+            "/tournaments/%2e%2e/secret",
+            " /tournaments/1",
+            "/tournaments/1\r\nSet-Cookie: x=y",
+        ] {
+            assert!(validate_return_to(raw).is_err(), "should reject: {raw}");
+        }
+    }
+
+    #[test]
+    fn rejects_unapproved_paths() {
+        assert!(validate_return_to("/admin/secret").is_err());
+        assert!(validate_return_to("/api/auth/me").is_err());
+    }
+
+    #[test]
+    fn strips_secret_query_params() {
+        let result = validate_return_to("/tournaments/1?tab=bracket&token=abc&access_token=xyz")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, "/tournaments/1?tab=bracket");
+    }
+
+    #[test]
+    fn preserves_non_secret_query_params() {
+        let result = validate_return_to("/matches/1?round=2&view=live")
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, "/matches/1?round=2&view=live");
+    }
+
+    #[test]
+    fn drops_fragments() {
+        let result = validate_return_to("/tournaments/1#section").unwrap().unwrap();
+        assert_eq!(result, "/tournaments/1");
+    }
+
+    #[test]
+    fn empty_and_root_fall_back_to_default() {
+        assert_eq!(validate_return_to("").unwrap(), None);
+        assert_eq!(validate_return_to("/").unwrap(), None);
+        assert_eq!(resolve_return_to(None), DEFAULT_RETURN_TO);
+        assert_eq!(resolve_return_to(Some("")), DEFAULT_RETURN_TO);
+        assert_eq!(resolve_return_to(Some("/")), DEFAULT_RETURN_TO);
+    }
+
+    #[test]
+    fn unsafe_destination_falls_back_to_default() {
+        assert_eq!(resolve_return_to(Some("https://evil.com")), DEFAULT_RETURN_TO);
+        assert_eq!(resolve_return_to(Some("//evil.com")), DEFAULT_RETURN_TO);
+    }
+
+    #[test]
+    fn rejects_overlong_destination() {
+        let raw = format!("/tournaments/{}", "a".repeat(MAX_RETURN_TO_LEN));
+        assert!(validate_return_to(&raw).is_err());
     }
 }

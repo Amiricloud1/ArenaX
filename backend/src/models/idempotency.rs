@@ -45,6 +45,12 @@ pub struct IdempotencyConflict {
     pub new_hash: String,
     pub original_timestamp: DateTime<Utc>,
     pub conflict_type: ConflictType,
+    /// User scope of the stored (original) record, when known.
+    pub original_user_scope: Option<String>,
+    /// User scope of the incoming request, when known.
+    pub new_user_scope: Option<String>,
+    /// Strategy that was applied (or should be applied) to resolve the conflict.
+    pub conflict_strategy: ConflictStrategy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +59,106 @@ pub enum ConflictType {
     MethodMismatch,
     RouteMismatch,
     UserMismatch,
+    /// The stored record has expired and can no longer be replayed.
+    Expired,
+}
+
+/// How a replay should behave when it collides with existing server state.
+///
+/// Offline command queues must declare one of these strategies per command so
+/// that replay surfaces conflicts instead of silently overwriting newer state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictStrategy {
+    /// Reject the replay and surface the conflict to the caller.
+    Reject,
+    /// Return the originally cached response without re-applying the mutation.
+    ReturnCached,
+    /// Only apply if the server state has not changed since the command was queued.
+    FailIfStale,
+}
+
+impl Default for ConflictStrategy {
+    fn default() -> Self {
+        Self::Reject
+    }
+}
+
+impl ConflictStrategy {
+    /// Parse a strategy from its wire representation, defaulting to `Reject`.
+    pub fn from_wire(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "return_cached" => Self::ReturnCached,
+            "fail_if_stale" => Self::FailIfStale,
+            _ => Self::Reject,
+        }
+    }
+}
+
+/// User scope attached to an idempotency record so that logout or account
+/// switch can purge only the commands belonging to that scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdempotencyUserScope {
+    /// Stable identifier of the authenticated user.
+    pub user_id: String,
+    /// Optional session/device identifier to further narrow the scope.
+    pub session_id: Option<String>,
+}
+
+impl IdempotencyUserScope {
+    pub fn new(user_id: impl Into<String>) -> Self {
+        Self {
+            user_id: user_id.into(),
+            session_id: None,
+        }
+    }
+
+    pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Canonical string form used for storage and comparison.
+    pub fn as_scope_key(&self) -> String {
+        match &self.session_id {
+            Some(session) => format!("{}:{}", self.user_id, session),
+            None => self.user_id.clone(),
+        }
+    }
+}
+
+/// Metadata describing a queued offline command.
+///
+/// Every queued command must declare an idempotency key, an expiry, a user
+/// scope and a conflict strategy. Commands that cannot be safely replayed
+/// (payments, match actions, etc.) must be rejected from offline mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfflineCommandMetadata {
+    pub idempotency_key: String,
+    pub expires_at: DateTime<Utc>,
+    pub user_scope: IdempotencyUserScope,
+    pub conflict_strategy: ConflictStrategy,
+}
+
+impl OfflineCommandMetadata {
+    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        now >= self.expires_at
+    }
+
+    /// Validate the metadata against the current time and user scope.
+    pub fn validate(
+        &self,
+        now: DateTime<Utc>,
+        current_scope: &IdempotencyUserScope,
+    ) -> Result<(), ConflictType> {
+        if self.is_expired(now) {
+            return Err(ConflictType::Expired);
+        }
+        if self.user_scope != *current_scope {
+            return Err(ConflictType::UserMismatch);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +205,12 @@ pub struct CachedResponse {
     pub headers: serde_json::Value,
     pub body: serde_json::Value,
     pub created_at: DateTime<Utc>,
+    /// User scope the cached response belongs to, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_scope: Option<String>,
+    /// Conflict strategy declared by the queued command, when known.
+    #[serde(default)]
+    pub conflict_strategy: ConflictStrategy,
 }
 
 impl CachedResponse {
@@ -114,7 +226,20 @@ impl CachedResponse {
             headers,
             body,
             created_at: Utc::now(),
+            user_scope: None,
+            conflict_strategy: ConflictStrategy::default(),
         }
+    }
+
+    /// Attach the user scope and conflict strategy to a cached response.
+    pub fn with_scope_and_strategy(
+        mut self,
+        user_scope: impl Into<String>,
+        conflict_strategy: ConflictStrategy,
+    ) -> Self {
+        self.user_scope = Some(user_scope.into());
+        self.conflict_strategy = conflict_strategy;
+        self
     }
 
     pub fn size_bytes(&self) -> usize {
@@ -223,171 +348,81 @@ pub struct IdempotencyMetricsSnapshot {
     pub hit_rate: f64,
 }
 
-/// Outcome recorded at the analytics ingestion boundary for a single event.
-///
-/// Every producer assigns a stable `event_id`; the ingestion boundary persists
-/// exactly one outcome per `event_id` so retries converge to a single accepted
-/// event and malformed payloads land in a diagnosable rejection path.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AnalyticsIngestionOutcome {
-    /// Event passed validation and was durably accepted.
-    Accepted,
-    /// Event was rejected; see `AnalyticsRejectionReason`.
-    Rejected,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
 
-/// Why an analytics event was rejected at the ingestion boundary.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AnalyticsRejectionReason {
-    /// Payload could not be parsed (invalid JSON, wrong types, etc.).
-    MalformedPayload,
-    /// Payload parsed but failed schema validation.
-    SchemaInvalid,
-    /// Event schema version is not supported by the ingestion boundary.
-    UnsupportedSchemaVersion,
-    /// Event ID was missing or not a stable identifier.
-    InvalidEventId,
-    /// Producer is not authorized to submit analytics events.
-    Unauthorized,
-    /// Event timestamp was outside the accepted window.
-    StaleTimestamp,
-}
+    fn scope() -> IdempotencyUserScope {
+        IdempotencyUserScope::new("user-1").with_session("session-a")
+    }
 
-impl AnalyticsRejectionReason {
-    /// Stable machine-readable code used for diagnostics and metrics.
-    pub fn code(&self) -> &'static str {
-        match self {
-            AnalyticsRejectionReason::MalformedPayload => "malformed_payload",
-            AnalyticsRejectionReason::SchemaInvalid => "schema_invalid",
-            AnalyticsRejectionReason::UnsupportedSchemaVersion => "unsupported_schema_version",
-            AnalyticsRejectionReason::InvalidEventId => "invalid_event_id",
-            AnalyticsRejectionReason::Unauthorized => "unauthorized",
-            AnalyticsRejectionReason::StaleTimestamp => "stale_timestamp",
+    fn metadata(expires_at: DateTime<Utc>) -> OfflineCommandMetadata {
+        OfflineCommandMetadata {
+            idempotency_key: "key-1".to_string(),
+            expires_at,
+            user_scope: scope(),
+            conflict_strategy: ConflictStrategy::Reject,
         }
     }
-}
 
-/// Durable record of an analytics ingestion decision keyed by event identity.
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct AnalyticsIngestionRecord {
-    pub id: Uuid,
-    /// Producer-assigned stable event identifier.
-    pub event_id: String,
-    /// Producer identifier (e.g. client instance or service name).
-    pub producer_id: String,
-    /// Schema version of the submitted event payload.
-    pub schema_version: i32,
-    /// Hash of the canonical payload, used to detect conflicting retries.
-    pub payload_hash: String,
-    pub outcome: AnalyticsIngestionOutcome,
-    /// Present only when `outcome` is `Rejected`.
-    pub rejection_reason: Option<AnalyticsRejectionReason>,
-    /// Human-readable diagnostic detail for rejected events.
-    pub rejection_detail: Option<String>,
-    pub received_at: DateTime<Utc>,
-    pub processed_at: Option<DateTime<Utc>>,
-    pub expires_at: DateTime<Utc>,
-}
+    #[test]
+    fn scope_key_includes_session_when_present() {
+        assert_eq!(scope().as_scope_key(), "user-1:session-a");
+        assert_eq!(IdempotencyUserScope::new("user-2").as_scope_key(), "user-2");
+    }
 
-impl AnalyticsIngestionRecord {
-    /// Build an accepted record for a validated event.
-    pub fn accepted(
-        event_id: String,
-        producer_id: String,
-        schema_version: i32,
-        payload_hash: String,
-        ttl_seconds: i64,
-    ) -> Self {
+    #[test]
+    fn conflict_strategy_parses_wire_values() {
+        assert_eq!(ConflictStrategy::from_wire("return_cached"), ConflictStrategy::ReturnCached);
+        assert_eq!(ConflictStrategy::from_wire("FAIL_IF_STALE"), ConflictStrategy::FailIfStale);
+        assert_eq!(ConflictStrategy::from_wire("unknown"), ConflictStrategy::Reject);
+    }
+
+    #[test]
+    fn metadata_rejects_expired_commands() {
         let now = Utc::now();
-        Self {
-            id: Uuid::new_v4(),
-            event_id,
-            producer_id,
-            schema_version,
-            payload_hash,
-            outcome: AnalyticsIngestionOutcome::Accepted,
-            rejection_reason: None,
-            rejection_detail: None,
-            received_at: now,
-            processed_at: Some(now),
-            expires_at: now + chrono::Duration::seconds(ttl_seconds),
-        }
+        let expired = metadata(now - Duration::seconds(1));
+        assert_eq!(expired.validate(now, &scope()), Err(ConflictType::Expired));
     }
 
-    /// Build a rejected record for a malformed or schema-invalid event.
-    pub fn rejected(
-        event_id: String,
-        producer_id: String,
-        schema_version: i32,
-        payload_hash: String,
-        reason: AnalyticsRejectionReason,
-        detail: Option<String>,
-        ttl_seconds: i64,
-    ) -> Self {
+    #[test]
+    fn metadata_rejects_account_switch() {
         let now = Utc::now();
-        Self {
-            id: Uuid::new_v4(),
-            event_id,
-            producer_id,
-            schema_version,
-            payload_hash,
-            outcome: AnalyticsIngestionOutcome::Rejected,
-            rejection_reason: Some(reason),
-            rejection_detail: detail,
-            received_at: now,
-            processed_at: Some(now),
-            expires_at: now + chrono::Duration::seconds(ttl_seconds),
-        }
+        let meta = metadata(now + Duration::hours(1));
+        let other = IdempotencyUserScope::new("user-2");
+        assert_eq!(meta.validate(now, &other), Err(ConflictType::UserMismatch));
+        assert!(meta.validate(now, &scope()).is_ok());
     }
 
-    pub fn is_accepted(&self) -> bool {
-        self.outcome == AnalyticsIngestionOutcome::Accepted
+    #[test]
+    fn cached_response_carries_scope_and_strategy() {
+        let cached = CachedResponse::new(
+            "hash".to_string(),
+            200,
+            serde_json::json!({}),
+            serde_json::json!({"ok": true}),
+        )
+        .with_scope_and_strategy("user-1", ConflictStrategy::FailIfStale);
+
+        assert_eq!(cached.user_scope.as_deref(), Some("user-1"));
+        assert_eq!(cached.conflict_strategy, ConflictStrategy::FailIfStale);
     }
 
-    pub fn is_rejected(&self) -> bool {
-        self.outcome == AnalyticsIngestionOutcome::Rejected
-    }
-}
-
-/// Result of attempting to record an analytics event at the ingestion boundary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AnalyticsIngestionResult {
-    /// First time this event ID was seen and it was accepted.
-    Accepted(AnalyticsIngestionRecord),
-    /// First time this event ID was seen and it was rejected.
-    Rejected(AnalyticsIngestionRecord),
-    /// Event ID already recorded; the stored outcome is returned unchanged.
-    Duplicate(AnalyticsIngestionRecord),
-    /// Same event ID arrived with a different payload hash.
-    Conflict {
-        event_id: String,
-        original_hash: String,
-        new_hash: String,
-    },
-}
-
-impl AnalyticsIngestionResult {
-    /// The stored record, if any, for replay/inspection.
-    pub fn record(&self) -> Option<&AnalyticsIngestionRecord> {
-        match self {
-            AnalyticsIngestionResult::Accepted(record)
-            | AnalyticsIngestionResult::Rejected(record)
-            | AnalyticsIngestionResult::Duplicate(record) => Some(record),
-            AnalyticsIngestionResult::Conflict { .. } => None,
-        }
-    }
-
-    /// Whether the event is durably accepted (including duplicate replays).
-    pub fn is_accepted(&self) -> bool {
-        matches!(
-            self,
-            AnalyticsIngestionResult::Accepted(_) | AnalyticsIngestionResult::Duplicate(_)
-        ) && self
-            .record()
-            .map(|record| record.is_accepted())
-            .unwrap_or(false)
+    #[test]
+    fn conflict_serializes_scope_and_strategy() {
+        let conflict = IdempotencyConflict {
+            key: "key-1".to_string(),
+            original_hash: "a".to_string(),
+            new_hash: "b".to_string(),
+            original_timestamp: Utc::now(),
+            conflict_type: ConflictType::UserMismatch,
+            original_user_scope: Some("user-1".to_string()),
+            new_user_scope: Some("user-2".to_string()),
+            conflict_strategy: ConflictStrategy::Reject,
+        };
+        let json = serde_json::to_value(&conflict).unwrap();
+        assert_eq!(json["conflict_strategy"], "reject");
+        assert_eq!(json["original_user_scope"], "user-1");
     }
 }
