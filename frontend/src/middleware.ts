@@ -328,6 +328,18 @@ export default async function middleware(request: NextRequest) {
   requestHeaders.set("x-user-id", String(payload?.sub ?? ""));
   requestHeaders.set("x-user-roles", roles.join(","));
   requestHeaders.set("x-locale", locale);
+  // Per-request identity/permission scope for SSR cache isolation. These
+  // headers are derived solely from the verified token for THIS request, so
+  // a server-side cache keyed on them can never reuse another user's data.
+  // The scope is a stable hash of the account + sorted roles; it changes on
+  // account switch and on privilege change (role grant/revocation).
+  const scope = buildIdentityScope(payload?.sub, roles);
+  requestHeaders.set("x-user-scope", scope);
+  requestHeaders.set("x-user-authenticated", payload ? "1" : "0");
+  // Prevent any intermediary/shared cache from serving a private response
+  // across identities.
+  requestHeaders.set("cache-control", "private, no-store");
+  requestHeaders.set("vary", "Authorization, Cookie");
 
   // Re-issue intl's rewrite (if any) with our merged headers so the locale
   // header actually reaches the render; otherwise plain pass-through.
@@ -343,13 +355,28 @@ export default async function middleware(request: NextRequest) {
   response.headers.set("x-user-id", String(payload?.sub ?? ""));
   response.headers.set("x-user-roles", roles.join(","));
   response.headers.set("x-locale", locale);
-
-  // Clear any stale return destination once the user is past the auth entry
-  // flow, so it is restored at most once.
-  if (!isAuthEntryPath && request.cookies.has(RETURN_TO_COOKIE)) {
-    response.cookies.delete(RETURN_TO_COOKIE);
-  }
+  response.headers.set("x-user-scope", scope);
+  response.headers.set("x-user-authenticated", payload ? "1" : "0");
+  // Private responses must never be stored in a shared cache.
+  response.headers.set("cache-control", "private, no-store");
+  response.headers.set("vary", "Authorization, Cookie");
   return response;
+}
+
+/**
+ * Build a stable, non-reversible identity scope from the account id and the
+ * sorted set of roles. Used as part of server-side cache keys so that data
+ * cached for one account/privilege set is never reused for another.
+ *
+ * Returns "anon" for unauthenticated requests.
+ */
+function buildIdentityScope(
+  sub: string | undefined,
+  roles: string[]
+): string {
+  if (!sub) return "anon";
+  const sortedRoles = [...new Set(roles)].sort().join(",");
+  return `${sub}:${sortedRoles}`;
 }
 
 /**
@@ -388,4 +415,13 @@ function copyIntlMeaningfulHeaders(
 
 export const config = {
   matcher: ["/((?!api|_next|_vercel|.*\\..*).*)"],
+};
+
+// Exported for focused unit tests (SSR isolation, role revocation, scope).
+export const __test__ = {
+  buildIdentityScope,
+  parseJwtPayload,
+  stripLocale,
+  detectLocale,
+  classifyRoute,
 };

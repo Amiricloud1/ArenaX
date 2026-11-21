@@ -38,21 +38,69 @@ module.exports = {
   globals: {
     NODE_OPTIONS: "--unhandled-rejections=warn",
   },
-  // Explicitly enumerate the test roots for the new feature areas so that
-  // realtime sequencing, offline queue, optimistic reconciliation, and
-  // return-destination validation suites are always discovered even if they
-  // live outside the default `src` tree.
-  roots: [
-    "<rootDir>/src",
-    "<rootDir>/__tests__",
-  ],
-  testMatch: [
-    "<rootDir>/src/**/__tests__/**/*.{ts,tsx,js,jsx}",
-    "<rootDir>/src/**/?(*.)+(spec|test).{ts,tsx,js,jsx}",
-    "<rootDir>/__tests__/**/*.{ts,tsx,js,jsx}",
-    "<rootDir>/__tests__/realtime/**/*.{ts,tsx,js,jsx}",
-    "<rootDir>/__tests__/offline/**/*.{ts,tsx,js,jsx}",
-    "<rootDir>/__tests__/optimistic/**/*.{ts,tsx,js,jsx}",
-    "<rootDir>/__tests__/auth/**/*.{ts,tsx,js,jsx}",
+  // Cross-tab invalidation tests exercise BroadcastChannel, storage events,
+  // and SSR (no-window) isolation. Run them in the jsdom environment, which
+  // provides window/document, and let individual tests stub or delete
+  // BroadcastChannel/localStorage to simulate unsupported browsers.
+  projects: [
+    {
+      displayName: "jsdom",
+      testEnvironment: "jest-environment-jsdom",
+      testEnvironmentOptions: {
+        customExportConditions: ["node", "node-addons"],
+        url: "http://localhost/",
+      },
+      setupFilesAfterEnv: ["<rootDir>/jest.setup.ts"],
+      testMatch: ["<rootDir>/src/**/*.test.{ts,tsx,js,jsx}"],
+      testPathIgnorePatterns: [
+        "<rootDir>/node_modules/",
+        "<rootDir>/e2e/",
+        "<rootDir>/.next/",
+        "<rootDir>/src/**/*.ssr.test.{ts,tsx,js,jsx}",
+      ],
+      moduleNameMapper: {
+        "^@/(.*)$": "<rootDir>/src/$1",
+        "\\.(css|less|scss|sass)$": "<rootDir>/__mocks__/styleMock.js",
+        "\\.(jpg|jpeg|png|gif|svg|webp)$": "<rootDir>/__mocks__/fileMock.js",
+      },
+      transform: {
+        "^.+\\.(js|jsx|ts|tsx)$": ["babel-jest", { configFile: "./babel-jest.config.js" }],
+      },
+      transformIgnorePatterns: [
+        "/node_modules/(?!(?:react-dnd|react-dnd-html5-backend|dnd-core)/|@react-dnd/)",
+      ],
+      globals: {
+        NODE_OPTIONS: "--unhandled-rejections=warn",
+      },
+    },
+    {
+      // SSR isolation tests: no window/document/BroadcastChannel available.
+      displayName: "node-ssr",
+      testEnvironment: "node",
+      testEnvironmentOptions: {
+        customExportConditions: ["node", "node-addons"],
+      },
+      setupFilesAfterEnv: ["<rootDir>/jest.setup.ts"],
+      testMatch: ["<rootDir>/src/**/*.ssr.test.{ts,tsx,js,jsx}"],
+      testPathIgnorePatterns: [
+        "<rootDir>/node_modules/",
+        "<rootDir>/e2e/",
+        "<rootDir>/.next/",
+      ],
+      moduleNameMapper: {
+        "^@/(.*)$": "<rootDir>/src/$1",
+        "\\.(css|less|scss|sass)$": "<rootDir>/__mocks__/styleMock.js",
+        "\\.(jpg|jpeg|png|gif|svg|webp)$": "<rootDir>/__mocks__/fileMock.js",
+      },
+      transform: {
+        "^.+\\.(js|jsx|ts|tsx)$": ["babel-jest", { configFile: "./babel-jest.config.js" }],
+      },
+      transformIgnorePatterns: [
+        "/node_modules/(?!(?:react-dnd|react-dnd-html5-backend|dnd-core)/|@react-dnd/)",
+      ],
+      globals: {
+        NODE_OPTIONS: "--unhandled-rejections=warn",
+      },
+    },
   ],
 };

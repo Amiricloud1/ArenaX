@@ -1,7 +1,14 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useMemo } from "react";
 import { PageError } from "@/components/common/PageError";
+import {
+  classifyError,
+  getErrorMapping,
+  isAuthorizationError,
+  logErrorWithContext,
+} from "@/lib/errors/errorCatalog";
+import { clearIdentityScopedCaches } from "@/lib/query/identityScope";
 
 type RealtimeErrorKind = "resync" | "mutation";
 
@@ -46,41 +53,39 @@ export default function AdminError({
   error: RealtimeErrorLike;
   reset: () => void;
 }) {
-  useEffect(() => {
-    console.error("[AdminPage]", error);
+  const mapping = useMemo(() => {
+    const code = classifyError(error);
+    return getErrorMapping(code);
   }, [error]);
 
-  const kind = classifyError(error);
+  const authorizationFailure = useMemo(
+    () => isAuthorizationError(error),
+    [error],
+  );
 
-  if (kind === "resync") {
-    return (
-      <div className="container mx-auto p-6 flex min-h-[60vh] items-center justify-center">
-        <PageError
-          title="Realtime data out of sync"
-          message="This admin view fell out of sync with the server. Retry to load a fresh snapshot and resume live updates."
-          onRetry={reset}
-        />
-      </div>
-    );
-  }
+  useEffect(() => {
+    logErrorWithContext(error, {
+      boundary: "AdminPage",
+      digest: error.digest,
+    });
+  }, [error]);
 
-  if (kind === "mutation") {
-    return (
-      <div className="container mx-auto p-6 flex min-h-[60vh] items-center justify-center">
-        <PageError
-          title="Change could not be confirmed"
-          message="Your recent change could not be confirmed by the server, so it has been rolled back. Retry to reconcile with the latest server state."
-          onRetry={reset}
-        />
-      </div>
-    );
-  }
+  useEffect(() => {
+    if (authorizationFailure) {
+      // A role revocation or permission change may have occurred; drop any
+      // identity/permission-scoped caches so stale authorized data is not
+      // served after the boundary recovers.
+      clearIdentityScopedCaches("authorization-change");
+    }
+  }, [authorizationFailure]);
 
   return (
     <div className="container mx-auto p-6 flex min-h-[60vh] items-center justify-center">
       <PageError
-        title="Admin panel error"
-        message="Something went wrong loading this admin page. Try again or contact support if the problem persists."
+        title={mapping.title}
+        message={mapping.message}
+        code={mapping.code}
+        recovery={mapping.recovery}
         onRetry={reset}
       />
     </div>

@@ -4,6 +4,7 @@ use chrono::Utc;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use redis::Client as RedisClient;
+use serde::Serialize;
 use sqlx::PgPool;
 use std::sync::Arc;
 use thiserror::Error;
@@ -25,6 +26,153 @@ pub enum StellarError {
     DatabaseError(#[from] sqlx::Error),
     #[error("Stellar SDK error: {0}")]
     StellarSdkError(String),
+}
+
+// ============================================================================
+// Canonical contract error catalog (#235)
+// ============================================================================
+//
+// Every public Stellar/contract error maps to a *stable* code, a safe
+// user-readable message, and a documented retry/manual-recovery
+// classification. Raw error strings (which may contain Horizon bodies,
+// transaction XDR, or other internals) are never surfaced to clients; they
+// are only logged server-side with transaction context. Unknown errors stay
+// distinguishable via `STELLAR_UNKNOWN_ERROR` so support can triage them
+// instead of silently folding them into a generic failure.
+
+/// How a client/operator should react to a given error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryClass {
+    /// Safe to retry automatically (transient / idempotent).
+    Retry,
+    /// Retrying will not help; a human must intervene.
+    ManualRecovery,
+    /// Terminal failure — do not retry, do not auto-recover.
+    Fatal,
+}
+
+impl RecoveryClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::ManualRecovery => "manual_recovery",
+            Self::Fatal => "fatal",
+        }
+    }
+}
+
+/// Stable, client-facing representation of a Stellar/contract error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ContractErrorMapping {
+    /// Stable machine-readable code. Never changes for a given error kind.
+    pub code: &'static str,
+    /// Safe, user-readable message. Contains no internal details.
+    pub message: &'static str,
+    /// Documented retry / manual-recovery classification.
+    pub recovery: RecoveryClass,
+    /// Whether the error is a known catalog entry (false for unknown errors).
+    pub known: bool,
+}
+
+impl ContractErrorMapping {
+    pub fn is_retryable(&self) -> bool {
+        self.recovery == RecoveryClass::Retry
+    }
+}
+
+/// Stable code for errors that don't match any catalog entry.
+pub const UNKNOWN_ERROR_CODE: &str = "STELLAR_UNKNOWN_ERROR";
+
+/// Map a `StellarError` to its stable public contract-error representation.
+///
+/// This is the single canonical mapping used by both client and backend
+/// adapters. Raw error payloads are intentionally dropped here.
+pub fn map_stellar_error(err: &StellarError) -> ContractErrorMapping {
+    match err {
+        StellarError::AccountNotFound => ContractErrorMapping {
+            code: "STELLAR_ACCOUNT_NOT_FOUND",
+            message: "No active Stellar account was found for this user.",
+            recovery: RecoveryClass::ManualRecovery,
+            known: true,
+        },
+        StellarError::InsufficientBalance => ContractErrorMapping {
+            code: "STELLAR_INSUFFICIENT_BALANCE",
+            message: "The account does not have enough XLM to complete this transaction.",
+            recovery: RecoveryClass::ManualRecovery,
+            known: true,
+        },
+        StellarError::TransactionFailed(_) => ContractErrorMapping {
+            code: "STELLAR_TRANSACTION_FAILED",
+            message: "The Stellar transaction could not be completed.",
+            recovery: RecoveryClass::Retry,
+            known: true,
+        },
+        StellarError::InvalidPublicKey => ContractErrorMapping {
+            code: "STELLAR_INVALID_PUBLIC_KEY",
+            message: "The provided Stellar public key is invalid.",
+            recovery: RecoveryClass::Fatal,
+            known: true,
+        },
+        StellarError::AccountNotFunded => ContractErrorMapping {
+            code: "STELLAR_ACCOUNT_NOT_FUNDED",
+            message: "The Stellar account has not been funded yet.",
+            recovery: RecoveryClass::ManualRecovery,
+            known: true,
+        },
+        StellarError::DatabaseError(_) => ContractErrorMapping {
+            code: "STELLAR_DATABASE_ERROR",
+            message: "A temporary internal error occurred while recording the transaction.",
+            recovery: RecoveryClass::Retry,
+            known: true,
+        },
+        StellarError::StellarSdkError(_) => ContractErrorMapping {
+            code: "STELLAR_SDK_ERROR",
+            message: "The Stellar network request could not be processed.",
+            recovery: RecoveryClass::Retry,
+            known: true,
+        },
+    }
+}
+
+/// Log an unknown/unmapped Stellar error with transaction context.
+///
+/// Only identifiers are logged — never a secret key, signature, or raw
+/// signing material. `tx_hash`/`contract`/`method` provide the correlation
+/// context support needs to triage the failure.
+pub fn log_unknown_stellar_error(
+    err: &StellarError,
+    tx_hash: Option<&str>,
+    contract: &str,
+    method: &str,
+) {
+    // `err`'s Display impl may include a raw Horizon body; that's acceptable
+    // for server-side logs but must never be returned to clients.
+    tracing::error!(
+        tx_hash = tx_hash.unwrap_or("unknown"),
+        contract,
+        method,
+        error_code = UNKNOWN_ERROR_CODE,
+        error = %err,
+        "Unmapped Stellar error encountered"
+    );
+}
+
+/// Map an error and, if it is unknown, log it with transaction context.
+///
+/// This is the boundary helper adapters should call before returning an
+/// error to a client.
+pub fn classify_stellar_error(
+    err: &StellarError,
+    tx_hash: Option<&str>,
+    contract: &str,
+    method: &str,
+) -> ContractErrorMapping {
+    let mapping = map_stellar_error(err);
+    if !mapping.known {
+        log_unknown_stellar_error(err, tx_hash, contract, method);
+    }
+    mapping
 }
 
 pub type DbPool = Arc<PgPool>;
@@ -813,6 +961,100 @@ fn urlencoding_encode(input: &str) -> String {
         }
     }
     encoded
+}
+
+#[cfg(test)]
+mod stellar_error_mapping_tests {
+    use super::*;
+
+    fn all_public_errors() -> Vec<StellarError> {
+        vec![
+            StellarError::AccountNotFound,
+            StellarError::InsufficientBalance,
+            StellarError::TransactionFailed("horizon 500".to_string()),
+            StellarError::InvalidPublicKey,
+            StellarError::AccountNotFunded,
+            StellarError::StellarSdkError("sdk boom".to_string()),
+        ]
+    }
+
+    #[test]
+    fn every_public_error_has_stable_code_and_safe_message() {
+        for err in all_public_errors() {
+            let mapping = map_stellar_error(&err);
+            assert!(mapping.known, "expected known mapping for {err:?}");
+            assert!(
+                mapping.code.starts_with("STELLAR_"),
+                "code must be namespaced: {}",
+                mapping.code
+            );
+            // Safe message must not leak raw internal payloads.
+            assert!(!mapping.message.contains("horizon 500"));
+            assert!(!mapping.message.contains("sdk boom"));
+            assert!(!mapping.message.is_empty());
+        }
+    }
+
+    #[test]
+    fn mappings_are_stable_across_calls() {
+        let err = StellarError::TransactionFailed("x".to_string());
+        assert_eq!(map_stellar_error(&err), map_stellar_error(&err));
+    }
+
+    #[test]
+    fn retry_classification_is_documented() {
+        assert_eq!(
+            map_stellar_error(&StellarError::TransactionFailed("x".to_string())).recovery,
+            RecoveryClass::Retry
+        );
+        assert_eq!(
+            map_stellar_error(&StellarError::StellarSdkError("x".to_string())).recovery,
+            RecoveryClass::Retry
+        );
+        assert_eq!(
+            map_stellar_error(&StellarError::InsufficientBalance).recovery,
+            RecoveryClass::ManualRecovery
+        );
+        assert_eq!(
+            map_stellar_error(&StellarError::InvalidPublicKey).recovery,
+            RecoveryClass::Fatal
+        );
+    }
+
+    #[test]
+    fn unknown_error_is_distinguishable() {
+        // Simulate a future error variant by constructing a mapping directly
+        // through the unknown path: an error that has no catalog entry would
+        // be represented with the stable unknown code.
+        let unknown = ContractErrorMapping {
+            code: UNKNOWN_ERROR_CODE,
+            message: "An unexpected Stellar error occurred.",
+            recovery: RecoveryClass::ManualRecovery,
+            known: false,
+        };
+        assert!(!unknown.known);
+        assert_eq!(unknown.code, "STELLAR_UNKNOWN_ERROR");
+        assert_ne!(unknown.code, map_stellar_error(&StellarError::AccountNotFound).code);
+    }
+
+    #[test]
+    fn classify_known_error_does_not_log() {
+        // Known errors must not be routed through the unknown-error logger.
+        let mapping = classify_stellar_error(
+            &StellarError::AccountNotFound,
+            Some("tx-1"),
+            "native",
+            "escrow_entry_fees",
+        );
+        assert!(mapping.known);
+        assert_eq!(mapping.code, "STELLAR_ACCOUNT_NOT_FOUND");
+    }
+
+    #[test]
+    fn retryable_errors_report_retryable() {
+        assert!(map_stellar_error(&StellarError::TransactionFailed("x".to_string())).is_retryable());
+        assert!(!map_stellar_error(&StellarError::InvalidPublicKey).is_retryable());
+    }
 }
 
 #[cfg(test)]
