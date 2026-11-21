@@ -86,6 +86,58 @@ All `eventType` strings must be registered in `server/src/services/kafka/domain-
 3. **Inject `traceId`** from the originating HTTP request (via `eventTracingMiddleware`). Never generate a new one mid-flow.
 4. **Use idempotent producer** (`idempotent: true`) — already set in `KafkaClient`.
 5. Log the `eventId` and `traceId` at `INFO` level after a successful publish.
+6. **Critical domain events go through the transactional outbox** (see §4.1). Never publish a match, wallet, or tournament event directly after `COMMIT`.
+
+### 4.1 Transactional Outbox
+
+Publishing after committing a domain mutation loses events if the process dies
+between `COMMIT` and the broker `ack`. Critical events (match, wallet,
+tournament) are therefore written to an outbox table **inside the same database
+transaction** as the mutation, and a separate publisher drains the table to
+Kafka.
+
+**Write path (atomic with the mutation):**
+
+```typescript
+await db.transaction(async (tx) => {
+  await tx.matches.update(matchId, { status: 'ended' });
+  await outbox.enqueue(tx, {
+    eventId: randomUUID(),          // stable id, generated once
+    eventType: 'match.ended',
+    version: 1,                     // schema version, see §3.1
+    aggregateId: matchId,           // partition key
+    traceId: req.traceId,
+    payload: { matchId, winnerId },
+  });
+});
+```
+
+- The outbox row commits or rolls back **with** the domain mutation — there is no
+  window where one exists without the other.
+- `eventId` is generated at enqueue time and never regenerated, so a retried
+  publish reuses the same id (stable across restarts).
+- `version` is the schema version from §3.1 and is carried on the row so the
+  publisher emits the exact schema that was current at write time.
+- The outbox is the **only** authoritative write path for these events; do not
+  add a second direct-publish path alongside it.
+
+**Publish path (resumable):**
+
+- The publisher polls unpublished rows (`published_at IS NULL`) ordered by
+  `id`, publishes each to its domain topic and `arenax.event.store`, then marks
+  the row published.
+- On restart the publisher resumes from the first unpublished row — nothing is
+  lost because the row was already durable before the crash.
+- A row may be published more than once (crash after `ack`, before the mark).
+  This is expected: delivery is at-least-once and consumers dedupe on `eventId`
+  (§5.2).
+
+**Retention & cleanup:**
+
+- Published rows are retained for **7 days** (matching the longest consumer
+  replay window) and then purged by a scheduled job.
+- Unpublished rows are never purged; a growing backlog is an alert (see §8).
+- Purge only rows with `published_at < now() - interval '7 days'`.
 
 ---
 
@@ -96,6 +148,17 @@ All `eventType` strings must be registered in `server/src/services/kafka/domain-
 3. **Never `throw` from `handle()` without a meaningful log.** The base `EventConsumer` will retry and eventually route to DLQ.
 4. **DLQ consumers** must be set up for every primary topic. A DLQ message must trigger a PagerDuty/Slack alert and be reviewed within 24 hours.
 5. **Do not block the event loop.** All I/O inside `handle()` must be awaited.
+
+### 5.2 Duplicate-safe consumption
+
+Because the outbox publisher (and Kafka itself) delivers at-least-once, a
+consumer may see the same `eventId` twice. Consumers MUST make redelivery a
+no-op:
+
+- Record processed `eventId`s (unique constraint or a `processed_events` table)
+  in the same transaction as the consumer's own write.
+- A duplicate `eventId` is skipped, not reprocessed — the second delivery must
+  not double-apply a wallet credit or re-emit a downstream event.
 
 ---
 
@@ -166,6 +229,8 @@ Every service MUST:
 - Emit consumer lag metrics to Prometheus via the `arenax_kafka_consumer_lag` gauge.
 - Include `traceId` in every log line related to event processing.
 - Set up Grafana dashboards for: publish rate, consumer lag, DLQ message count.
+- Emit outbox backlog metrics: unpublished row count and oldest unpublished age
+  (alert if oldest unpublished age `> 60 s`).
 
 ---
 
@@ -177,4 +242,3 @@ Every service MUST:
 4. All changes require review from at least **one Platform team member**.
 
 ---
-
