@@ -39,6 +39,7 @@ use async_trait::async_trait;
 use arenax_backend::service::payment_provider::{
     DepositInitiation, PaymentError, PaymentProvider, PaymentStatus,
 };
+mod support;
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Shared mock infrastructure
@@ -610,6 +611,38 @@ mod provider_kind_tests {
         assert_eq!("paystack".parse(), Ok(PaymentProviderKind::Paystack));
         assert_eq!("PAYSTACK".parse(), Ok(PaymentProviderKind::Paystack));
         assert_eq!(" Paystack ".parse(), Ok(PaymentProviderKind::Paystack));
+    }
+
+    mod deterministic_provider_simulator_tests {
+        use super::*;
+        use support::provider_simulator::{ProviderSimulator, Response, TestClock};
+
+        #[tokio::test]
+        async fn simulates_delays_reordering_duplicates_and_provider_failures() {
+            let clock = TestClock::new(100);
+            let provider = ProviderSimulator::new(clock.clone());
+            provider.schedule("slow", 110, 1, Response::Accepted);
+            provider.schedule("fast", 105, 2, Response::Failed);
+            provider.schedule("broken", 100, 3, Response::TransportError);
+
+            assert_eq!(provider.check_status("slow").await.unwrap(), PaymentStatus::Pending);
+            assert_eq!(provider.check_status("fast").await.unwrap(), PaymentStatus::Pending);
+
+            clock.advance(5);
+            assert_eq!(provider.check_status("fast").await.unwrap(), PaymentStatus::Failed);
+            assert_eq!(provider.check_status("slow").await.unwrap(), PaymentStatus::Pending);
+            assert!(matches!(
+                provider.check_status("fast").await,
+                Err(PaymentError::Provider(message)) if message.contains("duplicate")
+            ));
+            assert!(matches!(
+                provider.check_status("broken").await,
+                Err(PaymentError::Provider(message)) if message.contains("transport failure")
+            ));
+
+            clock.advance(5);
+            assert_eq!(provider.check_status("slow").await.unwrap(), PaymentStatus::Success);
+        }
     }
 
     #[test]

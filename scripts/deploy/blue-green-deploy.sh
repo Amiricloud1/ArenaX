@@ -3,7 +3,7 @@
 #
 # 1. Determine the idle slot (the color NOT currently receiving traffic,
 #    tracked in deploy/state/active-slot).
-# 2. Start the idle slot on the new image tag.
+# 2. Start the idle slot on the signature-verified image digests.
 # 3. Health-check the idle slot before it receives any real traffic.
 # 4. Canary: shift CANARY_WEIGHT% of traffic to it for CANARY_BAKE_SECONDS,
 #    re-checking health throughout. Abort (and never touch the active
@@ -18,11 +18,16 @@
 #    transition) to deploy/metrics/deployments.jsonl.
 #
 # Usage:
-#   IMAGE_TAG=<git-sha> ./scripts/deploy/blue-green-deploy.sh
+#   IMAGE_TAG=<git-sha> BACKEND_IMAGE_REF=<repo>@sha256:<digest> \
+#     FRONTEND_IMAGE_REF=<repo>@sha256:<digest> PROVENANCE_VERIFIED=true \
+#     ./scripts/deploy/blue-green-deploy.sh
 #
 # Env:
-#   IMAGE_TAG               (required) image tag to deploy, built by CI
-#   BACKEND_IMAGE, FRONTEND_IMAGE  image repos (defaults: arenax-backend / arenax-frontend)
+#   IMAGE_TAG                 source commit tag used for reporting
+#   BACKEND_IMAGE_REF         immutable, verified backend image digest
+#   FRONTEND_IMAGE_REF        immutable, verified frontend image digest
+#   SOURCE_REVISION           source commit whose provenance was verified
+#   PROVENANCE_VERIFIED       must be true before deployment is permitted
 #   CANARY_WEIGHT            (default 10) percent of traffic sent to the canary phase
 #   CANARY_BAKE_SECONDS       (default 60) how long to hold the canary split
 #   ROLLBACK_WINDOW_SECONDS    (default 120) how long the old slot stays warm post-cutover
@@ -33,6 +38,20 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
 : "${IMAGE_TAG:?IMAGE_TAG must be set to the image tag to deploy}"
+: "${SOURCE_REVISION:?SOURCE_REVISION must identify the verified source commit}"
+: "${VERIFICATION_RUN_ID:?VERIFICATION_RUN_ID must identify the provenance verification run}"
+: "${BACKEND_IMAGE_REF:?verified backend image digest is required}"
+: "${FRONTEND_IMAGE_REF:?verified frontend image digest is required}"
+[ "${PROVENANCE_VERIFIED:-}" = "true" ] || {
+  echo "Deployment requires verified release provenance." >&2
+  exit 1
+}
+for image_ref in "$BACKEND_IMAGE_REF" "$FRONTEND_IMAGE_REF"; do
+  [[ "$image_ref" =~ @sha256:[0-9a-f]{64}$ ]] || {
+    echo "Deployment image references must be immutable sha256 digests: $image_ref" >&2
+    exit 1
+  }
+done
 canary_weight="${CANARY_WEIGHT:-10}"
 canary_bake_seconds="${CANARY_BAKE_SECONDS:-60}"
 rollback_window_seconds="${ROLLBACK_WINDOW_SECONDS:-120}"
@@ -61,8 +80,10 @@ record_metric() {
   end_ts=$(date -u +%s)
   end_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   duration=$((end_ts - start_ts))
-  printf '{"started_at":"%s","finished_at":"%s","duration_seconds":%d,"image_tag":"%s","from_slot":"%s","to_slot":"%s","status":"%s"}\n' \
-    "$start_iso" "$end_iso" "$duration" "$IMAGE_TAG" "$active_color" "$idle_color" "$status" \
+  printf '{"started_at":"%s","finished_at":"%s","duration_seconds":%d,"image_tag":"%s","source_revision":"%s","verification_run_id":"%s","backend_image":"%s","frontend_image":"%s","provenance_verified":%s,"from_slot":"%s","to_slot":"%s","status":"%s"}\n' \
+    "$start_iso" "$end_iso" "$duration" "$IMAGE_TAG" "$SOURCE_REVISION" "$VERIFICATION_RUN_ID" \
+    "$BACKEND_IMAGE_REF" "$FRONTEND_IMAGE_REF" "$PROVENANCE_VERIFIED" \
+    "$active_color" "$idle_color" "$status" \
     >> deploy/metrics/deployments.jsonl
   echo "Deployment metrics recorded: status=$status duration=${duration}s"
 }
@@ -89,10 +110,16 @@ abort() {
   exit 1
 }
 
-BACKEND_IMAGE="${BACKEND_IMAGE:-arenax-backend}" \
-FRONTEND_IMAGE="${FRONTEND_IMAGE:-arenax-frontend}" \
+BACKEND_IMAGE_REF="$BACKEND_IMAGE_REF" \
+FRONTEND_IMAGE_REF="$FRONTEND_IMAGE_REF" \
 IMAGE_TAG="$IMAGE_TAG" \
   $compose up -d "backend-$idle_color" "frontend-$idle_color"
+
+printf '%s\n' "$BACKEND_IMAGE_REF" > "$state_dir/$idle_color-backend-image"
+printf '%s\n' "$FRONTEND_IMAGE_REF" > "$state_dir/$idle_color-frontend-image"
+printf '%s\n' "$SOURCE_REVISION" > "$state_dir/$idle_color-source-revision"
+printf '%s\n' "$VERIFICATION_RUN_ID" > "$state_dir/$idle_color-verification-run-id"
+printf '%s\n' "$PROVENANCE_VERIFIED" > "$state_dir/$idle_color-provenance-verified"
 
 echo "-- Health-checking idle slot ($idle_color) before it takes any traffic --"
 health_check "$idle_color" || abort "idle slot $idle_color failed readiness checks"

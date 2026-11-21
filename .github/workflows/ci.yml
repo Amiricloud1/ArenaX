@@ -7,6 +7,27 @@ on:
     branches: [main, dev, develop]
 
 jobs:
+  test-quarantine:
+    name: Test quarantine policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Restore quarantine recovery streaks
+        uses: actions/cache@v4
+        with:
+          path: .github/test-quarantine-history.json
+          key: quarantine-history-${{ github.ref }}-${{ github.run_id }}
+          restore-keys: |
+            quarantine-history-${{ github.ref }}-
+
+      - name: Validate quarantines and report disabled coverage
+        run: python3 scripts/check-test-quarantine.py
+
+      - name: Test quarantine policy edge cases
+        run: python3 -m unittest scripts/tests/test_check_test_quarantine.py
+
   secret-scan:
     name: Secret scan (current content + history)
     runs-on: ubuntu-latest
@@ -70,6 +91,10 @@ jobs:
   contracts:
     name: Contracts (Soroban)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     defaults:
       run:
         working-directory: contracts
@@ -144,6 +169,12 @@ jobs:
               if digest != artifact["sha256"]:
                   raise SystemExit(f"SHA-256 mismatch for {artifact['filename']}")
           PY
+
+      - name: Attest contract artifacts
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: contracts/target/wasm32-unknown-unknown/release/*.wasm
 
       - name: Upload contract build artifacts
         uses: actions/upload-artifact@v4
@@ -228,6 +259,11 @@ jobs:
         if ! command -v sqlx >/dev/null 2>&1; then
           cargo install sqlx-cli --version 0.8.6 --no-default-features --features rustls,postgres --locked
         fi
+
+    - name: Verify previous/current migration compatibility fixtures
+      env:
+        CONTRACT_RELEASE_MARKER: previous-app-retired
+      run: bash ./scripts/verify-migration-compatibility.sh
 
     - name: Verify migration files
       run: ./scripts/verify-migrations.sh

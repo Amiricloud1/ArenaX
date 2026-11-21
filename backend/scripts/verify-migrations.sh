@@ -355,6 +355,13 @@ run_staged_mode() {
     [ "${#files[@]}" -gt 0 ] || continue
 
     log "Stage: $stage (${#files[@]} file(s))"
+    if [ "$stage" = "contract" ] &&
+      [ "${CONTRACT_RELEASE_MARKER:-}" != "previous-app-retired" ]; then
+      fail "Contract migrations require CONTRACT_RELEASE_MARKER=previous-app-retired after all prior-version binaries are retired"
+    fi
+    if [ "$stage" = "contract" ]; then
+      log "Contract release marker recorded: $CONTRACT_RELEASE_MARKER"
+    fi
     local file
     for file in "${files[@]}"; do
       log "  $stage: $(basename "$file")"

@@ -1,0 +1,7 @@
+CREATE TABLE migration_compatibility_accounts (
+    id integer PRIMARY KEY,
+    legacy_name text NOT NULL
+);
+
+ALTER TABLE migration_compatibility_accounts
+    ADD COLUMN display_name text;
