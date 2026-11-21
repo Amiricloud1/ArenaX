@@ -180,6 +180,18 @@ const REDACTED_KEYS: &[&str] = &[
     "evidence",
     "ssn",
     "card_number",
+    // Experiment participant identifiers.
+    "participant_id",
+    "participant",
+    "experiment_participant_id",
+    // Privacy deletion target identifiers (must never be logged).
+    "deletion_target",
+    "deletion_target_id",
+    "deleted_value",
+    "deleted_values",
+    "profile_id",
+    "email",
+    "phone",
 ];
 
 fn redact_value(value: &serde_json::Value) -> serde_json::Value {

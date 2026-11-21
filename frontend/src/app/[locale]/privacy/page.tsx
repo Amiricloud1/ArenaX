@@ -146,6 +146,30 @@ export default function PrivacyPage() {
           </section>
 
           <section className="mb-8">
+            <h2 className="font-heading text-2xl font-bold mb-4">7a. Account Deletion and Verification</h2>
+            <p className="text-muted-foreground mb-4">
+              When you request deletion of your account, we run an end-to-end deletion
+              workflow that removes your personal information from our primary database
+              and from every dependent system that stores a copy of it, including caches,
+              analytics projections, and search indexes.
+            </p>
+            <ul className="list-disc pl-6 text-muted-foreground space-y-2 mb-4">
+              <li>Each dependent system must acknowledge the deletion request before the workflow is considered complete.</li>
+              <li>Failed or unacknowledged deletions are retried automatically and tracked until they succeed.</li>
+              <li>Deletion status is recorded without storing the deleted values themselves, so audit logs never contain the erased data.</li>
+              <li>We report your deletion as complete only after all required systems confirm removal, or when a documented legal-retention exception applies.</li>
+            </ul>
+            <p className="text-muted-foreground mb-4">
+              <strong>Retention exceptions:</strong> Certain records may be retained where
+              required by law or for legitimate purposes such as financial and transaction
+              records, fraud prevention, dispute resolution, and anti-cheat integrity. Where
+              an exception applies, we retain only the minimum necessary data for the
+              documented retention period and restrict its use to that purpose. Blockchain
+              data is permanent by design and cannot be deleted; see Section 3.
+            </p>
+          </section>
+
+          <section className="mb-8">
             <h2 className="font-heading text-2xl font-bold mb-4">8. Cookies and Tracking</h2>
             <p className="text-muted-foreground mb-4">
               We use cookies and similar tracking technologies to:
@@ -163,12 +187,48 @@ export default function PrivacyPage() {
           </section>
 
           <section className="mb-8">
+            <h2 className="font-heading text-2xl font-bold mb-4">8a. Experiments and Product Analytics</h2>
+            <p className="text-muted-foreground mb-4">
+              We run feature experiments to improve the Platform. When you are included in
+              an experiment, we assign you to a variant using a deterministic assignment
+              that is stable for the experiment scope and records the assignment version.
+              Your assignment is not silently changed mid-session.
+            </p>
+            <ul className="list-disc pl-6 text-muted-foreground space-y-2 mb-4">
+              <li><strong>Consent:</strong> Experiment assignment and exposure logging respect your consent preferences and our exclusion rules. If you have not consented, you are excluded from experiments.</li>
+              <li><strong>Exposure logging:</strong> We record that you were exposed to an experiment only when the assigned experience is actually presented to you, not at assignment time.</li>
+              <li><strong>Guardrails:</strong> Experiments define guardrail metrics (such as payment errors, match quality, latency, and player safety) and stop conditions in advance, so harmful outcomes are detected and the experiment is halted.</li>
+            </ul>
+            <p className="text-muted-foreground mb-4">
+              You can manage your analytics and experiment preferences through your account
+              settings, or contact us through our <Link href="/contact" className="text-primary hover:underline">Contact page</Link>.
+            </p>
+          </section>
+
+          <section className="mb-8">
+            <h2 className="font-heading text-2xl font-bold mb-4">8b. Leaderboard Snapshots</h2>
+            <p className="text-muted-foreground mb-4">
+              Leaderboards are served from versioned snapshots. Each response identifies the
+              snapshot version and time, and uses a stable tie-break rule so that rankings do
+              not shift between pages while you are browsing. A refresh never moves you between
+              pages within the same snapshot. Snapshot data is bounded in freshness, and stale
+              data is explicitly marked and observable.
+            </p>
+          </section>
+
+          <section className="mb-8">
             <h2 className="font-heading text-2xl font-bold mb-4">9. Data Retention</h2>
             <p className="text-muted-foreground mb-4">
               We retain your personal information for as long as your account is active or 
               as needed to provide you services. Blockchain data, by its nature, is 
               permanent and cannot be deleted. However, you can disconnect your wallet 
               from your account to reduce on-chain linkage.
+            </p>
+            <p className="text-muted-foreground mb-4">
+              When you request deletion, we remove your data from caches, analytics
+              projections, and search indexes as described in Section 7a. Where a documented
+              legal-retention exception applies, we retain only the minimum necessary data for
+              the required period and record the exception in our deletion audit trail.
             </p>
           </section>
 

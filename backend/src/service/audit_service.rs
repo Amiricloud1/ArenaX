@@ -104,6 +104,10 @@ impl AuditAction {
             Self::OperatorRequestRejected => "operator_request_rejected",
         }
     }
+
+    let mut redacted = 0usize;
+    let out = walk(value, &mut redacted);
+    (out, redacted)
 }
 
 /// Why a privileged operator request was refused.

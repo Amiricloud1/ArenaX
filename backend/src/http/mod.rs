@@ -30,6 +30,8 @@ pub mod analytics_handler;
 pub mod analytics_ingestion_handler;
 pub mod analytics_identity_handler;
 pub mod batch_handler;
+pub mod experiment_handler;
+pub mod privacy_deletion_handler;
 pub mod tournament_handler;
 pub mod users;
 pub mod wallet;

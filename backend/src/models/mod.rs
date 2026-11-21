@@ -4,8 +4,10 @@ pub mod analytics;
 pub mod api_key;
 pub mod batch;
 pub mod dispute;
+pub mod experiment;
 pub mod idempotency;
 pub mod leaderboard;
+pub mod privacy_deletion;
 pub mod match_authority;
 pub mod match_models;
 pub mod matchmaker;
@@ -33,8 +35,10 @@ pub use dispute::{
     DisputeEvidence, DisputeHistoryEntry, EscalateDisputeRequest, EscalationLevel,
     ListDisputesQuery, RejectDisputeRequest, ResolveDisputeRequest, TicketStatus,
 };
+pub use experiment::*;
 pub use idempotency::*;
 pub use leaderboard::*;
+pub use privacy_deletion::*;
 pub use match_authority::*;
 pub use match_models::{
     CreateDisputeRequest, DisputeListResponse, DisputeStatus, EloHistory, EloResponse,

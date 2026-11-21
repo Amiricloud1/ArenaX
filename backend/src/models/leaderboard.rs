@@ -18,12 +18,53 @@ pub struct LeaderboardEntry {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Versioned, freshness-aware metadata describing the snapshot a leaderboard
+/// response was served from. Clients can use `snapshot_id`/`snapshot_version`
+/// to request a consistent page set and `stale`/`stale_after` to bound and
+/// surface how old the data is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotInfo {
+    /// Stable identifier of the snapshot (e.g. a content hash or monotonic id).
+    pub snapshot_id: String,
+    /// Monotonic version number of the snapshot; increases on each rebuild.
+    pub snapshot_version: i64,
+    /// When the snapshot was created/materialized.
+    pub snapshot_created_at: DateTime<Utc>,
+    /// Whether the snapshot has exceeded its freshness bound.
+    pub stale: bool,
+    /// The instant after which the snapshot is considered stale.
+    pub stale_after: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaderboardResponse {
     pub entries: Vec<LeaderboardEntry>,
     pub total_count: i64,
     pub period: String,
     pub category: String,
+    /// Snapshot identity/version the entries were served from.
+    pub snapshot_id: String,
+    /// Monotonic snapshot version; stable across pages of one snapshot.
+    pub snapshot_version: i64,
+    /// When the snapshot was created/materialized.
+    pub snapshot_created_at: DateTime<Utc>,
+    /// Whether the snapshot has exceeded its freshness bound.
+    pub stale: bool,
+    /// The instant after which the snapshot is considered stale.
+    pub stale_after: DateTime<Utc>,
+}
+
+impl LeaderboardResponse {
+    /// Snapshot metadata for this response.
+    pub fn snapshot_info(&self) -> SnapshotInfo {
+        SnapshotInfo {
+            snapshot_id: self.snapshot_id.clone(),
+            snapshot_version: self.snapshot_version,
+            snapshot_created_at: self.snapshot_created_at,
+            stale: self.stale,
+            stale_after: self.stale_after,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -86,6 +86,21 @@ pub struct AggregationQuery {
     pub latency_budget_ms: Option<i64>,
 }
 
+#[derive(Deserialize)]
+pub struct ExposureBody {
+    pub experiment_key: String,
+    pub variant: String,
+    pub assignment_version: i32,
+    pub user_id: Option<String>,
+    pub session_id: Option<String>,
+    pub surface: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ExperimentStatusQuery {
+    pub analysis_window_secs: Option<i64>,
+}
+
 pub async fn record_match(
     db: web::Data<PgPool>,
     body: web::Json<RecordMatchBody>,
@@ -410,4 +425,112 @@ pub async fn get_revenue_metrics(
         incomplete,
         budget,
     }))
+}
+
+/// Logs an experiment exposure at presentation time.
+///
+/// The caller must be authenticated; the authenticated user id is taken from
+/// the request extensions (populated by the auth middleware). A body-supplied
+/// `user_id` is only honoured when it matches the authenticated principal, so
+/// exposures cannot be forged on behalf of other participants.
+pub async fn record_exposure(
+    req: HttpRequest,
+    db: web::Data<PgPool>,
+    body: web::Json<ExposureBody>,
+) -> Result<HttpResponse, ApiError> {
+    let authenticated_user = req
+        .extensions()
+        .get::<crate::middleware::security::AuthenticatedUser>()
+        .map(|u| u.user_id)
+        .ok_or_else(|| ApiError::Unauthorized("authentication required".to_string()))?;
+
+    if body.experiment_key.trim().is_empty() {
+        return Err(ApiError::BadRequest("experiment_key is required".to_string()));
+    }
+    if body.variant.trim().is_empty() {
+        return Err(ApiError::BadRequest("variant is required".to_string()));
+    }
+    if body.assignment_version < 1 {
+        return Err(ApiError::BadRequest(
+            "assignment_version must be >= 1".to_string(),
+        ));
+    }
+
+    let user_id = match body.user_id.as_deref() {
+        Some(raw) => {
+            let parsed = validate_uuid(raw)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            if parsed != authenticated_user {
+                return Err(ApiError::Forbidden(
+                    "cannot log exposure for another user".to_string(),
+                ));
+            }
+            parsed
+        }
+        None => authenticated_user,
+    };
+
+    let session_id = match body.session_id.as_deref() {
+        Some(raw) => Some(
+            validate_uuid(raw).map_err(|e| ApiError::BadRequest(e.to_string()))?,
+        ),
+        None => None,
+    };
+
+    let svc = AnalyticsService::new(db.get_ref().clone());
+    svc.record_exposure(
+        &body.experiment_key,
+        &body.variant,
+        body.assignment_version,
+        user_id,
+        session_id,
+        body.surface.as_deref(),
+    )
+    .await?;
+
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// Returns the guardrail dashboard status for an experiment.
+///
+/// Admin-only: the authenticated principal must carry the admin role.
+pub async fn get_experiment_status(
+    req: HttpRequest,
+    db: web::Data<PgPool>,
+    path: web::Path<String>,
+    query: web::Query<ExperimentStatusQuery>,
+) -> Result<HttpResponse, ApiError> {
+    let authenticated_user = req
+        .extensions()
+        .get::<crate::middleware::security::AuthenticatedUser>()
+        .ok_or_else(|| ApiError::Unauthorized("authentication required".to_string()))?;
+
+    if !authenticated_user.is_admin {
+        return Err(ApiError::Forbidden(
+            "admin role required".to_string(),
+        ));
+    }
+
+    let experiment_key = path.into_inner();
+    if experiment_key.trim().is_empty() {
+        return Err(ApiError::BadRequest("experiment_key is required".to_string()));
+    }
+
+    if let Some(window) = query.analysis_window_secs {
+        if window <= 0 {
+            return Err(ApiError::BadRequest(
+                "analysis_window_secs must be positive".to_string(),
+            ));
+        }
+    }
+
+    let svc = AnalyticsService::new(db.get_ref().clone());
+    match svc
+        .get_experiment_status(&experiment_key, query.analysis_window_secs)
+        .await?
+    {
+        Some(status) => Ok(HttpResponse::Ok().json(status)),
+        None => Ok(HttpResponse::NotFound()
+            .json(serde_json::json!({"error": "experiment not found"}))),
+    }
 }

@@ -363,6 +363,27 @@ function loadOrCreateSession(userId?: string): SessionProperties {
   return session;
 }
 
+function loadExperimentCache(): Record<string, ExperimentAssignment> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = sessionStorage.getItem(EXPERIMENT_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, ExperimentAssignment>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveExperimentCache(cache: Record<string, ExperimentAssignment>): void {
+  if (typeof window === "undefined") return;
+  try {
+    sessionStorage.setItem(EXPERIMENT_CACHE_KEY, JSON.stringify(cache));
+  } catch {
+    // ignore
+  }
+}
+
 function getDeviceType(): string {
   if (typeof navigator === "undefined") return "unknown";
   if (/Mobi|Android/i.test(navigator.userAgent)) return "mobile";
@@ -450,6 +471,8 @@ export class AnalyticsService {
     if (typeof window === "undefined") return;
     // Remove ephemeral identifiers on opt-out
     sessionStorage.removeItem(SESSION_KEY);
+    sessionStorage.removeItem(EXPERIMENT_CACHE_KEY);
+    this.experiments = {};
     this.session = {
       sessionId: "anonymous",
       deviceType: "unknown",
@@ -613,6 +636,71 @@ export class AnalyticsService {
     }
   }
 
+  // ── Experiments ───────────────────────────────────────────────────────────
+
+  /**
+   * Returns the cached assignment for the current session, if any. Assignments
+   * are pinned for the lifetime of the session so a participant is never
+   * silently reassigned mid-session.
+   */
+  getExperimentAssignment(experimentId: string): ExperimentAssignment | null {
+    const cached = this.experiments[experimentId];
+    return cached ? { ...cached } : null;
+  }
+
+  /**
+   * Resolves a deterministic assignment from the backend and caches it for the
+   * session. Requires analytics consent; without consent no assignment is
+   * requested or cached. A cached assignment always wins over a fresh request.
+   */
+  async assignExperiment(
+    experimentId: string,
+    options: AssignExperimentOptions = {},
+  ): Promise<ExperimentAssignment | null> {
+    if (this.consent.analytics !== "granted") return null;
+
+    const cached = this.experiments[experimentId];
+    if (cached) return { ...cached };
+
+    const endpoint = options.endpoint ?? "/api/experiments/assign";
+    const fetcher = options.fetcher ?? (typeof fetch !== "undefined" ? fetch : undefined);
+    if (!fetcher) return null;
+
+    try {
+      const response = await fetcher(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "same-origin",
+        body: JSON.stringify({
+          experimentId,
+          sessionId: this.session.sessionId,
+          userId: this.session.userId ?? null,
+        }),
+      });
+      if (!response.ok) return null;
+
+      const data = (await response.json()) as Partial<ExperimentAssignment> | null;
+      if (
+        !data ||
+        typeof data.variant !== "string" ||
+        typeof data.assignmentVersion !== "string"
+      ) {
+        return null;
+      }
+
+      const assignment: ExperimentAssignment = {
+        experimentId,
+        variant: data.variant,
+        assignmentVersion: data.assignmentVersion,
+      };
+      this.experiments[experimentId] = assignment;
+      saveExperimentCache(this.experiments);
+      return { ...assignment };
+    } catch {
+      return null;
+    }
+  }
+
   // ── Tracking ──────────────────────────────────────────────────────────────
 
   /**
@@ -710,6 +798,22 @@ export class AnalyticsService {
     locale?: string;
   }): void {
     this.track("auth_redirect_restore", { ...props });
+  }
+
+  /**
+   * Logs an experiment exposure. Must be called at presentation time (when the
+   * participant actually sees the assigned experience), never at assignment
+   * time. Respects analytics consent.
+   */
+  trackExposure(experimentId: string, variant: string, assignmentVersion: string): void {
+    if (this.consent.analytics !== "granted") return;
+    if (!experimentId || !variant || !assignmentVersion) return;
+
+    this.track("experiment_exposure", {
+      experimentId,
+      variant,
+      assignmentVersion,
+    });
   }
 }
 

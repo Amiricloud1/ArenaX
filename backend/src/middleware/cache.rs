@@ -96,6 +96,14 @@ pub struct CacheMetrics {
     stale_hits: AtomicU64,
     misses: AtomicU64,
     errors: AtomicU64,
+    /// Leaderboard reads served from a snapshot that had already passed its
+    /// freshness window (Issue #257). Distinct from `stale_hits` because a
+    /// snapshot can be within the cache's stale window yet still be reported
+    /// to the client as bounded-stale; operators alert on this directly.
+    snapshot_stale_served: AtomicU64,
+    /// Privacy deletion cache purges that failed to confirm (Issue #258).
+    /// Non-zero means a dependent cache may still hold deleted values.
+    deletion_ack_failures: AtomicU64,
 }
 
 /// Point-in-time copy of the counters.
@@ -105,6 +113,8 @@ pub struct CacheMetricsSnapshot {
     pub stale_hits: u64,
     pub misses: u64,
     pub errors: u64,
+    pub snapshot_stale_served: u64,
+    pub deletion_ack_failures: u64,
 }
 
 impl CacheMetricsSnapshot {
@@ -127,7 +137,23 @@ impl CacheMetrics {
             stale_hits: self.stale_hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
             errors: self.errors.load(Ordering::Relaxed),
+            snapshot_stale_served: self.snapshot_stale_served.load(Ordering::Relaxed),
+            deletion_ack_failures: self.deletion_ack_failures.load(Ordering::Relaxed),
         }
+    }
+
+    /// Records that a leaderboard read was served from a snapshot past its
+    /// freshness window (Issue #257). Callers report the bounded staleness to
+    /// the client; this counter makes it observable to operators.
+    pub fn record_snapshot_stale(&self) {
+        self.snapshot_stale_served.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records that a privacy deletion could not confirm a cache purge
+    /// (Issue #258). The deletion workflow must treat this as an unacknowledged
+    /// dependent system and retry; the counter surfaces it in metrics.
+    pub fn record_deletion_ack_failure(&self) {
+        self.deletion_ack_failures.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -343,6 +369,70 @@ impl ResponseCache {
         }
     }
 
+    /// Drops every cached leaderboard page for `category` (Issue #257).
+    ///
+    /// A snapshot is only coherent if all of its pages are dropped together;
+    /// invalidating one page would let a reader paginate from a new snapshot
+    /// into an old one and see users move between pages. Returns `true` when
+    /// the invalidation was confirmed, `false` when Redis failed — the caller
+    /// (a write path) must not report success on `false`.
+    pub async fn invalidate_leaderboard_snapshot(&self, category: &str) -> bool {
+        let tag = keys::leaderboard_tag(category);
+        self.invalidate_tag_confirmed(&tag).await
+    }
+
+    /// Purges every cached entry derived from one user's profile (Issue #258).
+    ///
+    /// Privacy deletion must not leave identifiable values in the response
+    /// cache. This drops the per-user tag (player stats, profile-derived
+    /// responses) and returns whether the purge was confirmed. A `false`
+    /// result is an unacknowledged dependent system: the deletion workflow
+    /// must retry and must not report completion.
+    pub async fn purge_user_profile(&self, user_id: &uuid::Uuid) -> bool {
+        let tag = keys::player_tag(user_id);
+        let confirmed = self.invalidate_tag_confirmed(&tag).await;
+        if !confirmed {
+            self.metrics.record_deletion_ack_failure();
+        }
+        confirmed
+    }
+
+    /// Like [`invalidate_tag`](Self::invalidate_tag) but reports success.
+    ///
+    /// The plain variant logs and swallows errors because a failed
+    /// invalidation on a best-effort path is tolerable. Deletion and snapshot
+    /// coherence cannot tolerate it, so they need the boolean.
+    async fn invalidate_tag_confirmed(&self, tag: &str) -> bool {
+        let mut conn = self.redis.clone();
+        let tag_key = self.tag_key(tag);
+
+        let members: Vec<String> = match conn.smembers(&tag_key).await {
+            Ok(m) => m,
+            Err(e) => {
+                self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                warn!(tag = %tag, error = %e, "Cache invalidation failed to read tag set");
+                return false;
+            }
+        };
+
+        if !members.is_empty() {
+            if let Err(e) = conn.del::<_, ()>(members.clone()).await {
+                self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+                warn!(tag = %tag, error = %e, "Cache invalidation failed to delete entries");
+                return false;
+            }
+        }
+
+        if let Err(e) = conn.del::<_, ()>(&tag_key).await {
+            self.metrics.errors.fetch_add(1, Ordering::Relaxed);
+            warn!(tag = %tag, error = %e, "Cache invalidation failed to delete tag set");
+            return false;
+        }
+
+        debug!(tag = %tag, entries = members.len(), "Invalidated cache tag");
+        true
+    }
+
     /// Read-through helper: serve from cache, otherwise compute and store.
     ///
     /// On a stale hit the caller gets the stale value immediately and `compute`
@@ -438,6 +528,16 @@ pub mod keys {
         format!("leaderboard:{}:{}:{}", category, limit, offset)
     }
 
+    /// Key for a page of a specific leaderboard snapshot (Issue #257).
+    ///
+    /// Including the snapshot version means every page of one snapshot is
+    /// addressed independently of any later snapshot, so a refresh can never
+    /// move a user between pages mid-pagination: the reader keeps requesting
+    /// the same version until it chooses to advance.
+    pub fn leaderboard_snapshot(category: &str, version: i64, limit: i64, offset: i64) -> String {
+        format!("leaderboard:{}:v{}:{}:{}", category, version, limit, offset)
+    }
+
     pub fn player_stats(user_id: &Uuid) -> String {
         format!("player_stats:{}", user_id)
     }
@@ -509,5 +609,34 @@ mod tests {
     fn player_tag_is_stable_for_a_user() {
         let user = uuid::Uuid::new_v4();
         assert_eq!(keys::player_tag(&user), keys::player_tag(&user));
+    }
+
+    #[test]
+    fn leaderboard_snapshot_pages_are_versioned_and_distinct() {
+        let v1_page_one = keys::leaderboard_snapshot("fifa", 1, 50, 0);
+        let v1_page_two = keys::leaderboard_snapshot("fifa", 1, 50, 50);
+        let v2_page_one = keys::leaderboard_snapshot("fifa", 2, 50, 0);
+
+        assert_ne!(v1_page_one, v1_page_two, "pages cache separately");
+        assert_ne!(v1_page_one, v2_page_one, "versions cache separately");
+        // Both versions still fall under the same tag so a board-wide
+        // invalidation drops every snapshot at once.
+        assert_eq!(keys::leaderboard_tag("fifa"), "leaderboard:fifa");
+    }
+
+    #[test]
+    fn deletion_ack_failure_is_counted() {
+        let metrics = CacheMetrics::default();
+        assert_eq!(metrics.snapshot().deletion_ack_failures, 0);
+        metrics.record_deletion_ack_failure();
+        assert_eq!(metrics.snapshot().deletion_ack_failures, 1);
+    }
+
+    #[test]
+    fn snapshot_staleness_is_counted() {
+        let metrics = CacheMetrics::default();
+        metrics.record_snapshot_stale();
+        metrics.record_snapshot_stale();
+        assert_eq!(metrics.snapshot().snapshot_stale_served, 2);
     }
 }

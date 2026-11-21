@@ -55,6 +55,9 @@ model User {
   organizedTournaments     Tournament[]
   leaderboardEntries       LeaderboardEntry[]
   apiKeys                  ApiKey[]
+  experimentAssignments    ExperimentAssignment[]
+  experimentExposures      ExperimentExposure[]
+  privacyDeletionJobs      PrivacyDeletionJob[]
 
   @@index([deletedAt])
   @@index([provider])
@@ -631,6 +634,7 @@ model Leaderboard {
   deletedAt   DateTime?
 
   entries     LeaderboardEntry[]
+  snapshots   LeaderboardSnapshot[]
 
   @@index([type])
   @@index([gameModeId])
