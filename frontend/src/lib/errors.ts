@@ -111,6 +111,146 @@ export class ApiError extends ArenaXError {
   }
 }
 
+// ─── Contract error mapping ───────────────────────────────────────────────────
+
+/**
+ * How a client should react to a given contract error.
+ * - `retry`: safe to retry automatically (transient / duplicate delivery).
+ * - `manual`: requires an operator or user action before retrying.
+ * - `fatal`: do not retry; surface to the user and escalate.
+ */
+export type ContractRecoveryClass = "retry" | "manual" | "fatal";
+
+export interface ContractErrorMapping {
+  /** Stable machine-readable code (never changes once published). */
+  code: string;
+  /** Safe, user-readable message. Never contains signing material. */
+  message: string;
+  /** Documented retry / manual-recovery classification. */
+  recovery: ContractRecoveryClass;
+  /** Whether the client should invalidate cached server state. */
+  invalidateCache: boolean;
+}
+
+/** Code used for any error not present in the published mapping table. */
+export const UNKNOWN_CONTRACT_ERROR_CODE = "CONTRACT_ERROR_UNKNOWN";
+
+/**
+ * Canonical mapping of every public contract error to a stable code, a safe
+ * message and a documented recovery classification. Keep this table in sync
+ * with the Soroban contract error enum and the backend adapter.
+ */
+export const CONTRACT_ERROR_MAP: Readonly<Record<string, ContractErrorMapping>> = Object.freeze({
+  // Authorization / identity
+  UNAUTHORIZED: {
+    code: "CONTRACT_UNAUTHORIZED",
+    message: "You are not authorized to perform this action.",
+    recovery: "manual",
+    invalidateCache: true,
+  },
+  FORBIDDEN: {
+    code: "CONTRACT_FORBIDDEN",
+    message: "Your role does not allow this action.",
+    recovery: "manual",
+    invalidateCache: true,
+  },
+  // Finality / transaction lifecycle
+  TX_ALREADY_FINALIZED: {
+    code: "CONTRACT_TX_ALREADY_FINALIZED",
+    message: "This transaction has already been finalized and cannot be changed.",
+    recovery: "fatal",
+    invalidateCache: true,
+  },
+  TX_NOT_FINALIZED: {
+    code: "CONTRACT_TX_NOT_FINALIZED",
+    message: "This transaction is not finalized yet. Please try again shortly.",
+    recovery: "retry",
+    invalidateCache: false,
+  },
+  DUPLICATE_DELIVERY: {
+    code: "CONTRACT_DUPLICATE_DELIVERY",
+    message: "This request was already processed. No further action is needed.",
+    recovery: "fatal",
+    invalidateCache: true,
+  },
+  // Validation
+  INVALID_AMOUNT: {
+    code: "CONTRACT_INVALID_AMOUNT",
+    message: "The amount provided is invalid.",
+    recovery: "manual",
+    invalidateCache: false,
+  },
+  INSUFFICIENT_BALANCE: {
+    code: "CONTRACT_INSUFFICIENT_BALANCE",
+    message: "Insufficient balance to complete this transaction.",
+    recovery: "manual",
+    invalidateCache: true,
+  },
+  // Transient
+  NETWORK_UNAVAILABLE: {
+    code: "CONTRACT_NETWORK_UNAVAILABLE",
+    message: "The network is temporarily unavailable. Please retry.",
+    recovery: "retry",
+    invalidateCache: false,
+  },
+  TIMEOUT: {
+    code: "CONTRACT_TIMEOUT",
+    message: "The request timed out. Please retry.",
+    recovery: "retry",
+    invalidateCache: false,
+  },
+});
+
+const UNKNOWN_CONTRACT_ERROR_MAPPING: ContractErrorMapping = Object.freeze({
+  code: UNKNOWN_CONTRACT_ERROR_CODE,
+  message: "An unexpected error occurred. Please contact support with the reference ID.",
+  recovery: "manual",
+  invalidateCache: false,
+});
+
+/**
+ * Maps a raw contract error code to its safe, user-readable mapping.
+ * Unknown codes remain distinguishable via `UNKNOWN_CONTRACT_ERROR_CODE`.
+ */
+export function mapContractError(rawCode: string | undefined | null): ContractErrorMapping {
+  if (!rawCode) return UNKNOWN_CONTRACT_ERROR_MAPPING;
+  return CONTRACT_ERROR_MAP[rawCode] ?? UNKNOWN_CONTRACT_ERROR_MAPPING;
+}
+
+/** Returns true when the raw code is not part of the published mapping table. */
+export function isUnknownContractError(rawCode: string | undefined | null): boolean {
+  return !rawCode || !(rawCode in CONTRACT_ERROR_MAP);
+}
+
+/**
+ * Builds a log-safe payload for a contract error. Includes transaction context
+ * but never signing material (signatures, secret keys, XDR envelopes).
+ */
+export function buildContractErrorLogContext(
+  rawCode: string | undefined | null,
+  context: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const mapping = mapContractError(rawCode);
+  const safeContext: Record<string, unknown> = {};
+  const REDACTED_KEYS = ["signature", "signedXdr", "secretKey", "privateKey", "seed", "signer"];
+
+  for (const [key, value] of Object.entries(context)) {
+    if (REDACTED_KEYS.some((k) => key.toLowerCase().includes(k.toLowerCase()))) {
+      safeContext[key] = "[REDACTED]";
+    } else {
+      safeContext[key] = value;
+    }
+  }
+
+  return {
+    rawCode: rawCode ?? null,
+    code: mapping.code,
+    recovery: mapping.recovery,
+    unknown: isUnknownContractError(rawCode),
+    context: safeContext,
+  };
+}
+
 // ─── Recovery strategies ──────────────────────────────────────────────────────
 
 /**
@@ -201,6 +341,20 @@ export function determineErrorSeverity(error: Error): ErrorSeverity {
 export function isRetryableError(error: Error): boolean {
   const category = determineErrorCategory(error);
   return getRecoveryStrategy(category) !== null;
+}
+
+/**
+ * Whether an error should invalidate cached server state (e.g. after an
+ * authorization change or a finality conflict).
+ */
+export function shouldInvalidateCache(error: Error): boolean {
+  if (error instanceof ApiError) {
+    if (error.statusCode === 401 || error.statusCode === 403) return true;
+    const rawCode = error.metadata?.contractCode;
+    if (typeof rawCode === "string") return mapContractError(rawCode).invalidateCache;
+  }
+  if (error instanceof AuthenticationError) return true;
+  return false;
 }
 
 export function generateErrorId(): string {

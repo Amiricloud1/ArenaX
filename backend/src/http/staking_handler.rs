@@ -1,6 +1,7 @@
 use crate::{
     api_error::ApiError,
     auth::middleware::ClaimsExt,
+    contract_error::{classify_contract_error, ContractErrorClass, ContractErrorResponse},
     middleware::security::validate_positive_amount,
     service::staking_service::{ClaimRewardsRequest, StakeForRewardsRequest, StakingService},
 };
@@ -25,6 +26,36 @@ pub struct ClaimBody {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Map a raw Soroban/staking contract error into the canonical, user-readable
+/// contract error response.  Unknown errors stay distinguishable (stable
+/// `UNKNOWN_CONTRACT_ERROR` code) and are logged with transaction context only
+/// — never signing material.
+fn map_contract_error(raw: &str, tx_context: &str) -> (ContractErrorResponse, ContractErrorClass) {
+    let class = classify_contract_error(raw);
+    if matches!(class, ContractErrorClass::Unknown) {
+        log::warn!(
+            target: "staking.contract_error",
+            "unmapped contract error: raw={:?} tx_context={}",
+            raw,
+            tx_context,
+        );
+    }
+    (ContractErrorResponse::from_class(class), class)
+}
+
+/// Convert a mapped contract error into an `ApiError`, preserving the stable
+/// code and recovery classification in the response body.
+fn contract_error_to_api_error(
+    raw: &str,
+    tx_context: &str,
+) -> ApiError {
+    let (resp, class) = map_contract_error(raw, tx_context);
+    ApiError::ContractError {
+        status: class.http_status(),
+        body: resp,
+    }
+}
 
 /// Extract the authenticated user's UUID from the JWT claims inserted by
 /// `AuthMiddleware`.  Returns `401 Unauthorized` if the middleware was not
@@ -92,7 +123,13 @@ pub async fn stake_for_rewards(
             stellar_address: body.stellar_address.clone(),
             amount: body.amount,
         })
-        .await?;
+        .await
+        .map_err(|e| match e {
+            ApiError::ContractFailure { raw, tx_context } => {
+                contract_error_to_api_error(&raw, &tx_context)
+            }
+            other => other,
+        })?;
 
     Ok(HttpResponse::Ok().json(resp))
 }
@@ -117,7 +154,13 @@ pub async fn claim_rewards(
             },
             0,
         )
-        .await?;
+        .await
+        .map_err(|e| match e {
+            ApiError::ContractFailure { raw, tx_context } => {
+                contract_error_to_api_error(&raw, &tx_context)
+            }
+            other => other,
+        })?;
 
     Ok(HttpResponse::Ok().json(resp))
 }
@@ -141,7 +184,14 @@ pub async fn unstake(
     }
 
     let svc = StakingService::new(db.get_ref().clone());
-    svc.record_unstake(authenticated_user).await?;
+    svc.record_unstake(authenticated_user)
+        .await
+        .map_err(|e| match e {
+            ApiError::ContractFailure { raw, tx_context } => {
+                contract_error_to_api_error(&raw, &tx_context)
+            }
+            other => other,
+        })?;
     Ok(HttpResponse::NoContent().finish())
 }
 
@@ -247,5 +297,57 @@ mod tests {
         let resp = test::call_service(&app, req).await;
         // attacker_id != owner_id → 403 Forbidden.
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ── Contract error mapping tests ────────────────────────────────────────
+
+    #[test]
+    fn test_retryable_contract_error_maps_to_stable_code() {
+        let (resp, class) = map_contract_error("tx_bad_seq", "tx=abc123");
+        assert_eq!(class, ContractErrorClass::Retryable);
+        assert_eq!(resp.code, "CONTRACT_RETRYABLE");
+        assert!(resp.retryable);
+        assert!(!resp.manual_recovery);
+    }
+
+    #[test]
+    fn test_failure_contract_error_maps_to_stable_code() {
+        let (resp, class) = map_contract_error("insufficient_balance", "tx=def456");
+        assert_eq!(class, ContractErrorClass::Failure);
+        assert_eq!(resp.code, "CONTRACT_FAILURE");
+        assert!(!resp.retryable);
+        assert!(!resp.manual_recovery);
+    }
+
+    #[test]
+    fn test_duplicate_delivery_contract_error_maps_to_stable_code() {
+        let (resp, class) = map_contract_error("duplicate_delivery", "tx=ghi789");
+        assert_eq!(class, ContractErrorClass::Duplicate);
+        assert_eq!(resp.code, "CONTRACT_DUPLICATE");
+        assert!(!resp.retryable);
+        assert!(resp.manual_recovery);
+    }
+
+    #[test]
+    fn test_unknown_contract_error_is_distinguishable() {
+        let (resp, class) = map_contract_error("some_future_error_xyz", "tx=jkl012");
+        assert_eq!(class, ContractErrorClass::Unknown);
+        assert_eq!(resp.code, "UNKNOWN_CONTRACT_ERROR");
+        // Unknown errors must not be silently retried.
+        assert!(!resp.retryable);
+        assert!(resp.manual_recovery);
+    }
+
+    #[test]
+    fn test_contract_error_to_api_error_preserves_classification() {
+        let err = contract_error_to_api_error("tx_bad_seq", "tx=abc123");
+        match err {
+            ApiError::ContractError { status, body } => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(body.code, "CONTRACT_RETRYABLE");
+                assert!(body.retryable);
+            }
+            other => panic!("expected ContractError, got {:?}", other),
+        }
     }
 }

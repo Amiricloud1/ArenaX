@@ -159,6 +159,51 @@ Admin users have `"roles": ["admin", "user"]`.
 | 401 `Session expired or invalid` | Session was revoked server-side |
 | 403 `Token has been revoked` | Token was explicitly blacklisted |
 
+## Return Destinations Through Authentication
+
+When a signed-out user opens a deep link (for example a tournament or match invitation), the client may send them through login, registration, or an OAuth callback. The intended destination is carried in a `returnTo` parameter and restored **once** after authentication succeeds.
+
+### Allowed destinations
+
+`returnTo` must resolve to a **local, approved path** on the same origin. The client validates it before storing and again before redirecting:
+
+- **Local paths only:** the value must start with a single `/` (e.g. `/tournaments/abc123`). Absolute URLs (`https://evil.example`), protocol-relative URLs (`//evil.example`), and backslash variants (`/\evil.example`) are rejected.
+- **Approved prefixes:** only known app routes are accepted (`/tournaments/...`, `/matches/...`, `/wallet`, `/disputes/...`, `/notifications`, `/settings`). Anything else falls back to the default post-login destination (e.g. `/dashboard`).
+- **Locale prefixes:** a leading locale segment (`/en/...`, `/fr/...`) is preserved and validated against the same approved prefixes, so `/en/tournaments/abc123` is accepted while `/en//evil.example` is not.
+- **Encoded input:** the value is percent-decoded exactly once before validation. Double-encoded payloads (`%2F%2Fevil.example`) that decode to a non-local path are rejected.
+
+### Query parameters
+
+Only **validated, non-secret** query parameters are preserved:
+
+- An allowlist of parameters is kept (e.g. `invite`, `ref`, `tab`). Unknown parameters are dropped.
+- Secret or sensitive parameters (`token`, `access_token`, `refresh_token`, `password`, `code`, `secret`, `key`, `session`) are always stripped, even if they appear in the allowlist.
+- Parameter values are length-bounded and re-encoded on redirect so they cannot break out of the query string.
+
+### Loop avoidance
+
+- The destination is restored **once**: after a successful login/registration/OAuth callback, the stored `returnTo` is consumed and cleared so a refresh or back-navigation does not replay it.
+- If the target resource is **private or unavailable** (403/404, expired invitation, revoked access), the client does **not** bounce back to login. It shows the appropriate error state (e.g. "Invitation expired" or "You don't have access") on the destination route instead of redirecting again.
+- Unauthenticated users hitting a protected route are sent to login with `returnTo`; authenticated users hitting the same route are never redirected to login, preventing redirect loops.
+
+### OAuth callbacks
+
+The OAuth callback (`/auth/callback`) validates `returnTo` with the same rules before redirecting. The `state` parameter is used only for CSRF protection and is never treated as a return destination. If `returnTo` is missing or invalid, the callback redirects to the default post-login destination.
+
+### Example
+
+```
+GET /login?returnTo=%2Fen%2Ftournaments%2Fabc123%3Finvite%3Dxyz%26token%3Dsecret
+```
+
+After successful login the client redirects to:
+
+```
+/en/tournaments/abc123?invite=xyz
+```
+
+The `token` parameter is stripped and the locale prefix is preserved.
+
 ## Security Best Practices
 
 - Store tokens in memory (not `localStorage`) in browser clients.
@@ -166,3 +211,4 @@ Admin users have `"roles": ["admin", "user"]`.
 - Always use HTTPS — tokens are bearer credentials.
 - Rotate refresh tokens on every use (already enforced server-side).
 - Call `/auth/revoke-sessions` if you suspect token compromise.
+- Never trust a `returnTo` value from the URL without validating it against the local-path and allowlist rules above.

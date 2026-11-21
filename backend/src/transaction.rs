@@ -1,4 +1,5 @@
 use crate::api_error::ApiError;
+use crate::contract_errors::{classify_contract_error, ContractErrorClass, ContractErrorCode};
 use sqlx::{postgres::PgPool, Postgres, Transaction};
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -61,13 +62,15 @@ where
                 return Ok(result);
             }
             Err(e) => {
-                let err_str = e.to_string();
-                let is_serialization = err_str.contains("40001") || err_str.contains("serialization failure");
-                // Check if this is a serialization error that can be retried
-                if is_serialization && attempt < config.max_retries {
+                let classification = classify_transaction_error(&e);
+                // Only serialization failures are safe to retry automatically.
+                if classification.class == ContractErrorClass::Retryable
+                    && attempt < config.max_retries
+                {
                     warn!(
                         attempt = attempt + 1,
                         max_retries = config.max_retries,
+                        error_code = classification.code.as_str(),
                         error = %e,
                         "Transaction failed due to serialization error, retrying..."
                     );
@@ -82,6 +85,17 @@ where
                     continue;
                 } else {
                     // Non-retryable error or max retries exceeded
+                    if classification.class == ContractErrorClass::Unknown {
+                        // Log unknown errors with transaction context only; never
+                        // include signing material or raw secrets.
+                        warn!(
+                            attempt = attempt + 1,
+                            max_retries = config.max_retries,
+                            error_code = classification.code.as_str(),
+                            error = %e,
+                            "Transaction failed with an unclassified error"
+                        );
+                    }
                     let _ = tx.rollback().await;
                     return Err(e);
                 }
@@ -95,6 +109,32 @@ where
             "Transaction failed after max retries",
         )))
     }))
+}
+
+/// Classification of a transaction error using the canonical contract error catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransactionErrorClassification {
+    pub code: ContractErrorCode,
+    pub class: ContractErrorClass,
+}
+
+/// Classify a transaction error into a stable code and retry/manual-recovery class.
+///
+/// Serialization failures map to the retryable catalog entry; anything that is
+/// not recognized remains distinguishable as `ContractErrorCode::Unknown`.
+pub fn classify_transaction_error<E: std::fmt::Display>(error: &E) -> TransactionErrorClassification {
+    let err_str = error.to_string();
+    let is_serialization =
+        err_str.contains("40001") || err_str.contains("serialization failure");
+
+    let code = if is_serialization {
+        ContractErrorCode::SerializationFailure
+    } else {
+        ContractErrorCode::Unknown
+    };
+
+    let class = classify_contract_error(code);
+    TransactionErrorClassification { code, class }
 }
 
 /// Begin a transaction with specified isolation level (raw sqlx error)
@@ -186,5 +226,25 @@ mod tests {
         assert_eq!(IsolationLevel::ReadCommitted.as_str(), "READ COMMITTED");
         assert_eq!(IsolationLevel::RepeatableRead.as_str(), "REPEATABLE READ");
         assert_eq!(IsolationLevel::Serializable.as_str(), "SERIALIZABLE");
+    }
+
+    #[test]
+    fn test_serialization_error_is_retryable() {
+        let classification = classify_transaction_error(&"error 40001: serialization failure");
+        assert_eq!(classification.code, ContractErrorCode::SerializationFailure);
+        assert_eq!(classification.class, ContractErrorClass::Retryable);
+    }
+
+    #[test]
+    fn test_unknown_error_is_distinguishable() {
+        let classification = classify_transaction_error(&"connection reset by peer");
+        assert_eq!(classification.code, ContractErrorCode::Unknown);
+        assert_eq!(classification.class, ContractErrorClass::Unknown);
+    }
+
+    #[test]
+    fn test_non_retryable_failure_classification() {
+        let classification = classify_transaction_error(&"permission denied for table payments");
+        assert_ne!(classification.class, ContractErrorClass::Retryable);
     }
 }
