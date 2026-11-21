@@ -9,3 +9,17 @@ providers:
     updateIntervalSeconds: 30
     options:
       path: /etc/grafana/dashboards
+
+  # Analytics dashboards are provisioned from the governed metric catalog.
+  # Every panel must reference a catalogued metric ID (see
+  # docs/analytics/metric-catalog.md) so CI can catch duplicate names and
+  # unreviewed definition changes. Panels include ingestion accepted/rejected
+  # counts, identity-link consent state, and query budget exceeded/stale alerts.
+  - name: arenax-analytics
+    orgId: 1
+    folder: ArenaX Analytics
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards/analytics

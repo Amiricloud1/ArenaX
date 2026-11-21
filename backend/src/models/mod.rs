@@ -1,5 +1,6 @@
 // Core models
 pub mod achievement;
+pub mod analytics;
 pub mod api_key;
 pub mod batch;
 pub mod dispute;
@@ -20,6 +21,9 @@ pub mod wallet;
 
 // Re-export commonly used types - explicit to avoid ambiguity
 pub use achievement::*;
+pub use analytics::{
+    AnalyticsEvent, AnalyticsEventRejection, IdentityLink, MetricCatalogEntry, QueryBudget,
+};
 // Explicit list (not `dispute::*`): `TicketStatus`/`CreateTicketRequest` are
 // deliberately distinct names from match_models' `DisputeStatus`/
 // `CreateDisputeRequest` to avoid a glob-export collision between the two

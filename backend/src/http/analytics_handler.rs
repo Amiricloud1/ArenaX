@@ -3,8 +3,8 @@ use crate::{
     middleware::security::validate_uuid,
     service::analytics_service::{AnalyticsService, RecordMatchRequest},
 };
-use actix_web::{web, HttpResponse};
-use serde::Deserialize;
+use actix_web::{web, HttpRequest, HttpResponse};
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -82,6 +82,8 @@ pub struct AggregationQuery {
     pub period_start: Option<i64>,
     pub period_end: Option<i64>,
     pub game_id: Option<i32>,
+    pub freshness_budget_secs: Option<i64>,
+    pub latency_budget_ms: Option<i64>,
 }
 
 pub async fn record_match(
@@ -129,6 +131,206 @@ pub async fn record_player_behaviour(
     Ok(HttpResponse::NoContent().finish())
 }
 
+/// Validate a single event, returning a rejection reason when invalid.
+fn validate_event(ev: &AnalyticsEvent) -> Result<(), String> {
+    if validate_uuid(&ev.event_id).is_err() {
+        return Err("invalid_event_id".to_string());
+    }
+    if !SUPPORTED_SCHEMA_VERSIONS.contains(&ev.schema_version) {
+        return Err(format!("unsupported_schema_version:{}", ev.schema_version));
+    }
+    if ev.name.trim().is_empty() || ev.name.len() > 128 {
+        return Err("invalid_event_name".to_string());
+    }
+    if let Some(payload) = &ev.payload {
+        let size = serde_json::to_vec(payload).map(|v| v.len()).unwrap_or(usize::MAX);
+        if size > MAX_EVENT_PAYLOAD_BYTES {
+            return Err("payload_too_large".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Ingest a batch of analytics events with durable deduplication.
+///
+/// Deduplication is keyed on `(producer_id, event_id)`: a retried event that was
+/// already accepted converges to a single accepted record, while malformed or
+/// schema-invalid events are routed to a diagnosable rejection path.
+pub async fn ingest_events(
+    db: web::Data<PgPool>,
+    body: web::Json<IngestEventsBody>,
+) -> Result<HttpResponse, ApiError> {
+    if body.producer_id.trim().is_empty() || body.producer_id.len() > 128 {
+        return Err(ApiError::BadRequest("invalid producer_id".to_string()));
+    }
+    if body.events.len() > MAX_EVENT_BATCH {
+        return Err(ApiError::BadRequest(format!(
+            "batch exceeds maximum of {} events",
+            MAX_EVENT_BATCH
+        )));
+    }
+
+    let svc = AnalyticsService::new(db.get_ref().clone());
+    let mut outcomes = Vec::with_capacity(body.events.len());
+    let mut accepted = 0usize;
+    let mut rejected = 0usize;
+
+    for ev in &body.events {
+        match validate_event(ev) {
+            Ok(()) => match svc
+                .ingest_event(&body.producer_id, ev.event_id, ev.schema_version, &ev.name, ev.occurred_at, ev.payload.clone())
+                .await
+            {
+                Ok(()) => {
+                    accepted += 1;
+                    outcomes.push(EventOutcome {
+                        event_id: ev.event_id.clone(),
+                        status: "accepted",
+                        reason: None,
+                    });
+                }
+                Err(e) => {
+                    rejected += 1;
+                    outcomes.push(EventOutcome {
+                        event_id: ev.event_id.clone(),
+                        status: "rejected",
+                        reason: Some(format!("ingest_error:{}", e)),
+                    });
+                }
+            },
+            Err(reason) => {
+                rejected += 1;
+                // Record the rejection so operators can diagnose malformed events.
+                let _ = svc
+                    .record_rejected_event(&body.producer_id, &ev.event_id, &reason)
+                    .await;
+                outcomes.push(EventOutcome {
+                    event_id: ev.event_id.clone(),
+                    status: "rejected",
+                    reason: Some(reason),
+                });
+            }
+        }
+    }
+
+    Ok(HttpResponse::Ok().json(IngestEventsResponse {
+        accepted,
+        rejected,
+        outcomes,
+    }))
+}
+
+/// Link an anonymous subject to an authenticated account, gated on consent.
+///
+/// Only the owning pseudonymous subject may perform the link; raw authentication
+/// identifiers are never stored alongside event payloads.
+pub async fn link_identity(
+    req: HttpRequest,
+    db: web::Data<PgPool>,
+    body: web::Json<IdentityLinkBody>,
+) -> Result<HttpResponse, ApiError> {
+    let subject_id = validate_uuid(&body.subject_id)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    authorize_subject(&req, subject_id)?;
+
+    if !body.consent {
+        return Ok(HttpResponse::Forbidden().json(IdentityResponse {
+            status: "rejected",
+            reason: Some("consent_required".to_string()),
+        }));
+    }
+    if body.account_id.trim().is_empty() || body.account_id.len() > 128 {
+        return Err(ApiError::BadRequest("invalid account_id".to_string()));
+    }
+
+    let svc = AnalyticsService::new(db.get_ref().clone());
+    svc.link_identity(subject_id, &body.account_id).await?;
+    Ok(HttpResponse::Ok().json(IdentityResponse {
+        status: "linked",
+        reason: None,
+    }))
+}
+
+/// Unlink a subject from any account, making the identity link reversible.
+pub async fn unlink_identity(
+    req: HttpRequest,
+    db: web::Data<PgPool>,
+    body: web::Json<IdentityUnlinkBody>,
+) -> Result<HttpResponse, ApiError> {
+    let subject_id = validate_uuid(&body.subject_id)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    authorize_subject(&req, subject_id)?;
+
+    let svc = AnalyticsService::new(db.get_ref().clone());
+    svc.unlink_identity(subject_id).await?;
+    Ok(HttpResponse::Ok().json(IdentityResponse {
+        status: "unlinked",
+        reason: None,
+    }))
+}
+
+/// Ensure the caller owns the pseudonymous subject. In production this reads
+/// verified JWT claims; here we require a matching `x-subject-id` header.
+fn authorize_subject(req: &HttpRequest, subject_id: Uuid) -> Result<(), ApiError> {
+    let claimed = req
+        .headers()
+        .get("x-subject-id")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::Unauthorized("missing subject identity".to_string()))?;
+    let claimed = validate_uuid(claimed)
+        .map_err(|_| ApiError::Unauthorized("invalid subject identity".to_string()))?;
+    if claimed != subject_id {
+        return Err(ApiError::Forbidden(
+            "subject does not own this identity link".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Build budget metadata and stale/incomplete markers for a dashboard query.
+fn dashboard_budget(
+    period_start: Option<i64>,
+    period_end: Option<i64>,
+    freshness_budget_secs: Option<i64>,
+    latency_budget_ms: Option<i64>,
+) -> Result<(BudgetMetadata, bool, bool), ApiError> {
+    let freshness_budget_secs = freshness_budget_secs.unwrap_or(DEFAULT_FRESHNESS_BUDGET_SECS);
+    let latency_budget_ms = latency_budget_ms.unwrap_or(DEFAULT_LATENCY_BUDGET_MS);
+    if freshness_budget_secs <= 0 || latency_budget_ms <= 0 {
+        return Err(ApiError::BadRequest("budgets must be positive".to_string()));
+    }
+
+    let (range_secs, incomplete) = match (period_start, period_end) {
+        (Some(start), Some(end)) => {
+            if end < start {
+                return Err(ApiError::BadRequest("period_end before period_start".to_string()));
+            }
+            let range = end - start;
+            if range > MAX_QUERY_RANGE_SECS {
+                // Bound the range rather than silently returning partial data as current.
+                (MAX_QUERY_RANGE_SECS, true)
+            } else {
+                (range, false)
+            }
+        }
+        _ => (MAX_QUERY_RANGE_SECS, true),
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let stale = period_end.map(|end| now - end > freshness_budget_secs).unwrap_or(true);
+
+    Ok((
+        BudgetMetadata {
+            freshness_budget_secs,
+            latency_budget_ms,
+            max_range_secs: MAX_QUERY_RANGE_SECS,
+            range_secs,
+        },
+        stale,
+        incomplete,
+    ))
+}
+
 pub async fn get_game_metrics(
     db: web::Data<PgPool>,
     path: web::Path<i32>,
@@ -167,12 +369,23 @@ pub async fn get_aggregated_stats(
     query: web::Query<AggregationQuery>,
 ) -> Result<HttpResponse, ApiError> {
     let svc = AnalyticsService::new(db.get_ref().clone());
+    let (budget, stale, incomplete) = dashboard_budget(
+        query.period_start,
+        query.period_end,
+        query.freshness_budget_secs,
+        query.latency_budget_ms,
+    )?;
     let stats = svc.get_aggregated_stats(
         query.game_id,
         query.period_start,
         query.period_end,
     ).await?;
-    Ok(HttpResponse::Ok().json(stats))
+    Ok(HttpResponse::Ok().json(DashboardResponse {
+        data: stats,
+        stale,
+        incomplete,
+        budget,
+    }))
 }
 
 pub async fn get_revenue_metrics(
@@ -180,10 +393,21 @@ pub async fn get_revenue_metrics(
     query: web::Query<AggregationQuery>,
 ) -> Result<HttpResponse, ApiError> {
     let svc = AnalyticsService::new(db.get_ref().clone());
+    let (budget, stale, incomplete) = dashboard_budget(
+        query.period_start,
+        query.period_end,
+        query.freshness_budget_secs,
+        query.latency_budget_ms,
+    )?;
     let metrics = svc.get_revenue_metrics(
         query.game_id,
         query.period_start,
         query.period_end,
     ).await?;
-    Ok(HttpResponse::Ok().json(metrics))
+    Ok(HttpResponse::Ok().json(DashboardResponse {
+        data: metrics,
+        stale,
+        incomplete,
+        budget,
+    }))
 }

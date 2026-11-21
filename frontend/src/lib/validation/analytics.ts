@@ -13,6 +13,14 @@
 // ─── Event types ──────────────────────────────────────────────────────────────
 
 export interface ValidationAttemptEvent {
+  /** Stable, producer-assigned event ID (UUID v4). Used for durable deduplication. */
+  eventId: string;
+  /** Schema version of the event payload, e.g. "1". */
+  schemaVersion: string;
+  /** Stable identifier of the producer that emitted the event. */
+  producerId: string;
+  /** Pseudonymous analytics subject ID (never a raw auth identifier). */
+  subjectId: string;
   /** Schema name (from `defineSchema`). */
   schemaName: string;
   /** Whether validation passed. */

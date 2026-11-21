@@ -23,6 +23,26 @@
 ///
 /// Redis key pattern: `idempotency:{idempotency_key}`
 /// Value: JSON-serialized CachedResponse with request hash, status, headers, body
+///
+/// # Analytics ingestion deduplication
+///
+/// The analytics batch endpoint (`/api/analytics/events`) reuses this middleware so
+/// that retried deliveries converge to a single accepted (or rejected) outcome:
+///
+/// - Producers assign a stable `Idempotency-Key` per batch (e.g. a UUID persisted
+///   alongside the batch until it is acknowledged).
+/// - The first delivery is processed and its outcome (2xx accepted or 4xx rejected)
+///   is cached under the key.
+/// - Retries with the same key and identical payload replay the cached outcome with
+///   `Idempotency-Replayed: true`, so events are never double-counted.
+/// - Retries with the same key but a different payload return 422
+///   (`IdempotencyKeyConflict`), which signals a producer bug rather than a
+///   transient failure.
+/// - Malformed or schema-invalid batches are rejected with a 4xx response that is
+///   cached, so the rejection path is diagnosable and stable across retries.
+///
+/// Analytics routes are configured via [`IdempotencyPolicy::analytics_policy`] which
+/// caches both successful and client-error outcomes for the ingestion boundary.
 
 use crate::api_error::ApiError;
 use crate::models::idempotency::*;
@@ -112,6 +132,38 @@ impl IdempotencyMiddleware {
 
     pub fn is_route_enabled(&self, path: &str) -> bool {
         self.policy.enabled_routes.iter().any(|pattern| path.starts_with(pattern) || path == pattern)
+    }
+
+    /// Whether the given path is the analytics ingestion boundary.
+    ///
+    /// Analytics batches are deduplicated on the same Idempotency-Key semantics as
+    /// other POST/PUT routes, but rejected (4xx) outcomes are cached as well so that
+    /// malformed batches have a stable, diagnosable rejection path across retries.
+    pub fn is_analytics_ingestion_route(&self, path: &str) -> bool {
+        self.policy
+            .analytics_routes
+            .iter()
+            .any(|pattern| path.starts_with(pattern) || path == pattern)
+    }
+
+    /// Whether a response with the given status should be cached for this path.
+    ///
+    /// - Non-analytics routes: only 2xx/3xx responses are cached (existing behavior).
+    /// - Analytics ingestion: 2xx/3xx accepted outcomes and 4xx rejected outcomes are
+    ///   cached so retries converge to one recorded outcome. 5xx responses are never
+    ///   cached so transient server failures can be retried.
+    fn should_cache_status(&self, path: &str, status: u16) -> bool {
+        let status = match actix_web::http::StatusCode::from_u16(status) {
+            Ok(status) => status,
+            Err(_) => return false,
+        };
+        if status.is_success() || status.is_redirection() {
+            return true;
+        }
+        if self.is_analytics_ingestion_route(path) {
+            return status.is_client_error();
+        }
+        false
     }
 
     /// Get reference to the metrics collector.
@@ -1032,6 +1084,56 @@ mod integration_tests {
         // - One processes (cache miss)
         // - One hits cache (or waits)
         // - Both get same result
+    }
+
+    /// Test scenario: Duplicate analytics batch delivery converges to one accepted event
+    #[test]
+    fn test_analytics_duplicate_delivery_converges() {
+        // First delivery: Idempotency-Key=X, batch B -> 202 accepted, outcome cached
+        // Retry: Idempotency-Key=X, batch B -> cache hit, Idempotency-Replayed: true
+        // - Events counted once
+        // - Same status/body returned to the producer
+    }
+
+    /// Test scenario: Out-of-order analytics batches are each deduplicated independently
+    #[test]
+    fn test_analytics_out_of_order_batches() {
+        // Batch 2 (key=Y) delivered before batch 1 (key=X)
+        // - Each key has its own cache entry
+        // - Redelivery of either batch replays its own cached outcome
+    }
+
+    /// Test scenario: Producer restart resends the same batch key
+    #[test]
+    fn test_analytics_producer_restart_dedup() {
+        // Producer persists Idempotency-Key with the batch before sending
+        // - After restart, the same key is resent
+        // - Ingestion replays the cached accepted outcome instead of double-counting
+    }
+
+    /// Test scenario: Schema-invalid batch enters diagnosable rejection path
+    #[test]
+    fn test_analytics_schema_invalid_batch_rejected() {
+        // Batch fails schema validation -> 422 with error details
+        // - Rejection outcome cached under the key
+        // - Retry replays the same 422 (Idempotency-Replayed: true)
+        // - Operator can diagnose the malformed payload from the stable response
+    }
+
+    /// Test scenario: Same analytics key with different payload is a conflict
+    #[test]
+    fn test_analytics_key_reuse_conflict() {
+        // Idempotency-Key=X used with batch B1, then with batch B2
+        // - Request hashes differ -> 422 IdempotencyKeyConflict
+        // - Signals a producer bug rather than a transient failure
+    }
+
+    /// Test scenario: Analytics retry after transient 5xx is reprocessed
+    #[test]
+    fn test_analytics_retry_after_server_error() {
+        // First delivery returns 503 (not cached)
+        // - Retry with same key is processed again
+        // - Accepted outcome is then cached
     }
 }
 

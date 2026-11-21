@@ -23,6 +23,28 @@ import {
 } from "@/lib/analyticsSchema";
 
 const SESSION_KEY = "arenax:analytics:session";
+const SUBJECT_KEY = "arenax:analytics:subject";
+const OUTBOX_KEY = "arenax:analytics:outbox";
+const SCHEMA_VERSION = 1;
+const MAX_OUTBOX = 500;
+const BATCH_SIZE = 20;
+
+export interface QueuedEvent {
+  eventId: string;
+  schemaVersion: number;
+  event: AnalyticsEventName;
+  timestamp: number;
+  sessionId: string;
+  subjectId: string;
+  props: Record<string, unknown>;
+}
+
+interface IdentityLink {
+  subjectId: string;
+  accountRef: string;
+  purpose: "product-analytics";
+  consentAt: number;
+}
 
 /**
  * Resource families whose caches are scoped by identity/permissions.
@@ -232,6 +254,66 @@ function generateId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
+function generateUuid(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  // RFC4122 v4 fallback
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < 16; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function loadOrCreateSubjectId(): string {
+  if (typeof window === "undefined") return generateUuid();
+  try {
+    const existing = localStorage.getItem(SUBJECT_KEY);
+    if (existing) return existing;
+    const created = generateUuid();
+    localStorage.setItem(SUBJECT_KEY, created);
+    return created;
+  } catch {
+    return generateUuid();
+  }
+}
+
+function loadOutbox(): QueuedEvent[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = localStorage.getItem(OUTBOX_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as QueuedEvent[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveOutbox(events: QueuedEvent[]): void {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(OUTBOX_KEY, JSON.stringify(events.slice(-MAX_OUTBOX)));
+  } catch {
+    // ignore quota / privacy-mode failures
+  }
+}
+
+function clearOutbox(): void {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.removeItem(OUTBOX_KEY);
+  } catch {
+    // ignore
+  }
+}
+
 function loadConsent(): ConsentState {
   const record = loadConsentRecord();
   if (record) {
@@ -299,6 +381,8 @@ export class AnalyticsService {
   constructor() {
     this.consent = loadConsent();
     this.session = loadOrCreateSession();
+    this.subjectId = loadOrCreateSubjectId();
+    this.outbox = loadOutbox();
   }
 
   // ── Adapter management ────────────────────────────────────────────────────
@@ -408,6 +492,7 @@ export class AnalyticsService {
         // ignore
       }
     }
+    this.linkIdentity(userId);
     this.adapters.forEach((a) => a.identify?.(userId, traits));
   }
 
@@ -478,6 +563,7 @@ export class AnalyticsService {
   }
 
   reset(): void {
+    this.unlinkIdentity();
     this.scrubSession();
     this.adapters.forEach((a) => a.reset?.());
     // Logout: drop scope and clear all caches in this and other tabs.
@@ -485,6 +571,46 @@ export class AnalyticsService {
     this.scope = { accountId: null, workspaceId: null, permissions: [] };
     this.notifyInvalidation(families);
     this.invalidation?.publish(families);
+  }
+
+  // ── Identity stitching ────────────────────────────────────────────────────
+
+  getSubjectId(): string {
+    return this.subjectId;
+  }
+
+  private linkIdentity(accountRef: string): void {
+    if (this.consent.analytics !== "granted") return;
+    const link: IdentityLink = {
+      subjectId: this.subjectId,
+      accountRef,
+      purpose: "product-analytics",
+      consentAt: this.consent.updatedAt ?? Date.now(),
+    };
+    this.postIdentity("/api/analytics/identity/link", link);
+  }
+
+  private unlinkIdentity(): void {
+    this.postIdentity("/api/analytics/identity/unlink", {
+      subjectId: this.subjectId,
+      purpose: "product-analytics",
+    });
+  }
+
+  private postIdentity(path: string, body: Record<string, unknown>): void {
+    if (typeof fetch === "undefined") return;
+    try {
+      void fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        keepalive: true,
+      }).catch(() => {
+        // Identity links are best-effort; server reconciles on next flush.
+      });
+    } catch {
+      // ignore
+    }
   }
 
   // ── Tracking ──────────────────────────────────────────────────────────────
@@ -512,7 +638,9 @@ export class AnalyticsService {
       return;
     }
 
-    const payload: AnalyticsPayload = {
+    const queued: QueuedEvent = {
+      eventId: generateUuid(),
+      schemaVersion: SCHEMA_VERSION,
       event,
       timestamp: Date.now(),
       sessionId: this.session.sessionId,

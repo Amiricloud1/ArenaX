@@ -53,6 +53,119 @@ pub struct RecordMatchRequest {
     pub player_count: i32,
 }
 
+// ─── Ingestion DTOs (#251) ───────────────────────────────────────────────────
+
+/// A single analytics event as delivered by a producer.
+/// `event_id` is a stable, producer-assigned identifier; `producer_id`
+/// scopes it so two producers may reuse the same event_id safely.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AnalyticsEvent {
+    pub producer_id: String,
+    pub event_id: String,
+    pub schema_version: i32,
+    pub event_name: String,
+    pub occurred_at: chrono::DateTime<Utc>,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+/// Outcome of ingesting a single event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestionOutcome {
+    /// Event was newly accepted.
+    Accepted,
+    /// Event was already accepted (idempotent retry).
+    Duplicate,
+    /// Event failed validation and was recorded in the rejection path.
+    Rejected,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestionResult {
+    pub producer_id: String,
+    pub event_id: String,
+    pub outcome: IngestionOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
+}
+
+/// Supported schema versions for ingestion. Rollouts add versions here.
+pub const SUPPORTED_SCHEMA_VERSIONS: &[i32] = &[1];
+
+// ─── Identity stitching DTOs (#252) ──────────────────────────────────────────
+
+/// Purpose-limited identity link. Raw auth identifiers are never stored here;
+/// callers pass an already-pseudonymised subject id.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdentityLinkRequest {
+    pub anonymous_subject: String,
+    pub authenticated_subject: String,
+    pub purpose: String,
+    pub consent_granted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityLinkOutcome {
+    Linked,
+    AlreadyLinked,
+    ConsentMissing,
+    Collision,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IdentityLinkResult {
+    pub outcome: IdentityLinkOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_subject: Option<String>,
+}
+
+// ─── Metric catalog DTOs (#253) ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricCatalogEntry {
+    pub name: String,
+    pub owner: String,
+    pub query_definition: String,
+    pub source_events: Vec<String>,
+    pub freshness_secs: i64,
+    pub privacy_class: String,
+    pub deprecated: bool,
+}
+
+// ─── Budget DTOs (#254) ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+pub struct QueryBudget {
+    pub max_latency_ms: u64,
+    pub max_freshness_secs: i64,
+    pub max_range_secs: i64,
+    pub max_rows: i64,
+}
+
+impl Default for QueryBudget {
+    fn default() -> Self {
+        Self {
+            max_latency_ms: 2_000,
+            max_freshness_secs: 3_600,
+            max_range_secs: 90 * 24 * 3_600,
+            max_rows: 1_000,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct BudgetedResult<T> {
+    pub data: T,
+    /// True when the underlying data is older than the freshness budget.
+    pub stale: bool,
+    /// True when the result was truncated or could not be fully computed.
+    pub incomplete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+}
+
 // ─── DB rows ──────────────────────────────────────────────────────────────────
 
 #[derive(sqlx::FromRow)]
@@ -424,4 +537,25 @@ impl AnalyticsService {
             "total_users": total_users,
         }))
     }
+}
+
+/// Validate an event against the supported schema. Returns a rejection reason
+/// when invalid, or `None` when the event may be accepted.
+fn validate_event(event: &AnalyticsEvent) -> Option<String> {
+    if event.producer_id.trim().is_empty() {
+        return Some("missing producer_id".to_string());
+    }
+    if event.event_id.trim().is_empty() {
+        return Some("missing event_id".to_string());
+    }
+    if event.event_name.trim().is_empty() {
+        return Some("missing event_name".to_string());
+    }
+    if !SUPPORTED_SCHEMA_VERSIONS.contains(&event.schema_version) {
+        return Some(format!(
+            "unsupported schema_version {}",
+            event.schema_version
+        ));
+    }
+    None
 }
