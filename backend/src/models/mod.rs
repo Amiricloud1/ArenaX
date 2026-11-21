@@ -31,9 +31,10 @@ pub use analytics::{
 // `CreateDisputeRequest` to avoid a glob-export collision between the two
 // unrelated dispute systems (see dispute.rs's module doc comment).
 pub use dispute::{
-    AddEvidenceRequest, AssignDisputeRequest, CreateTicketRequest, Dispute, DisputeDetail,
-    DisputeEvidence, DisputeHistoryEntry, EscalateDisputeRequest, EscalationLevel,
-    ListDisputesQuery, RejectDisputeRequest, ResolveDisputeRequest, TicketStatus,
+    AddEvidenceRequest, AssignDisputeRequest, CreateTicketRequest, Dispute, DisputeAppeal,
+    DisputeDetail, DisputeEvidence, DisputeHistoryEntry, EscalateDisputeRequest,
+    EscalationLevel, ListDisputesQuery, RejectDisputeRequest, ResolveDisputeRequest,
+    ReviewDisputeAppealRequest, SubmitDisputeAppealRequest, TicketStatus,
 };
 pub use experiment::*;
 pub use idempotency::*;

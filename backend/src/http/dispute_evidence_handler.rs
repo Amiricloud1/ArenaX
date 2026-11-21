@@ -22,6 +22,7 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
+use chrono::{DateTime, Utc};
 
 #[derive(Debug, Serialize)]
 pub struct DisputeEvidenceResponse {
@@ -32,6 +33,19 @@ pub struct DisputeEvidenceResponse {
 #[derive(Debug, Deserialize)]
 pub struct EvidenceLegalHoldRequest {
     pub enabled: bool,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+pub struct EvidenceCustodyRecord {
+    pub id: Uuid,
+    pub dispute_id: Uuid,
+    pub version: i32,
+    pub sha256: String,
+    pub object_key: String,
+    pub uploaded_by: Uuid,
+    pub uploaded_at: DateTime<Utc>,
+    pub transformation_parent_id: Option<Uuid>,
+    pub retention_class: String,
 }
 
 /// POST /api/matches/{id}/dispute/evidence
@@ -62,33 +76,34 @@ pub async fn upload_dispute_evidence(
 
     let hash_hex = hash_evidence(&body);
     let s3_key = evidence_object_key(user_id, match_id, &content_type, &hash_hex);
-    store.put(&s3_key, &content_type, &body).await?;
+    if let Err(error) = store.put(&s3_key, &content_type, &body).await {
+        if let Err(cleanup_error) = store.delete(&s3_key).await {
+            tracing::error!(
+                object_key = %s3_key,
+                error = %cleanup_error,
+                "Could not clean up a potentially partial evidence upload"
+            );
+        }
+        return Err(error);
+    }
 
     let svc = MatchService::new(db.get_ref().clone());
     let dispute = match svc
-        .attach_dispute_evidence(match_id, user_id, &hash_hex, &s3_key)
+        .attach_dispute_evidence(match_id, user_id, &hash_hex, &s3_key, user_id)
         .await
     {
         Ok(dispute) => dispute,
         Err(error) => {
-            let _ = store.delete(&s3_key).await;
+            if let Err(cleanup_error) = store.delete(&s3_key).await {
+                tracing::error!(
+                    object_key = %s3_key,
+                    error = %cleanup_error,
+                    "Could not clean up evidence after its custody record failed"
+                );
+            }
             return Err(error);
         }
     };
-
-    sqlx::query!(
-        r#"
-        INSERT INTO audit_logs (action, resource_type, resource_id, details)
-        VALUES ($1, $2, $3, $4)
-        "#,
-        "DISPUTE_EVIDENCE_UPLOADED",
-        "match_dispute",
-        dispute.id,
-        serde_json::json!({ "sha256": hash_hex, "object_key": s3_key }) as _
-    )
-    .execute(db.get_ref())
-    .await
-    .map_err(ApiError::database_error)?;
 
     Ok(HttpResponse::Ok().json(DisputeEvidenceResponse { dispute }))
 }
@@ -112,6 +127,19 @@ pub async fn get_match_dispute(
         .find(|dispute| staff_access || dispute.disputing_player_id == user_id)
         .next()
         .ok_or_else(|| ApiError::not_found("No dispute found for this match"))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO audit_logs (user_id, action, resource_type, resource_id, details)
+        VALUES ($1, 'DISPUTE_EVIDENCE_METADATA_ACCESSED', 'match_dispute', $2, $3)
+        "#,
+    )
+    .bind(user_id)
+    .bind(latest.id)
+    .bind(serde_json::json!({ "match_id": match_id }).to_string())
+    .execute(db.get_ref())
+    .await
+    .map_err(ApiError::database_error)?;
 
     Ok(HttpResponse::Ok().json(DisputeEvidenceResponse { dispute: latest }))
 }
@@ -157,6 +185,21 @@ pub async fn get_dispute_evidence(
     }
     validate_evidence_size(bytes.len())?;
 
+    sqlx::query!(
+        r#"
+        INSERT INTO audit_logs (user_id, action, resource_type, resource_id, details)
+        VALUES ($1, $2, $3, $4, $5)
+        "#,
+        user_id,
+        "DISPUTE_EVIDENCE_ACCESSED",
+        "match_dispute",
+        dispute.id,
+        serde_json::json!({ "sha256": dispute.evidence_hash }) as _
+    )
+    .execute(db.get_ref())
+    .await
+    .map_err(ApiError::database_error)?;
+
     let content_type = if key.ends_with(".png") {
         "image/png"
     } else if key.ends_with(".jpg") {
@@ -173,6 +216,54 @@ pub async fn get_dispute_evidence(
         .insert_header(("Cache-Control", "private, no-store"))
         .content_type(content_type)
         .body(bytes))
+}
+
+/// GET /api/matches/{id}/dispute/evidence/custody
+pub async fn get_evidence_custody(
+    req: HttpRequest,
+    db: web::Data<DbPool>,
+    path: web::Path<Uuid>,
+) -> Result<HttpResponse, ApiError> {
+    let match_id = path.into_inner();
+    let user_id = req
+        .user_id()
+        .ok_or_else(|| ApiError::unauthorized("Authentication required"))?;
+    let staff_access = has_staff_access(&req);
+    authorize_evidence_access(db.get_ref(), match_id, user_id, staff_access).await?;
+
+    let records = sqlx::query_as::<_, EvidenceCustodyRecord>(
+        r#"
+        SELECT v.*
+        FROM match_dispute_evidence_versions v
+        JOIN match_disputes d ON d.id = v.dispute_id
+        WHERE d.match_id = $1 AND ($2 OR d.disputing_player_id = $3)
+        ORDER BY v.uploaded_at ASC, v.version ASC
+        "#,
+    )
+    .bind(match_id)
+    .bind(staff_access)
+    .bind(user_id)
+    .fetch_all(db.get_ref())
+    .await
+    .map_err(ApiError::database_error)?;
+
+    sqlx::query!(
+        r#"
+        INSERT INTO audit_logs (user_id, action, resource_type, details)
+        VALUES ($1, $2, $3, $4)
+        "#,
+        user_id,
+        "DISPUTE_EVIDENCE_CUSTODY_ACCESSED",
+        "match_dispute",
+        serde_json::json!({ "match_id": match_id, "version_count": records.len() }) as _
+    )
+    .execute(db.get_ref())
+    .await
+    .map_err(ApiError::database_error)?;
+
+    Ok(HttpResponse::Ok()
+        .insert_header(("Cache-Control", "private, no-store"))
+        .json(records))
 }
 
 /// PUT /api/matches/{id}/dispute/evidence/legal-hold
@@ -285,6 +376,7 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
                 .route("", web::get().to(get_match_dispute))
                 .route("/evidence", web::post().to(upload_dispute_evidence))
                 .route("/evidence", web::get().to(get_dispute_evidence))
+                .route("/evidence/custody", web::get().to(get_evidence_custody))
                 .route("/evidence/legal-hold", web::put().to(set_evidence_legal_hold)),
         ),
     );

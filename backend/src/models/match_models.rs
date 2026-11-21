@@ -73,7 +73,7 @@ pub struct MatchDispute {
     /// their local copy and confirm the stored file was never swapped.
     pub evidence_hash: Option<String>,
     /// S3 object key the evidence file was stored under, namespaced
-    /// `{user_id}/{match_id}/{hash}.{ext}`.
+    /// `{user_id}/{match_id}/{hash}/{upload_id}.{ext}`.
     pub evidence_s3_key: Option<String>,
     pub evidence_legal_hold: bool,
     pub evidence_retention_until: Option<DateTime<Utc>>,

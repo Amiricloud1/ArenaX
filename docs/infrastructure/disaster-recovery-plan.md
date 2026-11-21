@@ -49,6 +49,8 @@ instances) without triggering this plan.
    extended downtime.
 7. **Total logging/monitoring loss** — ELK or Prometheus stack down,
    reducing incident visibility (Tier 2, does not block Tier 0 recovery).
+8. **Payment/contract divergence** — provider callbacks, internal ledger
+   state, and Soroban finality disagree for a charge, refund, or payout.
 
 ## 4. Backup Strategy (RPO enforcement)
 
@@ -145,6 +147,18 @@ incident channel and declared a Sev1/Sev2 incident.
    `server/infra/monitoring` compose definitions.
 3. Backfill logs from local service log buffers where retained.
 
+### 5.8 Payment and contract divergence
+
+Use the staging-only [payment and contract divergence drill](integrity-payment-contract-incident-drill.md)
+to contain and reconcile provider, ledger, and Soroban state. In production,
+page the Payments and Contract on-call owners, pause only new affected
+risk-bearing operations, and preserve read-only investigation and emergency
+principal exits. Do not retry an uncertain charge or payout until the original
+provider event, ledger idempotency key, and contract finality have been
+reconciled. Keep every unresolved transaction assigned with evidence and an
+explicit next action; release the pause only after the recovery gates in the
+drill procedure are independently confirmed.
+
 ## 6. Quarterly DR Drills
 
 - A DR drill is run **once per quarter**, scheduled by the infrastructure
@@ -158,6 +172,9 @@ incident channel and declared a Sev1/Sev2 incident.
 - Drill scope includes: triggering the failure, following the runbook
   as written (not from memory), and recording every deviation from the
   documented steps.
+- At least once per year, and after material payment/contract settlement
+  changes, include the cross-system payment and contract divergence scenario
+  from §5.8.
 - Drill outcomes feed directly into the post-incident review process
   (§7) — a failed or over-time drill is treated exactly like a real
   incident for review purposes and the corresponding runbook must be

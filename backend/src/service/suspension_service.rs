@@ -21,6 +21,7 @@
 use crate::api_error::ApiError;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sqlx::PgPool;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -142,6 +143,10 @@ pub struct Suspension {
     pub appeal_status: AppealStatus,
     pub appeal_text: Option<String>,
     pub appeal_submitted_at: Option<DateTime<Utc>>,
+    pub appeal_deadline_at: DateTime<Utc>,
+    pub decision_version: i32,
+    pub appeal_decision_version: Option<i32>,
+    pub appeal_evidence_refs: Value,
     pub appeal_reviewed_at: Option<DateTime<Utc>>,
     pub appeal_reviewed_by: Option<Uuid>,
     pub appeal_response: Option<String>,
@@ -212,6 +217,10 @@ struct SuspensionRow {
     appeal_status: String,
     appeal_text: Option<String>,
     appeal_submitted_at: Option<DateTime<Utc>>,
+    appeal_deadline_at: DateTime<Utc>,
+    decision_version: i32,
+    appeal_decision_version: Option<i32>,
+    appeal_evidence_refs: Value,
     appeal_reviewed_at: Option<DateTime<Utc>>,
     appeal_reviewed_by: Option<Uuid>,
     appeal_response: Option<String>,
@@ -220,7 +229,9 @@ struct SuspensionRow {
 const SELECT_COLUMNS: &str = r#"
     id, user_id, kind, scope, reason, issued_by, issued_at, expires_at,
     lifted_at, lifted_by, lift_reason, appeal_status, appeal_text,
-    appeal_submitted_at, appeal_reviewed_at, appeal_reviewed_by, appeal_response
+    appeal_submitted_at, appeal_deadline_at, decision_version,
+    appeal_decision_version, appeal_evidence_refs, appeal_reviewed_at,
+    appeal_reviewed_by, appeal_response
 "#;
 
 fn row_to_suspension(row: SuspensionRow) -> Suspension {
@@ -239,6 +250,10 @@ fn row_to_suspension(row: SuspensionRow) -> Suspension {
         appeal_status: AppealStatus::from_str(&row.appeal_status),
         appeal_text: row.appeal_text,
         appeal_submitted_at: row.appeal_submitted_at,
+        appeal_deadline_at: row.appeal_deadline_at,
+        decision_version: row.decision_version,
+        appeal_decision_version: row.appeal_decision_version,
+        appeal_evidence_refs: row.appeal_evidence_refs,
         appeal_reviewed_at: row.appeal_reviewed_at,
         appeal_reviewed_by: row.appeal_reviewed_by,
         appeal_response: row.appeal_response,
@@ -462,34 +477,89 @@ impl SuspensionService {
         suspension_id: Uuid,
         user_id: Uuid,
         appeal_text: &str,
+        evidence_refs: &[String],
     ) -> Result<Suspension, ApiError> {
         let appeal_text = appeal_text.trim();
-        if appeal_text.is_empty() {
+        if appeal_text.is_empty() || appeal_text.len() > 2000 {
             return Err(ApiError::BadRequest(
-                "An appeal must say something".to_string(),
+                "An appeal must contain 1 to 2000 characters".to_string(),
+            ));
+        }
+        if evidence_refs.len() > 5
+            || evidence_refs
+                .iter()
+                .any(|reference| reference.trim().is_empty() || reference.len() > 500)
+        {
+            return Err(ApiError::BadRequest(
+                "An appeal may include at most five non-empty evidence references of 500 characters or fewer"
+                    .to_string(),
             ));
         }
 
-        // `user_id` is in the predicate rather than checked afterwards so one
-        // player cannot appeal another's suspension, and the appeal cannot be
-        // resubmitted while one is already pending or decided.
+        let mut tx = self.db_pool.begin().await.map_err(ApiError::DatabaseError)?;
+        sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(ApiError::DatabaseError)?
+            .ok_or(ApiError::NotFound)?;
+        let recent_appeals: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM player_suspensions
+            WHERE user_id = $1 AND appeal_submitted_at > NOW() - INTERVAL '30 days'
+            "#,
+        )
+        .bind(user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(ApiError::DatabaseError)?;
+        if recent_appeals >= 3 {
+            let reset_at: DateTime<Utc> = sqlx::query_scalar(
+                r#"
+                SELECT COALESCE(MIN(appeal_submitted_at) + INTERVAL '30 days', NOW())
+                FROM player_suspensions
+                WHERE user_id = $1 AND appeal_submitted_at > NOW() - INTERVAL '30 days'
+                "#,
+            )
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(ApiError::DatabaseError)?;
+            let retry_after = (reset_at - Utc::now()).num_seconds().max(1) as u64;
+            return Err(ApiError::TooManyRequests {
+                message: "At most three suspension appeals may be submitted in 30 days"
+                    .to_string(),
+                limit: 3,
+                remaining: 0,
+                reset: reset_at.timestamp() as u64,
+                retry_after,
+            });
+        }
+
+        // The atomic predicate pins the appeal to the current decision and
+        // enforces a single submission before the deadline.
         let row = sqlx::query_as::<_, SuspensionRow>(&format!(
             r#"
             UPDATE player_suspensions
             SET appeal_status = 'pending',
                 appeal_text = $3,
-                appeal_submitted_at = NOW()
+                appeal_submitted_at = NOW(),
+                appeal_decision_version = decision_version,
+                appeal_evidence_refs = $4
             WHERE id = $1
               AND user_id = $2
               AND appeal_status = 'none'
               AND lifted_at IS NULL
+              AND appeal_deadline_at > NOW()
+              AND (expires_at IS NULL OR expires_at > NOW())
             RETURNING {SELECT_COLUMNS}
             "#
         ))
         .bind(suspension_id)
         .bind(user_id)
         .bind(appeal_text)
-        .fetch_optional(&self.db_pool)
+        .bind(serde_json::json!(evidence_refs))
+        .fetch_optional(&mut *tx)
         .await
         .map_err(ApiError::DatabaseError)?;
 
@@ -499,6 +569,25 @@ impl SuspensionService {
                     .to_string(),
             )
         })?;
+        sqlx::query(
+            r#"
+            INSERT INTO audit_logs (user_id, action, resource_type, resource_id, details)
+            VALUES ($1, 'SUSPENSION_APPEAL_SUBMITTED', 'player_suspension', $2, $3)
+            "#,
+        )
+        .bind(user_id)
+        .bind(suspension_id)
+        .bind(
+            serde_json::json!({
+                "decision_version": row.appeal_decision_version,
+                "evidence_reference_count": evidence_refs.len()
+            })
+            .to_string(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::DatabaseError)?;
+        tx.commit().await.map_err(ApiError::DatabaseError)?;
 
         info!(suspension_id = %suspension_id, user_id = %user_id, "Appeal submitted");
         Ok(row_to_suspension(row))
@@ -516,12 +605,19 @@ impl SuspensionService {
         accept: bool,
         response: &str,
     ) -> Result<Suspension, ApiError> {
+        let response = response.trim();
+        if response.is_empty() || response.len() > 1000 {
+            return Err(ApiError::BadRequest(
+                "An appeal decision reason must contain 1 to 1000 characters".to_string(),
+            ));
+        }
         let status = if accept {
             AppealStatus::Accepted
         } else {
             AppealStatus::Rejected
         };
 
+        let mut tx = self.db_pool.begin().await.map_err(ApiError::DatabaseError)?;
         let row = sqlx::query_as::<_, SuspensionRow>(&format!(
             r#"
             UPDATE player_suspensions
@@ -532,7 +628,11 @@ impl SuspensionService {
                 lifted_at = CASE WHEN $2 = 'accepted' THEN NOW() ELSE lifted_at END,
                 lifted_by = CASE WHEN $2 = 'accepted' THEN $3 ELSE lifted_by END,
                 lift_reason = CASE WHEN $2 = 'accepted' THEN 'Appeal accepted' ELSE lift_reason END
-            WHERE id = $1 AND appeal_status = 'pending'
+            WHERE id = $1
+              AND appeal_status = 'pending'
+              AND issued_by IS DISTINCT FROM $3
+              AND user_id <> $3
+              AND appeal_decision_version = decision_version
             RETURNING {SELECT_COLUMNS}
             "#
         ))
@@ -540,11 +640,48 @@ impl SuspensionService {
         .bind(status.as_str())
         .bind(reviewer_id)
         .bind(response)
-        .fetch_optional(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(ApiError::DatabaseError)?;
 
         let row = row.ok_or(ApiError::NotFound)?;
+        sqlx::query(
+            r#"
+            INSERT INTO notifications (user_id, type, title, message, link)
+            VALUES ($1, 'suspension_appeal', $2, $3, $4)
+            "#,
+        )
+        .bind(row.user_id)
+        .bind(if accept {
+            "Your appeal was accepted"
+        } else {
+            "Your appeal was reviewed"
+        })
+        .bind(response)
+        .bind(format!("/suspensions/{}", row.id))
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::DatabaseError)?;
+        sqlx::query(
+            r#"
+            INSERT INTO audit_logs (user_id, action, resource_type, resource_id, details)
+            VALUES ($1, 'SUSPENSION_APPEAL_REVIEWED', 'player_suspension', $2, $3)
+            "#,
+        )
+        .bind(reviewer_id)
+        .bind(row.id)
+        .bind(
+            serde_json::json!({
+                "accepted": accept,
+                "decision_version": row.appeal_decision_version,
+                "response": response
+            })
+            .to_string(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::DatabaseError)?;
+        tx.commit().await.map_err(ApiError::DatabaseError)?;
 
         info!(
             suspension_id = %suspension_id,
@@ -637,6 +774,10 @@ mod tests {
             appeal_status: AppealStatus::None,
             appeal_text: None,
             appeal_submitted_at: None,
+            appeal_deadline_at: Utc::now() + Duration::days(30),
+            decision_version: 1,
+            appeal_decision_version: None,
+            appeal_evidence_refs: serde_json::json!([]),
             appeal_reviewed_at: None,
             appeal_reviewed_by: None,
             appeal_response: None,

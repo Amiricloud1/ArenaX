@@ -17,9 +17,11 @@
 
 use crate::api_error::ApiError;
 use crate::models::{
-    AddEvidenceRequest, CreateTicketRequest, Dispute, DisputeDetail, DisputeEvidence,
-    DisputeHistoryEntry, EscalationLevel, ListDisputesQuery, TicketStatus,
+    AddEvidenceRequest, CreateTicketRequest, Dispute, DisputeAppeal, DisputeDetail,
+    DisputeEvidence, DisputeHistoryEntry, EscalationLevel, ListDisputesQuery,
+    SubmitDisputeAppealRequest, TicketStatus,
 };
+use chrono::{Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -54,6 +56,41 @@ impl DisputeService {
             .begin()
             .await
             .map_err(ApiError::database_error)?;
+        let dedupe_key = format!(
+            "{}:{}:{}:{}",
+            opened_by,
+            request.match_id.map_or_else(|| "none".to_string(), |id| id.to_string()),
+            request.category.trim().to_lowercase(),
+            request.subject.trim().to_lowercase()
+        );
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(dedupe_key)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::database_error)?;
+        let duplicate_id: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM disputes
+            WHERE opened_by = $1
+              AND match_id IS NOT DISTINCT FROM $2
+              AND lower(trim(category)) = lower(trim($3))
+              AND lower(trim(subject)) = lower(trim($4))
+              AND status IN ('open', 'under_review', 'escalated')
+            LIMIT 1
+            "#,
+        )
+        .bind(opened_by)
+        .bind(request.match_id)
+        .bind(request.category.trim())
+        .bind(request.subject.trim())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+        if let Some(duplicate_id) = duplicate_id {
+            return Err(ApiError::conflict(format!(
+                "A matching active report already exists ({duplicate_id})"
+            )));
+        }
 
         let dispute = sqlx::query_as::<_, Dispute>(
             r#"
@@ -177,6 +214,241 @@ impl DisputeService {
         .map_err(ApiError::database_error)
     }
 
+    pub async fn submit_appeal(
+        &self,
+        dispute_id: Uuid,
+        appellant_id: Uuid,
+        request: SubmitDisputeAppealRequest,
+    ) -> Result<DisputeAppeal, ApiError> {
+        let appeal_text = request.appeal_text.trim();
+        if appeal_text.is_empty() || appeal_text.len() > 2000 {
+            return Err(ApiError::bad_request(
+                "appeal_text must contain 1 to 2000 characters",
+            ));
+        }
+        if request.evidence_refs.len() > 5
+            || request
+                .evidence_refs
+                .iter()
+                .any(|reference| reference.trim().is_empty() || reference.len() > 500)
+        {
+            return Err(ApiError::bad_request(
+                "an appeal may include at most five non-empty evidence references of 500 characters or fewer",
+            ));
+        }
+
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .map_err(ApiError::database_error)?;
+        let dispute = sqlx::query_as::<_, Dispute>(
+            "SELECT * FROM disputes WHERE id = $1 FOR UPDATE",
+        )
+        .bind(dispute_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?
+        .ok_or_else(|| ApiError::not_found("dispute not found"))?;
+
+        if dispute.opened_by != appellant_id {
+            return Err(ApiError::forbidden("You may only appeal your own dispute"));
+        }
+        if !matches!(
+            dispute.status(),
+            TicketStatus::Resolved | TicketStatus::Rejected
+        ) {
+            return Err(ApiError::conflict(
+                "only a resolved or rejected case may be appealed",
+            ));
+        }
+        if request.decision_version != dispute.decision_version {
+            return Err(ApiError::conflict(
+                "the appeal references a stale decision version",
+            ));
+        }
+        let deadline = dispute
+            .resolved_at
+            .ok_or_else(|| ApiError::conflict("the case has no finalized decision"))?
+            + Duration::days(30);
+        if deadline <= Utc::now() {
+            return Err(ApiError::conflict("the appeal deadline has passed"));
+        }
+        let already_appealed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM dispute_appeals WHERE dispute_id = $1)",
+        )
+        .bind(dispute_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+        if already_appealed {
+            return Err(ApiError::conflict(
+                "only one appeal may be submitted for a case decision",
+            ));
+        }
+
+        let appeal = sqlx::query_as::<_, DisputeAppeal>(
+            r#"
+            INSERT INTO dispute_appeals
+                (dispute_id, appellant_id, decision_version, appeal_text, evidence_refs, deadline_at)
+            SELECT $1, $2, $3, $4, $5, $6
+            WHERE $6 > NOW()
+            RETURNING *
+            "#,
+        )
+        .bind(dispute_id)
+        .bind(appellant_id)
+        .bind(request.decision_version)
+        .bind(appeal_text)
+        .bind(serde_json::json!(request.evidence_refs))
+        .bind(deadline)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?
+        .ok_or_else(|| ApiError::conflict("the appeal deadline has passed"))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO dispute_history (dispute_id, actor_id, action, note)
+            VALUES ($1, $2, 'appeal_submitted', 'Appeal submitted')
+            "#,
+        )
+        .bind(dispute_id)
+        .bind(appellant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+        tx.commit().await.map_err(ApiError::database_error)?;
+        Ok(appeal)
+    }
+
+    pub async fn pending_appeals(&self, limit: i64) -> Result<Vec<DisputeAppeal>, ApiError> {
+        sqlx::query_as::<_, DisputeAppeal>(
+            r#"
+            SELECT * FROM dispute_appeals
+            WHERE status = 'pending'
+            ORDER BY submitted_at ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await
+        .map_err(ApiError::database_error)
+    }
+
+    pub async fn get_appeal(&self, dispute_id: Uuid) -> Result<DisputeAppeal, ApiError> {
+        sqlx::query_as::<_, DisputeAppeal>(
+            "SELECT * FROM dispute_appeals WHERE dispute_id = $1",
+        )
+        .bind(dispute_id)
+        .fetch_optional(&self.db_pool)
+        .await
+        .map_err(ApiError::database_error)?
+        .ok_or_else(|| ApiError::not_found("appeal not found"))
+    }
+
+    pub async fn review_appeal(
+        &self,
+        appeal_id: Uuid,
+        reviewer_id: Uuid,
+        accept: bool,
+        decision_reason: &str,
+    ) -> Result<DisputeAppeal, ApiError> {
+        let reason = decision_reason.trim();
+        if reason.is_empty() || reason.len() > 1000 {
+            return Err(ApiError::bad_request(
+                "decision_reason must contain 1 to 1000 characters",
+            ));
+        }
+
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .map_err(ApiError::database_error)?;
+        let appeal = sqlx::query_as::<_, DisputeAppeal>(
+            "SELECT * FROM dispute_appeals WHERE id = $1 FOR UPDATE",
+        )
+        .bind(appeal_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?
+        .ok_or_else(|| ApiError::not_found("appeal not found"))?;
+        if appeal.status != "pending" {
+            return Err(ApiError::conflict("appeal is no longer reviewable"));
+        }
+
+        let dispute = sqlx::query_as::<_, Dispute>(
+            "SELECT * FROM disputes WHERE id = $1 FOR UPDATE",
+        )
+        .bind(appeal.dispute_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+        if dispute.resolved_by == Some(reviewer_id) || dispute.opened_by == reviewer_id {
+            return Err(ApiError::forbidden(
+                "The original decision maker and case opener cannot review this appeal",
+            ));
+        }
+        if dispute.decision_version != appeal.decision_version {
+            return Err(ApiError::conflict(
+                "the case decision changed after this appeal was submitted",
+            ));
+        }
+
+        let status = if accept { "accepted" } else { "rejected" };
+        let reviewed = sqlx::query_as::<_, DisputeAppeal>(
+            r#"
+            UPDATE dispute_appeals
+            SET status = $2, reviewer_id = $3, decision_reason = $4, reviewed_at = NOW()
+            WHERE id = $1 AND status = 'pending'
+            RETURNING *
+            "#,
+        )
+        .bind(appeal_id)
+        .bind(status)
+        .bind(reviewer_id)
+        .bind(reason)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?
+        .ok_or_else(|| ApiError::conflict("appeal is no longer reviewable"))?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO dispute_history (dispute_id, actor_id, action, note)
+            VALUES ($1, $2, 'appeal_reviewed', $3)
+            "#,
+        )
+        .bind(dispute.id)
+        .bind(reviewer_id)
+        .bind(format!("Appeal {status}: {reason}"))
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO notifications (user_id, type, title, message, link)
+            VALUES ($1, 'dispute_appeal', $2, $3, $4)
+            "#,
+        )
+        .bind(appeal.appellant_id)
+        .bind(if accept {
+            "Your appeal was accepted"
+        } else {
+            "Your appeal was reviewed"
+        })
+        .bind(reason)
+        .bind(format!("/disputes/{}", dispute.id))
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?;
+
+        tx.commit().await.map_err(ApiError::database_error)?;
+        Ok(reviewed)
+    }
+
     pub async fn list_evidence(&self, dispute_id: Uuid) -> Result<Vec<DisputeEvidence>, ApiError> {
         sqlx::query_as::<_, DisputeEvidence>(
             "SELECT * FROM dispute_evidence WHERE dispute_id = $1 ORDER BY created_at ASC",
@@ -198,7 +470,19 @@ impl DisputeService {
         uploaded_by: Uuid,
         request: AddEvidenceRequest,
     ) -> Result<DisputeEvidence, ApiError> {
-        let dispute = self.get_dispute(dispute_id).await?;
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .map_err(ApiError::database_error)?;
+        let dispute = sqlx::query_as::<_, Dispute>(
+            "SELECT * FROM disputes WHERE id = $1 FOR UPDATE",
+        )
+        .bind(dispute_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?
+        .ok_or_else(|| ApiError::not_found("dispute not found"))?;
         if dispute.status().is_terminal() {
             return Err(ApiError::conflict(
                 "cannot add evidence to a closed dispute",
@@ -207,12 +491,6 @@ impl DisputeService {
         if request.file_url.trim().is_empty() || request.file_name.trim().is_empty() {
             return Err(ApiError::bad_request("file_url and file_name are required"));
         }
-
-        let mut tx = self
-            .db_pool
-            .begin()
-            .await
-            .map_err(ApiError::database_error)?;
 
         let evidence = sqlx::query_as::<_, DisputeEvidence>(
             r#"
@@ -259,16 +537,38 @@ impl DisputeService {
         assigned_to: Uuid,
         actor_id: Uuid,
     ) -> Result<Dispute, ApiError> {
-        let dispute = self.get_dispute(dispute_id).await?;
-        if dispute.status().is_terminal() {
-            return Err(ApiError::conflict("cannot reassign a closed dispute"));
-        }
-
         let mut tx = self
             .db_pool
             .begin()
             .await
             .map_err(ApiError::database_error)?;
+        let dispute = sqlx::query_as::<_, Dispute>(
+            "SELECT * FROM disputes WHERE id = $1 FOR UPDATE",
+        )
+        .bind(dispute_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?
+        .ok_or_else(|| ApiError::not_found("dispute not found"))?;
+        if dispute.status().is_terminal() {
+            return Err(ApiError::conflict("cannot reassign a closed dispute"));
+        }
+        if assigned_to == dispute.opened_by {
+            return Err(ApiError::bad_request(
+                "the case opener cannot be assigned as its reviewer",
+            ));
+        }
+        let assigned_role: Option<String> =
+            sqlx::query_scalar("SELECT role FROM users WHERE id = $1")
+                .bind(assigned_to)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(ApiError::database_error)?;
+        if !matches!(assigned_role.as_deref(), Some("moderator" | "admin")) {
+            return Err(ApiError::bad_request(
+                "cases may only be assigned to moderators or administrators",
+            ));
+        }
 
         let updated = sqlx::query_as::<_, Dispute>(
             "UPDATE disputes SET assigned_to = $1 WHERE id = $2 RETURNING *",
@@ -321,19 +621,25 @@ impl DisputeService {
         actor_id: Uuid,
         note: Option<String>,
     ) -> Result<Dispute, ApiError> {
-        let dispute = self.get_dispute(dispute_id).await?;
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .map_err(ApiError::database_error)?;
+        let dispute = sqlx::query_as::<_, Dispute>(
+            "SELECT * FROM disputes WHERE id = $1 FOR UPDATE",
+        )
+        .bind(dispute_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?
+        .ok_or_else(|| ApiError::not_found("dispute not found"))?;
         if dispute.status().is_terminal() {
             return Err(ApiError::conflict("cannot escalate a closed dispute"));
         }
 
         let from_level = dispute.escalation();
         let to_level = from_level.next();
-
-        let mut tx = self
-            .db_pool
-            .begin()
-            .await
-            .map_err(ApiError::database_error)?;
 
         let updated = sqlx::query_as::<_, Dispute>(
             r#"
@@ -410,21 +716,37 @@ impl DisputeService {
             return Err(ApiError::bad_request("resolution must not be empty"));
         }
 
-        let dispute = self.get_dispute(dispute_id).await?;
-        if dispute.status().is_terminal() {
-            return Err(ApiError::conflict("dispute is already closed"));
-        }
-
         let mut tx = self
             .db_pool
             .begin()
             .await
             .map_err(ApiError::database_error)?;
+        let dispute = sqlx::query_as::<_, Dispute>(
+            "SELECT * FROM disputes WHERE id = $1 FOR UPDATE",
+        )
+        .bind(dispute_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?
+        .ok_or_else(|| ApiError::not_found("dispute not found"))?;
+        if dispute.status().is_terminal() {
+            return Err(ApiError::conflict("dispute is already closed"));
+        }
+        if dispute.opened_by == resolved_by
+            || dispute
+                .assigned_to
+                .is_some_and(|assigned_to| assigned_to != resolved_by)
+        {
+            return Err(ApiError::forbidden(
+                "Only the assigned reviewer may finalize a case, and the opener cannot review it",
+            ));
+        }
 
         let updated = sqlx::query_as::<_, Dispute>(
             r#"
             UPDATE disputes
-            SET status = $1, resolution = $2, resolved_by = $3, resolved_at = NOW()
+            SET status = $1, resolution = $2, resolved_by = $3, resolved_at = NOW(),
+                decision_version = decision_version + 1
             WHERE id = $4
             RETURNING *
             "#,
@@ -497,18 +819,24 @@ impl DisputeService {
         to_status: TicketStatus,
         note: Option<String>,
     ) -> Result<Dispute, ApiError> {
-        let dispute = self.get_dispute(dispute_id).await?;
-        if dispute.status().is_terminal() {
-            return Err(ApiError::conflict(
-                "cannot change status of a closed dispute",
-            ));
-        }
-
         let mut tx = self
             .db_pool
             .begin()
             .await
             .map_err(ApiError::database_error)?;
+        let dispute = sqlx::query_as::<_, Dispute>(
+            "SELECT * FROM disputes WHERE id = $1 FOR UPDATE",
+        )
+        .bind(dispute_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(ApiError::database_error)?
+        .ok_or_else(|| ApiError::not_found("dispute not found"))?;
+        if dispute.status() != TicketStatus::Open {
+            return Err(ApiError::conflict(
+                "only an open dispute can enter review",
+            ));
+        }
 
         let updated = sqlx::query_as::<_, Dispute>(
             "UPDATE disputes SET status = $1 WHERE id = $2 RETURNING *",
