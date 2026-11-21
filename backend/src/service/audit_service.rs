@@ -81,6 +81,10 @@ pub enum AuditAction {
     /// Explicit application-level record of a data modification, for paths
     /// where the change does not land in an audited table.
     DataModification,
+    /// A privileged operator request that was refused before submission —
+    /// expired session, revoked session, or an action outside the session's
+    /// scope. Recorded so a rejection leaves evidence, not just a 403.
+    OperatorRequestRejected,
 }
 
 impl AuditAction {
@@ -97,7 +101,181 @@ impl AuditAction {
             Self::AdminOverride => "admin_override",
             Self::AdminConfigChange => "admin_config_change",
             Self::DataModification => "data_modification",
+            Self::OperatorRequestRejected => "operator_request_rejected",
         }
+    }
+}
+
+/// Why a privileged operator request was refused.
+///
+/// A closed set for the same reason as [`AuditAction`]: the rejection reason
+/// is what an investigator groups by, so it must be spelled consistently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectionReason {
+    /// The session's expiry had passed when the action was submitted.
+    Expired,
+    /// The session was revoked after the action was queued.
+    Revoked,
+    /// The action was not covered by the session's scope.
+    WrongScope,
+    /// The session's purpose did not permit the action.
+    WrongPurpose,
+    /// No approval reference was bound to the session.
+    MissingApproval,
+    /// The session was unknown to the store.
+    UnknownSession,
+}
+
+impl RejectionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Revoked => "revoked",
+            Self::WrongScope => "wrong_scope",
+            Self::WrongPurpose => "wrong_purpose",
+            Self::MissingApproval => "missing_approval",
+            Self::UnknownSession => "unknown_session",
+        }
+    }
+}
+
+/// Evidence for a refused privileged request.
+///
+/// Carries the session's binding (actor, purpose, scope, expiry, approval
+/// reference) so the record answers "who asked, for what, under which
+/// approval, and why was it refused" without a join back to a session that
+/// may already have been purged. Signing keys are never part of this — they
+/// live outside the session store and are never copied into the trail.
+#[derive(Debug, Clone)]
+pub struct RejectedRequestInput {
+    /// The operator the session was issued to.
+    pub actor_id: Option<Uuid>,
+    /// The session identifier, if one was presented.
+    pub session_id: Option<Uuid>,
+    /// What the session was issued for, e.g. `"payout_override"`.
+    pub purpose: String,
+    /// The scopes the session held.
+    pub scope: Vec<String>,
+    /// The scope the refused action required.
+    pub required_scope: Option<String>,
+    /// When the session expired (or would have).
+    pub expires_at: Option<DateTime<Utc>>,
+    /// The approval reference bound to the session.
+    pub approval_reference: Option<String>,
+    /// The action that was attempted, e.g. `"admin_override"`.
+    pub attempted_action: String,
+    /// The resource the action targeted.
+    pub resource_type: String,
+    pub resource_id: Option<Uuid>,
+    pub reason: RejectionReason,
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+}
+
+impl RejectedRequestInput {
+    pub fn new(
+        purpose: impl Into<String>,
+        attempted_action: impl Into<String>,
+        resource_type: impl Into<String>,
+        reason: RejectionReason,
+    ) -> Self {
+        Self {
+            actor_id: None,
+            session_id: None,
+            purpose: purpose.into(),
+            scope: Vec::new(),
+            required_scope: None,
+            expires_at: None,
+            approval_reference: None,
+            attempted_action: attempted_action.into(),
+            resource_type: resource_type.into(),
+            resource_id: None,
+            reason,
+            ip_address: None,
+            user_agent: None,
+        }
+    }
+
+    pub fn actor(mut self, actor_id: Uuid) -> Self {
+        self.actor_id = Some(actor_id);
+        self
+    }
+
+    pub fn session(mut self, session_id: Uuid) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+
+    pub fn scope(mut self, scope: Vec<String>) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    pub fn required_scope(mut self, scope: impl Into<String>) -> Self {
+        self.required_scope = Some(scope.into());
+        self
+    }
+
+    pub fn expires_at(mut self, expires_at: DateTime<Utc>) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+
+    pub fn approval_reference(mut self, reference: impl Into<String>) -> Self {
+        self.approval_reference = Some(reference.into());
+        self
+    }
+
+    pub fn resource(mut self, resource_id: Uuid) -> Self {
+        self.resource_id = Some(resource_id);
+        self
+    }
+
+    pub fn request_context(
+        mut self,
+        ip_address: Option<String>,
+        user_agent: Option<String>,
+    ) -> Self {
+        self.ip_address = ip_address;
+        self.user_agent = user_agent;
+        self
+    }
+
+    /// Render the evidence as the `new_values` payload of an audit entry.
+    ///
+    /// Kept as a pure function so the shape can be asserted in tests without
+    /// a database.
+    pub fn evidence(&self) -> JsonValue {
+        serde_json::json!({
+            "session_id": self.session_id,
+            "purpose": self.purpose,
+            "scope": self.scope,
+            "required_scope": self.required_scope,
+            "expires_at": self.expires_at,
+            "approval_reference": self.approval_reference,
+            "attempted_action": self.attempted_action,
+            "rejection_reason": self.reason.as_str(),
+        })
+    }
+
+    /// Convert into the generic audit entry this service writes.
+    pub fn into_entry(self) -> AuditEntryInput {
+        let evidence = self.evidence();
+        let mut entry = AuditEntryInput::new(
+            AuditAction::OperatorRequestRejected,
+            self.resource_type.clone(),
+        )
+        .after(evidence)
+        .request_context(self.ip_address.clone(), self.user_agent.clone());
+
+        if let Some(actor_id) = self.actor_id {
+            entry = entry.actor(actor_id);
+        }
+        if let Some(resource_id) = self.resource_id {
+            entry = entry.resource(resource_id);
+        }
+        entry
     }
 }
 
@@ -310,6 +488,51 @@ impl AuditService {
         .await?;
 
         Ok(id)
+    }
+
+    /// Record a refused privileged request.
+    ///
+    /// Unlike [`Self::log`], a failure here is logged and swallowed: the
+    /// request is already being refused, and turning an audit-write failure
+    /// into a different error would hide the rejection from the caller. The
+    /// rejection itself is the security decision; the record is evidence.
+    pub async fn log_rejected_request(
+        &self,
+        rejected: RejectedRequestInput,
+    ) -> Result<Uuid, AuditError> {
+        let reason = rejected.reason;
+        let actor_id = rejected.actor_id;
+        let attempted_action = rejected.attempted_action.clone();
+
+        match self.log(rejected.into_entry()).await {
+            Ok(id) => {
+                warn!(
+                    audit_id = %id,
+                    actor_id = ?actor_id,
+                    attempted_action = %attempted_action,
+                    rejection_reason = reason.as_str(),
+                    "privileged operator request rejected"
+                );
+                Ok(id)
+            }
+            Err(e) => {
+                error!(
+                    actor_id = ?actor_id,
+                    attempted_action = %attempted_action,
+                    rejection_reason = reason.as_str(),
+                    "failed to record rejected privileged request: {e}"
+                );
+                Err(e)
+            }
+        }
+    }
+
+    /// Record a refused privileged request inside a caller's transaction.
+    pub async fn log_rejected_request_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        rejected: RejectedRequestInput,
+    ) -> Result<Uuid, AuditError> {
+        Self::log_in_tx(tx, rejected.into_entry()).await
     }
 
     /// Declare who the current transaction is acting as.
@@ -542,6 +765,7 @@ mod tests {
             AuditAction::AdminOverride,
             AuditAction::AdminConfigChange,
             AuditAction::DataModification,
+            AuditAction::OperatorRequestRejected,
         ];
 
         for action in actions {
@@ -577,5 +801,105 @@ mod tests {
         let cutoff = AuditService::retention_cutoff();
         let years_back = (Utc::now() - cutoff).num_days() / 365;
         assert_eq!(years_back, RETENTION_YEARS);
+    }
+
+    #[test]
+    fn rejection_reasons_are_stable_and_fit_the_column() {
+        let reasons = [
+            RejectionReason::Expired,
+            RejectionReason::Revoked,
+            RejectionReason::WrongScope,
+            RejectionReason::WrongPurpose,
+            RejectionReason::MissingApproval,
+            RejectionReason::UnknownSession,
+        ];
+
+        for reason in reasons {
+            assert!(reason.as_str().len() <= 50);
+            assert!(!reason.as_str().is_empty());
+        }
+    }
+
+    #[test]
+    fn rejected_request_evidence_carries_the_session_binding() {
+        let actor = Uuid::new_v4();
+        let session = Uuid::new_v4();
+        let resource = Uuid::new_v4();
+        let expires_at = Utc::now() + Duration::minutes(15);
+
+        let rejected = RejectedRequestInput::new(
+            "payout_override",
+            "admin_override",
+            "payouts",
+            RejectionReason::Expired,
+        )
+        .actor(actor)
+        .session(session)
+        .scope(vec!["payouts:write".into()])
+        .required_scope("payouts:write")
+        .expires_at(expires_at)
+        .approval_reference("APR-1234")
+        .resource(resource)
+        .request_context(Some("203.0.113.7".into()), Some("curl/8".into()));
+
+        let evidence = rejected.evidence();
+        assert_eq!(evidence["session_id"], serde_json::json!(session));
+        assert_eq!(evidence["purpose"], serde_json::json!("payout_override"));
+        assert_eq!(evidence["scope"], serde_json::json!(["payouts:write"]));
+        assert_eq!(evidence["required_scope"], serde_json::json!("payouts:write"));
+        assert_eq!(evidence["approval_reference"], serde_json::json!("APR-1234"));
+        assert_eq!(evidence["attempted_action"], serde_json::json!("admin_override"));
+        assert_eq!(evidence["rejection_reason"], serde_json::json!("expired"));
+        // Signing keys must never appear in the evidence payload.
+        assert!(evidence.get("signing_key").is_none());
+        assert!(evidence.get("private_key").is_none());
+    }
+
+    #[test]
+    fn rejected_request_converts_to_an_audit_entry() {
+        let actor = Uuid::new_v4();
+        let resource = Uuid::new_v4();
+
+        let entry = RejectedRequestInput::new(
+            "data_export",
+            "admin_export",
+            "users",
+            RejectionReason::WrongScope,
+        )
+        .actor(actor)
+        .scope(vec!["users:read".into()])
+        .required_scope("users:export")
+        .approval_reference("APR-9")
+        .resource(resource)
+        .into_entry();
+
+        assert_eq!(entry.action, AuditAction::OperatorRequestRejected);
+        assert_eq!(entry.action.as_str(), "operator_request_rejected");
+        assert_eq!(entry.actor_id, Some(actor));
+        assert_eq!(entry.resource_id, Some(resource));
+        assert_eq!(entry.resource_type, "users");
+        let new_values = entry.new_values.expect("evidence payload");
+        assert_eq!(new_values["rejection_reason"], serde_json::json!("wrong_scope"));
+        assert_eq!(new_values["required_scope"], serde_json::json!("users:export"));
+    }
+
+    #[test]
+    fn rejected_request_without_actor_still_converts() {
+        // An unknown session has no actor to attribute; the entry must still
+        // be writable so the attempt leaves a trace.
+        let entry = RejectedRequestInput::new(
+            "unknown",
+            "admin_override",
+            "payouts",
+            RejectionReason::UnknownSession,
+        )
+        .into_entry();
+
+        assert_eq!(entry.actor_id, None);
+        assert_eq!(entry.action, AuditAction::OperatorRequestRejected);
+        assert_eq!(
+            entry.new_values.expect("evidence payload")["rejection_reason"],
+            serde_json::json!("unknown_session")
+        );
     }
 }
