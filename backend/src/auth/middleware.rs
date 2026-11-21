@@ -1,4 +1,5 @@
 use crate::auth::jwt_service::{Claims, JwtError, JwtService, TokenType};
+use crate::auth::operator_session::{OperatorSessionError, OperatorSessionStore};
 use actix_web::{
     dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform},
     error::{ErrorForbidden, ErrorUnauthorized},
@@ -9,6 +10,9 @@ use futures::future::LocalBoxFuture;
 use std::future::{ready, Ready};
 use std::rc::Rc;
 use tracing::{debug, warn};
+
+/// Header carrying the opaque operator session token for privileged actions.
+pub const OPERATOR_SESSION_HEADER: &str = "X-Operator-Session";
 
 fn is_public_route(req: &ServiceRequest) -> bool {
     let path = req.path();
@@ -41,6 +45,31 @@ fn is_public_route(req: &ServiceRequest) -> bool {
         || (method == Method::POST && path.starts_with("/api/webhooks/"))
 }
 
+/// Privileged operator actions that require a bounded, revocable session.
+///
+/// Returns the scope that a valid operator session must cover for the given
+/// request, or `None` when the route is not a privileged operator action.
+fn required_operator_scope(method: &Method, path: &str) -> Option<&'static str> {
+    if path.starts_with("/api/operator") {
+        return Some("operator");
+    }
+    if path.starts_with("/api/ip-list")
+        || path.starts_with("/api/feature-flags")
+        || path.starts_with("/api/cache")
+        || path.starts_with("/api/idempotency")
+        || path.starts_with("/api/reputation/bad-actors")
+    {
+        return Some("admin");
+    }
+    if path.starts_with("/api/suspensions") || path.starts_with("/api/disputes") {
+        return Some("moderation");
+    }
+    if method != Method::GET && path.starts_with("/api/soroban") {
+        return Some("soroban");
+    }
+    None
+}
+
 fn required_roles(path: &str) -> Option<&'static [&'static str]> {
     if path == "/api/auth/analytics"
         || path.starts_with("/api/ip-list")
@@ -62,13 +91,21 @@ fn required_roles(path: &str) -> Option<&'static [&'static str]> {
 /// Authentication middleware for protecting routes
 pub struct AuthMiddleware {
     jwt_service: Rc<JwtService>,
+    operator_sessions: Option<Rc<OperatorSessionStore>>,
 }
 
 impl AuthMiddleware {
     pub fn new(jwt_service: JwtService) -> Self {
         Self {
             jwt_service: Rc::new(jwt_service),
+            operator_sessions: None,
         }
+    }
+
+    /// Attach the operator session store used to gate privileged actions.
+    pub fn with_operator_sessions(mut self, store: OperatorSessionStore) -> Self {
+        self.operator_sessions = Some(Rc::new(store));
+        self
     }
 }
 
@@ -88,6 +125,7 @@ where
         ready(Ok(AuthMiddlewareService {
             service: Rc::new(service),
             jwt_service: self.jwt_service.clone(),
+            operator_sessions: self.operator_sessions.clone(),
         }))
     }
 }
@@ -95,6 +133,7 @@ where
 pub struct AuthMiddlewareService<S> {
     service: Rc<S>,
     jwt_service: Rc<JwtService>,
+    operator_sessions: Option<Rc<OperatorSessionStore>>,
 }
 
 impl<S, B> Service<ServiceRequest> for AuthMiddlewareService<S>
@@ -112,6 +151,7 @@ where
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let jwt_service = self.jwt_service.clone();
         let service = self.service.clone();
+        let operator_sessions = self.operator_sessions.clone();
 
         Box::pin(async move {
             // ── Token extraction ─────────────────────────────────────────────
@@ -153,6 +193,83 @@ where
                             return Err(ErrorForbidden("Insufficient permissions"));
                         }
                     }
+
+                    // ── Operator session gate ────────────────────────────────
+                    // Privileged actions must present a bounded, revocable
+                    // operator session bound to the actor, purpose, scope,
+                    // expiry and approval reference. Checked immediately before
+                    // the handler runs (i.e. before submission).
+                    if let Some(required_scope) = required_operator_scope(req.method(), req.path()) {
+                        let store = match operator_sessions.as_ref() {
+                            Some(s) => s,
+                            None => {
+                                warn!(
+                                    user_id = %claims.sub,
+                                    path = %req.path(),
+                                    "Privileged action attempted without operator session store"
+                                );
+                                return Err(ErrorForbidden("Operator session required"));
+                            }
+                        };
+
+                        let session_token = req
+                            .headers()
+                            .get(OPERATOR_SESSION_HEADER)
+                            .and_then(|h| h.to_str().ok())
+                            .map(str::to_owned);
+
+                        let session_token = match session_token {
+                            Some(t) => t,
+                            None => {
+                                warn!(
+                                    user_id = %claims.sub,
+                                    path = %req.path(),
+                                    "Missing operator session token"
+                                );
+                                return Err(ErrorForbidden("Operator session required"));
+                            }
+                        };
+
+                        match store.validate(&session_token, &claims.sub, required_scope) {
+                            Ok(session) => {
+                                debug!(
+                                    user_id = %claims.sub,
+                                    session_id = %session.session_id,
+                                    purpose = %session.purpose,
+                                    scope = %session.scope,
+                                    approval_ref = %session.approval_ref,
+                                    "Operator session validated"
+                                );
+                                req.extensions_mut().insert(session);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    user_id = %claims.sub,
+                                    path = %req.path(),
+                                    error = %e,
+                                    "Operator session rejected"
+                                );
+                                return Err(match e {
+                                    OperatorSessionError::Expired => {
+                                        ErrorForbidden("Operator session expired")
+                                    }
+                                    OperatorSessionError::Revoked => {
+                                        ErrorForbidden("Operator session revoked")
+                                    }
+                                    OperatorSessionError::WrongScope => {
+                                        ErrorForbidden("Operator session scope mismatch")
+                                    }
+                                    OperatorSessionError::ActorMismatch => {
+                                        ErrorForbidden("Operator session actor mismatch")
+                                    }
+                                    OperatorSessionError::NotFound => {
+                                        ErrorForbidden("Operator session not found")
+                                    }
+                                });
+                            }
+                        }
+                    }
+
                     debug!(user_id = %claims.sub, "Request authenticated");
                     req.extensions_mut().insert(claims);
                     service.call(req).await
@@ -204,10 +321,119 @@ impl ClaimsExt for actix_web::HttpRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::operator_session::{OperatorSessionRequest, OperatorSessionStore};
+    use std::time::Duration;
+
+    fn store() -> OperatorSessionStore {
+        OperatorSessionStore::new()
+    }
+
+    fn issue(store: &OperatorSessionStore, actor: &str, scope: &str) -> String {
+        store
+            .issue(OperatorSessionRequest {
+                actor: actor.to_string(),
+                purpose: "manual-payout".to_string(),
+                scope: scope.to_string(),
+                ttl: Duration::from_secs(60),
+                approval_ref: "approval-123".to_string(),
+            })
+            .expect("session issued")
+    }
 
     #[test]
     fn test_claims_ext_interface() {
         // This test just ensures the trait compiles
         assert!(true);
+    }
+
+    #[test]
+    fn operator_scope_mapping() {
+        assert_eq!(
+            required_operator_scope(&Method::POST, "/api/operator/payout"),
+            Some("operator")
+        );
+        assert_eq!(
+            required_operator_scope(&Method::POST, "/api/feature-flags"),
+            Some("admin")
+        );
+        assert_eq!(
+            required_operator_scope(&Method::POST, "/api/disputes/1/resolve"),
+            Some("moderation")
+        );
+        assert_eq!(
+            required_operator_scope(&Method::POST, "/api/soroban/submit"),
+            Some("soroban")
+        );
+        assert_eq!(
+            required_operator_scope(&Method::GET, "/api/soroban/status"),
+            None
+        );
+        assert_eq!(required_operator_scope(&Method::GET, "/api/tournaments"), None);
+    }
+
+    #[test]
+    fn valid_session_is_accepted() {
+        let store = store();
+        let token = issue(&store, "actor-1", "operator");
+        let session = store
+            .validate(&token, "actor-1", "operator")
+            .expect("valid session");
+        assert_eq!(session.actor, "actor-1");
+        assert_eq!(session.scope, "operator");
+        assert_eq!(session.approval_ref, "approval-123");
+    }
+
+    #[test]
+    fn expired_session_is_rejected() {
+        let store = store();
+        let token = store
+            .issue(OperatorSessionRequest {
+                actor: "actor-1".to_string(),
+                purpose: "manual-payout".to_string(),
+                scope: "operator".to_string(),
+                ttl: Duration::from_millis(1),
+                approval_ref: "approval-123".to_string(),
+            })
+            .expect("session issued");
+        std::thread::sleep(Duration::from_millis(5));
+        let err = store.validate(&token, "actor-1", "operator").unwrap_err();
+        assert_eq!(err, OperatorSessionError::Expired);
+    }
+
+    #[test]
+    fn revoked_session_is_rejected() {
+        let store = store();
+        let token = issue(&store, "actor-1", "operator");
+        let session = store
+            .validate(&token, "actor-1", "operator")
+            .expect("valid session");
+        store.revoke(&session.session_id);
+        let err = store.validate(&token, "actor-1", "operator").unwrap_err();
+        assert_eq!(err, OperatorSessionError::Revoked);
+    }
+
+    #[test]
+    fn wrong_scope_is_rejected() {
+        let store = store();
+        let token = issue(&store, "actor-1", "operator");
+        let err = store.validate(&token, "actor-1", "admin").unwrap_err();
+        assert_eq!(err, OperatorSessionError::WrongScope);
+    }
+
+    #[test]
+    fn wrong_actor_is_rejected() {
+        let store = store();
+        let token = issue(&store, "actor-1", "operator");
+        let err = store.validate(&token, "actor-2", "operator").unwrap_err();
+        assert_eq!(err, OperatorSessionError::ActorMismatch);
+    }
+
+    #[test]
+    fn unknown_session_is_rejected() {
+        let store = store();
+        let err = store
+            .validate("not-a-real-token", "actor-1", "operator")
+            .unwrap_err();
+        assert_eq!(err, OperatorSessionError::NotFound);
     }
 }

@@ -131,6 +131,66 @@ export function defineSchemaWithRefinements<
   };
 }
 
+// ─── Analytics event schema builder ───────────────────────────────────────────
+
+/**
+ * Metadata attached to an analytics event schema.
+ * Mirrors the cross-client event contract fields (owner, purpose, version).
+ */
+export interface EventSchemaMetadata extends Omit<SchemaMetadata, "name"> {
+  /** Team or service that owns the event contract. */
+  owner: string;
+  /** Why the event is collected (analytics purpose). */
+  purpose: string;
+  /** Schema version — bump on breaking changes with a migration plan. */
+  version: number;
+}
+
+/**
+ * A compiled analytics event validator with attached metadata.
+ */
+export interface EventSchema<TShape extends z.ZodRawShape> {
+  schema: z.ZodObject<TShape>;
+  meta: EventSchemaMetadata & { name: string };
+  /** Validate and return typed data or throw ZodError. */
+  parse(data: unknown): z.infer<z.ZodObject<TShape>>;
+  /** Validate and return { success, data } without throwing. */
+  safeParse(data: unknown): z.ZodSafeParseResult<z.infer<z.ZodObject<TShape>>>;
+}
+
+/**
+ * Compiles an analytics event contract into a Zod validator and registers it
+ * in the shared schema registry so governance / analytics can discover it.
+ *
+ * Used by both frontend and server producers to validate event payloads
+ * against the same versioned contract.
+ *
+ * @example
+ * export const loginEvent = defineEventSchema(
+ *   "auth.login",
+ *   { owner: "identity", purpose: "auth_funnel", version: 1 },
+ *   { userId: z.string().uuid(), method: z.enum(["password", "oauth"]) },
+ * );
+ * const result = loginEvent.safeParse(payload);
+ */
+export function defineEventSchema<TShape extends z.ZodRawShape>(
+  name: string,
+  meta: EventSchemaMetadata,
+  shape: TShape,
+): EventSchema<TShape> {
+  const schema = z.object(shape);
+  const fullMeta = { name, ...meta };
+
+  _registerSchema(fullMeta);
+
+  return {
+    schema,
+    meta: fullMeta,
+    parse: (data: unknown) => schema.parse(data),
+    safeParse: (data: unknown) => schema.safeParse(data),
+  };
+}
+
 // ─── Schema registry ──────────────────────────────────────────────────────────
 
 const _registry = new Map<string, SchemaMetadata>();

@@ -35,6 +35,10 @@ pub struct AuditEntry {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Audit action recorded when a privileged operator session is rejected
+/// (Issue #236). Written by the operator-session boundary, never by this API.
+pub const OPERATOR_SESSION_REJECTED_ACTION: &str = "operator_session_rejected";
+
 /// Filters for the audit query.
 ///
 /// Every field is optional and every one narrows the result — an investigation
@@ -46,6 +50,26 @@ pub struct AuditQuery {
     pub resource_type: Option<String>,
     pub resource_id: Option<Uuid>,
     pub source: Option<String>,
+    /// Inclusive lower bound on `created_at`.
+    pub from: Option<chrono::DateTime<chrono::Utc>>,
+    /// Inclusive upper bound on `created_at`.
+    pub to: Option<chrono::DateTime<chrono::Utc>>,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
+/// Filters for the rejected-operator-session evidence view.
+///
+/// Deliberately narrower than [`AuditQuery`]: this endpoint exists to answer
+/// "which privileged actions were refused, and why", so it only exposes the
+/// dimensions an investigator needs and pins the action to the rejection
+/// event. It is read-only like the rest of the trail.
+#[derive(Debug, Deserialize)]
+pub struct RejectedSessionQuery {
+    /// The operator whose session was rejected.
+    pub user_id: Option<Uuid>,
+    /// The resource the refused action targeted, if any.
+    pub resource_id: Option<Uuid>,
     /// Inclusive lower bound on `created_at`.
     pub from: Option<chrono::DateTime<chrono::Utc>>,
     /// Inclusive upper bound on `created_at`.
@@ -160,6 +184,82 @@ pub async fn query_audit_logs(
     }))
 }
 
+/// `GET /admin/audit-logs/operator-sessions/rejected`
+///
+/// Read-only evidence of privileged operator sessions that were refused at the
+/// submission boundary (expired, revoked, wrong scope, or missing approval).
+///
+/// The rows are produced by the operator-session boundary itself; this handler
+/// only reads them. There is intentionally no way to write a rejection record
+/// through the API — a forgeable rejection log would let a compromised session
+/// erase the evidence of its own refused actions.
+pub async fn rejected_operator_sessions(
+    pool: web::Data<PgPool>,
+    query: web::Query<RejectedSessionQuery>,
+) -> Result<HttpResponse, ApiError> {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let offset = query.offset.unwrap_or(0).max(0);
+
+    let entries = sqlx::query_as::<_, AuditEntry>(
+        r#"
+        SELECT id, sequence_number, user_id, action, resource_type, resource_id,
+               old_values, new_values, source, entry_hash, previous_hash, created_at
+        FROM audit_logs
+        WHERE action = $1
+          AND ($2::uuid IS NULL OR user_id = $2)
+          AND ($3::uuid IS NULL OR resource_id = $3)
+          AND ($4::timestamptz IS NULL OR created_at >= $4)
+          AND ($5::timestamptz IS NULL OR created_at <= $5)
+        ORDER BY sequence_number DESC
+        LIMIT $6 OFFSET $7
+        "#,
+    )
+    .bind(OPERATOR_SESSION_REJECTED_ACTION)
+    .bind(query.user_id)
+    .bind(query.resource_id)
+    .bind(query.from)
+    .bind(query.to)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool.get_ref())
+    .await
+    .map_err(|e| {
+        ApiError::InternalServerError(format!("Failed to query rejected operator sessions: {e}"))
+    })?;
+
+    let total: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM audit_logs
+        WHERE action = $1
+          AND ($2::uuid IS NULL OR user_id = $2)
+          AND ($3::uuid IS NULL OR resource_id = $3)
+          AND ($4::timestamptz IS NULL OR created_at >= $4)
+          AND ($5::timestamptz IS NULL OR created_at <= $5)
+        "#,
+    )
+    .bind(OPERATOR_SESSION_REJECTED_ACTION)
+    .bind(query.user_id)
+    .bind(query.resource_id)
+    .bind(query.from)
+    .bind(query.to)
+    .fetch_one(pool.get_ref())
+    .await
+    .map_err(|e| {
+        ApiError::InternalServerError(format!("Failed to count rejected operator sessions: {e}"))
+    })?;
+
+    Ok(HttpResponse::Ok().json(AuditPage {
+        entries,
+        total,
+        limit,
+        offset,
+    }))
+}
+
 /// `GET /admin/audit-logs/{resource_type}/{resource_id}`
 ///
 /// Full history for one resource, oldest first — the order in which the
@@ -250,6 +350,12 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         web::scope("/admin/audit-logs")
             .route("", web::get().to(query_audit_logs))
             .route("/verify", web::get().to(verify_chain))
+            // Registered before the `{resource_type}/{resource_id}` catch-all
+            // so the literal path is not swallowed by the parameterised route.
+            .route(
+                "/operator-sessions/rejected",
+                web::get().to(rejected_operator_sessions),
+            )
             .route("/{resource_type}/{resource_id}", web::get().to(resource_history)),
     )
     .service(
@@ -277,5 +383,56 @@ mod tests {
     fn negative_offset_is_floored_at_zero() {
         assert_eq!((-10i64).max(0), 0);
         assert_eq!(25i64.max(0), 25);
+    }
+
+    #[test]
+    fn rejected_session_action_is_the_canonical_event_name() {
+        // The operator-session boundary writes this exact action string; the
+        // evidence endpoint filters on it. If the two drift, rejections become
+        // invisible to investigators.
+        assert_eq!(OPERATOR_SESSION_REJECTED_ACTION, "operator_session_rejected");
+    }
+
+    #[test]
+    fn rejected_session_query_is_clamped_like_the_main_query() {
+        // The rejection view shares the same unbounded-trail risk as the main
+        // query, so it must apply the same clamp.
+        assert_eq!(10_000i64.clamp(1, MAX_PAGE_SIZE), MAX_PAGE_SIZE);
+        assert_eq!(0i64.clamp(1, MAX_PAGE_SIZE), 1);
+        assert_eq!((-1i64).max(0), 0);
+    }
+
+    #[test]
+    fn rejected_session_query_parses_optional_filters() {
+        // Empty query: all filters absent, so the endpoint returns every
+        // rejection in the window with default paging.
+        let empty: RejectedSessionQuery = serde_json::from_str("{}").unwrap();
+        assert!(empty.user_id.is_none());
+        assert!(empty.resource_id.is_none());
+        assert!(empty.from.is_none());
+        assert!(empty.to.is_none());
+        assert!(empty.limit.is_none());
+        assert!(empty.offset.is_none());
+
+        // Populated query: filters bind through unchanged.
+        let user = Uuid::new_v4();
+        let resource = Uuid::new_v4();
+        let raw = format!(
+            r#"{{"user_id":"{user}","resource_id":"{resource}","limit":10,"offset":5}}"#
+        );
+        let parsed: RejectedSessionQuery = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.user_id, Some(user));
+        assert_eq!(parsed.resource_id, Some(resource));
+        assert_eq!(parsed.limit, Some(10));
+        assert_eq!(parsed.offset, Some(5));
+    }
+
+    #[test]
+    fn rejected_session_query_rejects_malformed_uuids() {
+        // A malformed filter must fail deserialisation rather than silently
+        // widening the query to every rejection.
+        let result: Result<RejectedSessionQuery, _> =
+            serde_json::from_str(r#"{"user_id":"not-a-uuid"}"#);
+        assert!(result.is_err());
     }
 }

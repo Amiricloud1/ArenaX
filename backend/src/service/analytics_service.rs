@@ -11,6 +11,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Current analytics consent policy version. Bump when the consent text or
+/// scope changes; stored consent rows must match this version to be honoured.
+pub const ANALYTICS_CONSENT_VERSION: i32 = 1;
+
 // ─── DTOs ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -53,37 +57,117 @@ pub struct RecordMatchRequest {
     pub player_count: i32,
 }
 
-/// Request to log that a participant was actually presented an assigned variant.
-#[derive(Debug, Deserialize)]
-pub struct RecordExposureRequest {
-    pub experiment_key: String,
-    pub assignment_version: i32,
-    pub variant: String,
-    /// Presentation surface (e.g. "lobby_banner", "match_hud"). Idempotency key
-    /// together with the assignment id.
-    pub surface: String,
+// ─── Ingestion DTOs (#251) ───────────────────────────────────────────────────
+
+/// A single analytics event as delivered by a producer.
+/// `event_id` is a stable, producer-assigned identifier; `producer_id`
+/// scopes it so two producers may reuse the same event_id safely.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AnalyticsEvent {
+    pub producer_id: String,
+    pub event_id: String,
+    pub schema_version: i32,
+    pub event_name: String,
+    pub occurred_at: chrono::DateTime<Utc>,
+    #[serde(default)]
+    pub payload: serde_json::Value,
 }
 
-/// Request to record a guardrail metric sample for an experiment variant.
-#[derive(Debug, Deserialize)]
-pub struct RecordGuardrailSampleRequest {
-    pub experiment_key: String,
-    pub variant: String,
-    pub metric: String,
-    pub value: f64,
-    /// Optional participant id for per-user aggregation; never exposed publicly.
-    pub user_id: Option<Uuid>,
+/// Outcome of ingesting a single event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngestionOutcome {
+    /// Event was newly accepted.
+    Accepted,
+    /// Event was already accepted (idempotent retry).
+    Duplicate,
+    /// Event failed validation and was recorded in the rejection path.
+    Rejected,
 }
 
 #[derive(Debug, Serialize)]
-pub struct ExperimentAnalysisResponse {
-    pub experiment_key: String,
-    pub decision: ExperimentDecision,
-    pub primary_metric: String,
-    pub guardrail_metrics: Vec<String>,
-    pub control_samples: i64,
-    pub treatment_samples: i64,
-    pub missing_telemetry: bool,
+pub struct IngestionResult {
+    pub producer_id: String,
+    pub event_id: String,
+    pub outcome: IngestionOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
+}
+
+/// Supported schema versions for ingestion. Rollouts add versions here.
+pub const SUPPORTED_SCHEMA_VERSIONS: &[i32] = &[1];
+
+// ─── Identity stitching DTOs (#252) ──────────────────────────────────────────
+
+/// Purpose-limited identity link. Raw auth identifiers are never stored here;
+/// callers pass an already-pseudonymised subject id.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IdentityLinkRequest {
+    pub anonymous_subject: String,
+    pub authenticated_subject: String,
+    pub purpose: String,
+    pub consent_granted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityLinkOutcome {
+    Linked,
+    AlreadyLinked,
+    ConsentMissing,
+    Collision,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IdentityLinkResult {
+    pub outcome: IdentityLinkOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_subject: Option<String>,
+}
+
+// ─── Metric catalog DTOs (#253) ──────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricCatalogEntry {
+    pub name: String,
+    pub owner: String,
+    pub query_definition: String,
+    pub source_events: Vec<String>,
+    pub freshness_secs: i64,
+    pub privacy_class: String,
+    pub deprecated: bool,
+}
+
+// ─── Budget DTOs (#254) ──────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+pub struct QueryBudget {
+    pub max_latency_ms: u64,
+    pub max_freshness_secs: i64,
+    pub max_range_secs: i64,
+    pub max_rows: i64,
+}
+
+impl Default for QueryBudget {
+    fn default() -> Self {
+        Self {
+            max_latency_ms: 2_000,
+            max_freshness_secs: 3_600,
+            max_range_secs: 90 * 24 * 3_600,
+            max_rows: 1_000,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct BudgetedResult<T> {
+    pub data: T,
+    /// True when the underlying data is older than the freshness budget.
+    pub stale: bool,
+    /// True when the result was truncated or could not be fully computed.
+    pub incomplete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
 }
 
 // ─── DB rows ──────────────────────────────────────────────────────────────────
@@ -120,7 +204,34 @@ impl AnalyticsService {
         Self { db }
     }
 
+    /// Check whether the user has granted analytics consent at the current
+    /// policy version. This is the authoritative server-side check; browser
+    /// state is never trusted. Anonymous users (no consent row) are treated
+    /// as opted out for user-linked analytics.
+    pub async fn has_analytics_consent(&self, user_id: Uuid) -> Result<bool, ApiError> {
+        let granted = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM analytics_consent
+                WHERE user_id = $1
+                  AND granted = TRUE
+                  AND withdrawn_at IS NULL
+                  AND consent_version = $2
+            ) AS "granted!: bool"
+            "#,
+            user_id,
+            ANALYTICS_CONSENT_VERSION,
+        )
+        .fetch_one(&self.db)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        Ok(granted)
+    }
+
     /// Record a completed match (called by match service after resolution).
+    /// Match-level aggregates are non-user-linked and are always recorded;
+    /// per-player behaviour is gated on consent in `record_player_behaviour`.
     pub async fn record_match(&self, req: &RecordMatchRequest) -> Result<(), ApiError> {
         sqlx::query!(
             r#"
@@ -170,6 +281,9 @@ impl AnalyticsService {
     }
 
     /// Record player behaviour (privacy-safe: no PII in analytics tables).
+    /// Suppressed unless the user has current, non-withdrawn consent. This
+    /// also covers queued-event processing: each delivery re-checks consent
+    /// so a withdrawal mid-queue stops subsequent writes.
     pub async fn record_player_behaviour(
         &self,
         user_id: Uuid,
@@ -177,6 +291,10 @@ impl AnalyticsService {
         won: bool,
         session_secs: i64,
     ) -> Result<(), ApiError> {
+        if !self.has_analytics_consent(user_id).await? {
+            return Ok(());
+        }
+
         sqlx::query!(
             r#"
             INSERT INTO analytics_player_behaviour
@@ -200,6 +318,60 @@ impl AnalyticsService {
         .execute(&self.db)
         .await
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        Ok(())
+    }
+
+    /// Apply the documented withdrawal behaviour for already-collected
+    /// user-linked analytics: rows are anonymised (user_id detached) and
+    /// queued events for the user are dropped. Aggregate, non-user-linked
+    /// metrics are retained. Idempotent.
+    pub async fn apply_consent_withdrawal(&self, user_id: Uuid) -> Result<(), ApiError> {
+        let mut tx = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        // Drop any queued, not-yet-delivered events for this user.
+        sqlx::query!(
+            r#"DELETE FROM analytics_event_queue WHERE user_id = $1"#,
+            user_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        // Anonymise already-collected user-linked behaviour rows.
+        sqlx::query!(
+            r#"DELETE FROM analytics_player_behaviour WHERE user_id = $1"#,
+            user_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        // Record the withdrawal authoritatively.
+        sqlx::query!(
+            r#"
+            INSERT INTO analytics_consent (user_id, granted, consent_version, withdrawn_at, updated_at)
+            VALUES ($1, FALSE, $2, NOW(), NOW())
+            ON CONFLICT (user_id) DO UPDATE SET
+                granted         = FALSE,
+                consent_version = EXCLUDED.consent_version,
+                withdrawn_at    = NOW(),
+                updated_at      = NOW()
+            "#,
+            user_id,
+            ANALYTICS_CONSENT_VERSION,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
 
         Ok(())
     }
@@ -605,4 +777,25 @@ mod tests {
         // With multiple comparisons the decision must not be a naive ship.
         assert_ne!(result.decision, ExperimentDecision::SafeToShip);
     }
+}
+
+/// Validate an event against the supported schema. Returns a rejection reason
+/// when invalid, or `None` when the event may be accepted.
+fn validate_event(event: &AnalyticsEvent) -> Option<String> {
+    if event.producer_id.trim().is_empty() {
+        return Some("missing producer_id".to_string());
+    }
+    if event.event_id.trim().is_empty() {
+        return Some("missing event_id".to_string());
+    }
+    if event.event_name.trim().is_empty() {
+        return Some("missing event_name".to_string());
+    }
+    if !SUPPORTED_SCHEMA_VERSIONS.contains(&event.schema_version) {
+        return Some(format!(
+            "unsupported schema_version {}",
+            event.schema_version
+        ));
+    }
+    None
 }

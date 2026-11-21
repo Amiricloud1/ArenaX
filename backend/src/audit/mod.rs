@@ -86,6 +86,62 @@ pub enum AuditError {
     IntegrityViolation { index: usize },
 }
 
+/// Why a privileged operator session was rejected at the submission boundary.
+///
+/// These reasons are recorded in the audit log so that rejected requests remain
+/// attributable and tamper-evident, even though the action never executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRejectionReason {
+    /// The session had expired by the time the action reached submission.
+    Expired,
+    /// The session was revoked (possibly while the action was queued).
+    Revoked,
+    /// The session's scope does not cover the requested action/target.
+    WrongScope,
+    /// The session's bound actor does not match the requesting actor.
+    ActorMismatch,
+    /// The session's purpose does not permit the requested action.
+    WrongPurpose,
+    /// The session is missing a required approval reference.
+    MissingApproval,
+    /// The session could not be found in the session store.
+    UnknownSession,
+}
+
+impl SessionRejectionReason {
+    /// Stable machine-readable code for audit and API responses.
+    pub fn code(&self) -> &'static str {
+        match self {
+            SessionRejectionReason::Expired => "session_expired",
+            SessionRejectionReason::Revoked => "session_revoked",
+            SessionRejectionReason::WrongScope => "session_wrong_scope",
+            SessionRejectionReason::ActorMismatch => "session_actor_mismatch",
+            SessionRejectionReason::WrongPurpose => "session_wrong_purpose",
+            SessionRejectionReason::MissingApproval => "session_missing_approval",
+            SessionRejectionReason::UnknownSession => "session_unknown",
+        }
+    }
+}
+
+/// A stored, immutable record of a rejected privileged request.
+///
+/// Rejected requests are chained into the same hash chain as accepted actions so
+/// that attempts to act outside a valid session are themselves auditable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectedActionRecord {
+    pub seq: u64,
+    pub actor_id: String,
+    pub actor_role: OperatorRole,
+    pub action: SensitiveAction,
+    pub target: String,
+    /// Session identifier the request claimed to act under, if any.
+    pub session_id: Option<String>,
+    pub reason: SessionRejectionReason,
+    pub prev_hash: String,
+    pub hash: String,
+}
+
 /// A stored, immutable audit record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditRecord {
@@ -105,6 +161,7 @@ pub struct AuditRecord {
 #[derive(Debug, Default)]
 pub struct AuditLog {
     records: Vec<AuditRecord>,
+    rejections: Vec<RejectedActionRecord>,
 }
 
 const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -171,6 +228,21 @@ fn compute_hash(record: &AuditRecord) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+fn compute_rejection_hash(record: &RejectedActionRecord) -> String {
+    let mut hasher = Sha256::new();
+    // Domain-separate rejection hashes from accepted-action hashes.
+    hasher.update(b"rejected_action");
+    hasher.update(record.seq.to_le_bytes());
+    hasher.update(record.actor_id.as_bytes());
+    hasher.update(format!("{:?}", record.actor_role).as_bytes());
+    hasher.update(format!("{:?}", record.action).as_bytes());
+    hasher.update(record.target.as_bytes());
+    hasher.update(record.session_id.as_deref().unwrap_or("").as_bytes());
+    hasher.update(record.reason.code().as_bytes());
+    hasher.update(record.prev_hash.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
 impl AuditLog {
     pub fn new() -> Self {
         Self::default()
@@ -213,6 +285,47 @@ impl AuditLog {
         Ok(self.records.last().expect("just pushed"))
     }
 
+    /// Record a rejected privileged request so the denial is attributable.
+    ///
+    /// Rejections share the hash chain with accepted actions: the `prev_hash`
+    /// links to the most recent entry of either kind, so removing or reordering
+    /// a rejection breaks [`AuditLog::verify_integrity`].
+    pub fn record_rejection(
+        &mut self,
+        actor: &Actor,
+        action: SensitiveAction,
+        target: &str,
+        session_id: Option<&str>,
+        reason: SessionRejectionReason,
+    ) -> Result<&RejectedActionRecord, AuditError> {
+        if actor.id.trim().is_empty() {
+            return Err(AuditError::Unauthenticated);
+        }
+
+        let seq = (self.records.len() + self.rejections.len()) as u64;
+        let prev_hash = self
+            .rejections
+            .last()
+            .map(|r| r.hash.clone())
+            .or_else(|| self.records.last().map(|r| r.hash.clone()))
+            .unwrap_or_else(|| GENESIS_HASH.to_string());
+
+        let mut record = RejectedActionRecord {
+            seq,
+            actor_id: actor.id.clone(),
+            actor_role: actor.role,
+            action,
+            target: target.to_string(),
+            session_id: session_id.map(str::to_string),
+            reason,
+            prev_hash,
+            hash: String::new(),
+        };
+        record.hash = compute_rejection_hash(&record);
+        self.rejections.push(record);
+        Ok(self.rejections.last().expect("just pushed"))
+    }
+
     /// Read-only search over the audit log. Never mutates records.
     pub fn search(&self, actor: &Actor, query: &str) -> Result<Vec<&AuditRecord>, AuditError> {
         if actor.id.trim().is_empty() {
@@ -235,22 +348,57 @@ impl AuditLog {
     }
 
     /// Verify the hash chain is intact; detects tampering of any record.
+    ///
+    /// Accepted actions and rejections form a single interleaved chain ordered
+    /// by `seq`, so neither kind can be silently dropped or reordered.
     pub fn verify_integrity(&self) -> Result<(), AuditError> {
         let mut expected_prev = GENESIS_HASH.to_string();
-        for (index, record) in self.records.iter().enumerate() {
-            if record.prev_hash != expected_prev {
-                return Err(AuditError::IntegrityViolation { index });
+        let mut next_seq: u64 = 0;
+
+        let mut actions = self.records.iter().peekable();
+        let mut rejections = self.rejections.iter().peekable();
+
+        loop {
+            let take_action = match (actions.peek(), rejections.peek()) {
+                (Some(a), Some(r)) => a.seq <= r.seq,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+
+            let index = next_seq as usize;
+            if take_action {
+                let record = actions.next().expect("peeked");
+                if record.seq != next_seq
+                    || record.prev_hash != expected_prev
+                    || compute_hash(record) != record.hash
+                {
+                    return Err(AuditError::IntegrityViolation { index });
+                }
+                expected_prev = record.hash.clone();
+            } else {
+                let record = rejections.next().expect("peeked");
+                if record.seq != next_seq
+                    || record.prev_hash != expected_prev
+                    || compute_rejection_hash(record) != record.hash
+                {
+                    return Err(AuditError::IntegrityViolation { index });
+                }
+                expected_prev = record.hash.clone();
             }
-            if compute_hash(record) != record.hash {
-                return Err(AuditError::IntegrityViolation { index });
-            }
-            expected_prev = record.hash.clone();
+            next_seq += 1;
         }
+
         Ok(())
     }
 
     pub fn records(&self) -> &[AuditRecord] {
         &self.records
+    }
+
+    /// Immutable view of rejected privileged requests.
+    pub fn rejections(&self) -> &[RejectedActionRecord] {
+        &self.rejections
     }
 }
 
@@ -315,5 +463,96 @@ mod tests {
         log.record(req(OperatorRole::Admin, SensitiveAction::Moderation, Some("spam"))).unwrap();
         let hits = log.search(&actor(OperatorRole::Support), "spam").unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn records_rejection_with_reason_and_session() {
+        let mut log = AuditLog::new();
+        let rec = log
+            .record_rejection(
+                &actor(OperatorRole::Admin),
+                SensitiveAction::Payout,
+                "user-42",
+                Some("sess-1"),
+                SessionRejectionReason::Expired,
+            )
+            .unwrap()
+            .clone();
+        assert_eq!(rec.reason, SessionRejectionReason::Expired);
+        assert_eq!(rec.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(rec.seq, 0);
+        assert!(log.verify_integrity().is_ok());
+    }
+
+    #[test]
+    fn rejection_requires_actor() {
+        let mut log = AuditLog::new();
+        let anon = Actor { id: "  ".into(), role: OperatorRole::Admin };
+        assert_eq!(
+            log.record_rejection(
+                &anon,
+                SensitiveAction::Moderation,
+                "user-42",
+                None,
+                SessionRejectionReason::Revoked,
+            ),
+            Err(AuditError::Unauthenticated)
+        );
+        assert!(log.rejections().is_empty());
+    }
+
+    #[test]
+    fn interleaved_chain_detects_tampering_of_rejection() {
+        let mut log = AuditLog::new();
+        log.record(req(OperatorRole::Admin, SensitiveAction::FeatureFlag, None)).unwrap();
+        log.record_rejection(
+            &actor(OperatorRole::Admin),
+            SensitiveAction::Payout,
+            "user-42",
+            Some("sess-1"),
+            SessionRejectionReason::Revoked,
+        )
+        .unwrap();
+        log.record(req(OperatorRole::Admin, SensitiveAction::Moderation, Some("ok"))).unwrap();
+        assert!(log.verify_integrity().is_ok());
+
+        // Mutating a rejection's reason must break the chain.
+        log.rejections[0].reason = SessionRejectionReason::WrongScope;
+        assert!(log.verify_integrity().is_err());
+    }
+
+    #[test]
+    fn dropped_rejection_breaks_chain() {
+        let mut log = AuditLog::new();
+        log.record_rejection(
+            &actor(OperatorRole::Admin),
+            SensitiveAction::Payout,
+            "user-42",
+            None,
+            SessionRejectionReason::WrongScope,
+        )
+        .unwrap();
+        log.record(req(OperatorRole::Admin, SensitiveAction::Moderation, Some("ok"))).unwrap();
+        assert!(log.verify_integrity().is_ok());
+
+        log.rejections.clear();
+        assert!(log.verify_integrity().is_err());
+    }
+
+    #[test]
+    fn rejection_reasons_have_distinct_codes() {
+        let reasons = [
+            SessionRejectionReason::Expired,
+            SessionRejectionReason::Revoked,
+            SessionRejectionReason::WrongScope,
+            SessionRejectionReason::ActorMismatch,
+            SessionRejectionReason::WrongPurpose,
+            SessionRejectionReason::MissingApproval,
+            SessionRejectionReason::UnknownSession,
+        ];
+        let mut codes: Vec<&str> = reasons.iter().map(|r| r.code()).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes.len(), reasons.len());
     }
 }

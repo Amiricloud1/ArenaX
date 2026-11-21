@@ -8,6 +8,7 @@ import {
   generateErrorId,
   serializeError,
 } from "./errors";
+import { redact } from "../../lib/telemetry";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -263,4 +264,83 @@ export function clearLoggedErrors(): void {
 
 export function getErrorSummary(): ErrorSummary {
   return errorLogger.getSummary();
+}
+
+// ─── Privacy-safe client error reporting ─────────────────────────────────────
+
+/**
+ * Context accepted by {@link reportClientError}. Only allow-listed, non-sensitive
+ * fields are forwarded to telemetry; everything else is dropped.
+ */
+export interface ClientErrorContext {
+  /** Correlation ID shared with the error boundary / server logs. */
+  correlationId?: string;
+  /** Route or route group where the failure occurred (e.g. "/checkout"). */
+  route?: string;
+  /** Coarse phase of the failure (render, data-loading, action, etc.). */
+  phase?: string;
+  /** Whether the boundary already attempted a recovery action. */
+  recoveryAttempted?: boolean;
+  /** Arbitrary extra fields — passed through `redact` before sending. */
+  extra?: Record<string, unknown>;
+}
+
+/** Keys that must never leave the browser, regardless of value. */
+const SENSITIVE_KEY_PATTERN =
+  /(token|secret|password|passwd|authorization|auth|cookie|session|api[-_]?key|card|cvv|cvc|pan|iban|account|routing|payment|billing|ssn|email|phone|form|body|payload|request|response)/i;
+
+function isSensitiveKey(key: string): boolean {
+  return SENSITIVE_KEY_PATTERN.test(key);
+}
+
+/**
+ * Recursively strip sensitive keys and redact string values. Never throws.
+ */
+function sanitize(value: unknown, depth = 0): unknown {
+  if (depth > 6) return "[truncated]";
+  if (value == null) return value;
+  if (typeof value === "string") return redact(value);
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) return value.slice(0, 50).map((v) => sanitize(v, depth + 1));
+  if (typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (isSensitiveKey(k)) {
+        out[k] = "[redacted]";
+      } else {
+        out[k] = sanitize(v, depth + 1);
+      }
+    }
+    return out;
+  }
+  return String(value);
+}
+
+/**
+ * Report a client-side error to telemetry without leaking tokens, payment
+ * details, raw form contents, request bodies, or the raw error message.
+ *
+ * Returns the correlation ID so callers can surface it to the user.
+ */
+export function reportClientError(error: unknown, context: ClientErrorContext = {}): string {
+  const correlationId = context.correlationId ?? generateErrorId();
+  const err = error instanceof Error ? error : new Error(String(error ?? "Unknown error"));
+
+  // Deliberately exclude `error.message` and any request/response bodies.
+  const safeMetadata: Record<string, unknown> = {
+    correlationId,
+    route: context.route ? redact(context.route) : undefined,
+    phase: context.phase,
+    recoveryAttempted: context.recoveryAttempted ?? false,
+    errorName: err.name,
+    extra: context.extra ? sanitize(context.extra) : undefined,
+  };
+
+  try {
+    errorLogger.logError(err, safeMetadata);
+  } catch {
+    // Reporting must never cascade into another failure.
+  }
+
+  return correlationId;
 }

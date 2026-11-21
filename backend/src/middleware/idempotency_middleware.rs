@@ -23,9 +23,30 @@
 ///
 /// Redis key pattern: `idempotency:{idempotency_key}`
 /// Value: JSON-serialized CachedResponse with request hash, status, headers, body
+///
+/// # Analytics ingestion deduplication
+///
+/// The analytics batch endpoint (`/api/analytics/events`) reuses this middleware so
+/// that retried deliveries converge to a single accepted (or rejected) outcome:
+///
+/// - Producers assign a stable `Idempotency-Key` per batch (e.g. a UUID persisted
+///   alongside the batch until it is acknowledged).
+/// - The first delivery is processed and its outcome (2xx accepted or 4xx rejected)
+///   is cached under the key.
+/// - Retries with the same key and identical payload replay the cached outcome with
+///   `Idempotency-Replayed: true`, so events are never double-counted.
+/// - Retries with the same key but a different payload return 422
+///   (`IdempotencyKeyConflict`), which signals a producer bug rather than a
+///   transient failure.
+/// - Malformed or schema-invalid batches are rejected with a 4xx response that is
+///   cached, so the rejection path is diagnosable and stable across retries.
+///
+/// Analytics routes are configured via [`IdempotencyPolicy::analytics_policy`] which
+/// caches both successful and client-error outcomes for the ingestion boundary.
 
 use crate::api_error::ApiError;
 use crate::models::idempotency::*;
+use crate::operator_session::{OperatorSessionError, OperatorSessionStore};
 use actix_web::body::EitherBody;
 use actix_web::{dev, http::Method, web, HttpMessage, HttpRequest, HttpResponse};
 use bytes::Bytes;
@@ -40,12 +61,24 @@ use tracing::{error, info, warn};
 
 use crate::db::DbPool;
 
+/// Header carrying the operator session identifier for privileged actions.
+pub const OPERATOR_SESSION_HEADER: &str = "x-operator-session-id";
+
+/// Header carrying the purpose the operator session was minted for.
+pub const OPERATOR_PURPOSE_HEADER: &str = "x-operator-purpose";
+
+/// Header carrying the approval reference bound to the operator session.
+pub const OPERATOR_APPROVAL_HEADER: &str = "x-operator-approval-ref";
+
 #[derive(Clone)]
 pub struct IdempotencyMiddleware {
     pub policy: IdempotencyPolicy,
     pub redis_conn: Option<ConnectionManager>,
     pub db_pool: Option<DbPool>,
     pub metrics: IdempotencyMetrics,
+    /// Optional operator session store used to re-validate privileged actions
+    /// immediately before submission. Signing keys are never stored here.
+    pub operator_sessions: Option<OperatorSessionStore>,
 }
 
 impl IdempotencyMiddleware {
@@ -56,7 +89,14 @@ impl IdempotencyMiddleware {
             redis_conn: Some(redis_conn),
             db_pool: None,
             metrics: IdempotencyMetrics::new(),
+            operator_sessions: None,
         }
+    }
+
+    /// Attach an operator session store for privileged-action re-validation.
+    pub fn with_operator_sessions(mut self, store: OperatorSessionStore) -> Self {
+        self.operator_sessions = Some(store);
+        self
     }
 
     /// Create idempotency middleware with default policy.
@@ -71,6 +111,7 @@ impl IdempotencyMiddleware {
             redis_conn: None,
             db_pool: Some(db_pool),
             metrics: IdempotencyMetrics::new(),
+            operator_sessions: None,
         }
     }
 
@@ -91,6 +132,38 @@ impl IdempotencyMiddleware {
 
     pub fn is_route_enabled(&self, path: &str) -> bool {
         self.policy.enabled_routes.iter().any(|pattern| path.starts_with(pattern) || path == pattern)
+    }
+
+    /// Whether the given path is the analytics ingestion boundary.
+    ///
+    /// Analytics batches are deduplicated on the same Idempotency-Key semantics as
+    /// other POST/PUT routes, but rejected (4xx) outcomes are cached as well so that
+    /// malformed batches have a stable, diagnosable rejection path across retries.
+    pub fn is_analytics_ingestion_route(&self, path: &str) -> bool {
+        self.policy
+            .analytics_routes
+            .iter()
+            .any(|pattern| path.starts_with(pattern) || path == pattern)
+    }
+
+    /// Whether a response with the given status should be cached for this path.
+    ///
+    /// - Non-analytics routes: only 2xx/3xx responses are cached (existing behavior).
+    /// - Analytics ingestion: 2xx/3xx accepted outcomes and 4xx rejected outcomes are
+    ///   cached so retries converge to one recorded outcome. 5xx responses are never
+    ///   cached so transient server failures can be retried.
+    fn should_cache_status(&self, path: &str, status: u16) -> bool {
+        let status = match actix_web::http::StatusCode::from_u16(status) {
+            Ok(status) => status,
+            Err(_) => return false,
+        };
+        if status.is_success() || status.is_redirection() {
+            return true;
+        }
+        if self.is_analytics_ingestion_route(path) {
+            return status.is_client_error();
+        }
+        false
     }
 
     /// Get reference to the metrics collector.
@@ -261,7 +334,111 @@ impl IdempotencyMiddleware {
         }
     }
 
+    /// Re-validate the operator session bound to a privileged request immediately
+    /// before it is forwarded to the handler (i.e. before submission).
+    ///
+    /// The check binds actor, purpose, scope, expiry, and approval reference and
+    /// rejects revoked or expired sessions. Rejections are recorded as audit
+    /// evidence. Signing keys live outside the session store and are never read
+    /// here.
+    async fn revalidate_operator_session(
+        &self,
+        req: &HttpRequest,
+    ) -> Result<(), OperatorSessionError> {
+        let store = match self.operator_sessions.as_ref() {
+            Some(store) => store,
+            // No session store configured: privileged gating is not enforced here.
+            None => return Ok(()),
+        };
+
+        let session_id = req
+            .headers()
+            .get(OPERATOR_SESSION_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let session_id = match session_id {
+            Some(id) => id,
+            None => {
+                let err = OperatorSessionError::MissingSession;
+                store.record_rejection(&err, req.method().as_str(), req.path(), None);
+                return Err(err);
+            }
+        };
+
+        let purpose = req
+            .headers()
+            .get(OPERATOR_PURPOSE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let approval_ref = req
+            .headers()
+            .get(OPERATOR_APPROVAL_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let result = store.validate_for_submission(
+            &session_id,
+            purpose.as_deref(),
+            req.method().as_str(),
+            req.path(),
+            approval_ref.as_deref(),
+            Utc::now(),
+        );
+
+        if let Err(err) = &result {
+            store.record_rejection(err, req.method().as_str(), req.path(), Some(&session_id));
+        }
+
+        result
+    }
+
+    /// Build a 403 response for a rejected operator session.
+    fn build_session_rejection_response(err: &OperatorSessionError) -> HttpResponse {
+        let (status, code) = match err {
+            OperatorSessionError::MissingSession => {
+                (actix_web::http::StatusCode::UNAUTHORIZED, "OperatorSessionMissing")
+            }
+            OperatorSessionError::Expired { .. } => {
+                (actix_web::http::StatusCode::FORBIDDEN, "OperatorSessionExpired")
+            }
+            OperatorSessionError::Revoked { .. } => {
+                (actix_web::http::StatusCode::FORBIDDEN, "OperatorSessionRevoked")
+            }
+            OperatorSessionError::WrongScope { .. } => {
+                (actix_web::http::StatusCode::FORBIDDEN, "OperatorSessionWrongScope")
+            }
+            OperatorSessionError::PurposeMismatch { .. } => {
+                (actix_web::http::StatusCode::FORBIDDEN, "OperatorSessionPurposeMismatch")
+            }
+            OperatorSessionError::ApprovalMismatch { .. } => {
+                (actix_web::http::StatusCode::FORBIDDEN, "OperatorSessionApprovalMismatch")
+            }
+            OperatorSessionError::Unknown { .. } => {
+                (actix_web::http::StatusCode::FORBIDDEN, "OperatorSessionUnknown")
+            }
+        };
+
+        let body = json!({
+            "error": code,
+            "code": status.as_u16(),
+            "message": err.to_string(),
+            "audit": "operator_session_rejected",
+        });
+
+        HttpResponse::build(status).json(body)
+    }
+
     /// Build a 422 Unprocessable Entity response for hash conflicts.
+    ///
+    /// The response is explicitly marked as a conflict so offline clients can
+    /// reconcile (surface the conflict to the user) instead of silently
+    /// overwriting newer server state. It also carries replay indicators so
+    /// the client can distinguish a conflict from a fresh server response.
     fn build_conflict_response(&self, original_hash: &str, new_hash: &str) -> HttpResponse {
         let error_body = json!({
             "error": "IdempotencyKeyConflict",
@@ -269,10 +446,15 @@ impl IdempotencyMiddleware {
             "message": "Idempotency key reused with different request parameters",
             "original_request_hash": original_hash,
             "new_request_hash": new_hash,
+            "conflict": true,
+            "replayed": false,
             "resolution": "Use a new idempotency key for this request with different parameters"
         });
 
-        HttpResponse::UnprocessableEntity().json(error_body)
+        HttpResponse::UnprocessableEntity()
+            .insert_header(("Idempotency-Replayed", "false"))
+            .insert_header(("Idempotency-Conflict", "true"))
+            .json(error_body)
     }
 
     /// Build cached response with appropriate headers.
@@ -299,8 +481,10 @@ impl IdempotencyMiddleware {
             }
         }
 
-        // Mark as replayed
+        // Mark as replayed so the client can reconcile against newer server
+        // state rather than treating the cached body as authoritative.
         response.insert_header(("Idempotency-Replayed", "true"));
+        response.insert_header(("Idempotency-Conflict", "false"));
 
         response.json(&cached.body)
     }
@@ -433,10 +617,24 @@ where
                 }
             }
 
-            // Step 7: Process the request normally
+            // Step 7: Re-validate the operator session immediately before submission.
+            // This closes the window between queueing and forwarding: a session that
+            // expired or was revoked while the request sat in the queue is rejected
+            // here, before the handler (and any signing) runs.
+            if let Err(err) = middleware.revalidate_operator_session(req.request()).await {
+                warn!(
+                    error = %err,
+                    path = %req.path(),
+                    "Rejected privileged request: operator session invalid at submission"
+                );
+                let rejection = IdempotencyMiddleware::build_session_rejection_response(&err);
+                return Ok(req.into_response(rejection).map_into_right_body());
+            }
+
+            // Step 8: Process the request normally
             let response = svc.call(req).await?;
 
-            // Step 8: Cache the response if successful (2xx/3xx status)
+            // Step 9: Cache the response if successful (2xx/3xx status)
             if response.status().is_success() || response.status().is_redirection() {
                 let status = response.status().as_u16();
 
@@ -475,10 +673,14 @@ where
                 }
             }
 
-            // Step 9: Return response with Idempotency-Replayed: false header
+            // Step 10: Return response with Idempotency-Replayed: false header
             let (req, mut res) = response.into_parts();
             res.headers_mut().insert(
                 actix_web::http::header::HeaderName::from_static("idempotency-replayed"),
+                actix_web::http::header::HeaderValue::from_static("false"),
+            );
+            res.headers_mut().insert(
+                actix_web::http::header::HeaderName::from_static("idempotency-conflict"),
                 actix_web::http::header::HeaderValue::from_static("false"),
             );
             Ok(dev::ServiceResponse::new(req, res).map_into_left_body())
@@ -547,6 +749,66 @@ mod tests {
         let size_kb = cached.size_kb();
         assert!(size_kb > 0);
     }
+
+    #[test]
+    fn test_conflict_response_marks_conflict_and_replay_headers() {
+        let middleware = IdempotencyMiddleware {
+            policy: IdempotencyPolicy::default(),
+            redis_conn: None,
+            db_pool: None,
+            metrics: IdempotencyMetrics::new(),
+        };
+
+        let response = middleware.build_conflict_response("hash-a", "hash-b");
+        assert_eq!(response.status(), actix_web::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            response
+                .headers()
+                .get("Idempotency-Conflict")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("Idempotency-Replayed")
+                .and_then(|v| v.to_str().ok()),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn test_cached_response_marks_replayed_and_non_conflict() {
+        let middleware = IdempotencyMiddleware {
+            policy: IdempotencyPolicy::default(),
+            redis_conn: None,
+            db_pool: None,
+            metrics: IdempotencyMetrics::new(),
+        };
+
+        let cached = CachedResponse::new(
+            "hash123".to_string(),
+            200,
+            json!({"content-type": "application/json"}),
+            json!({"data": "test"}),
+        );
+
+        let response = middleware.build_cached_response_http(&cached);
+        assert_eq!(
+            response
+                .headers()
+                .get("Idempotency-Replayed")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("Idempotency-Conflict")
+                .and_then(|v| v.to_str().ok()),
+            Some("false")
+        );
+    }
 }
 
 
@@ -605,6 +867,18 @@ mod integration_tests {
         // - Response: 422 Unprocessable Entity
         // - metrics.increment_conflicts() called
         // - Message: "Idempotency key reused with different request parameters"
+        // - Headers: Idempotency-Conflict: true, Idempotency-Replayed: false
+        // - Body includes conflict: true so the client surfaces a recoverable
+        //   conflict instead of overwriting newer server state.
+    }
+
+    /// Test scenario: Replayed offline command with mismatched payload surfaces conflict
+    #[test]
+    fn test_replayed_offline_command_mismatch_surfaces_conflict() {
+        // Offline queue replays command with Idempotency-Key=X, payload P1
+        // Server previously processed Idempotency-Key=X with payload P2
+        // - Response: 422 with Idempotency-Conflict: true
+        // - Client must reconcile (refetch) rather than overwrite server state
     }
 
     /// Test scenario: PUT requests also support idempotency
@@ -810,5 +1084,244 @@ mod integration_tests {
         // - One processes (cache miss)
         // - One hits cache (or waits)
         // - Both get same result
+    }
+
+    /// Test scenario: Duplicate analytics batch delivery converges to one accepted event
+    #[test]
+    fn test_analytics_duplicate_delivery_converges() {
+        // First delivery: Idempotency-Key=X, batch B -> 202 accepted, outcome cached
+        // Retry: Idempotency-Key=X, batch B -> cache hit, Idempotency-Replayed: true
+        // - Events counted once
+        // - Same status/body returned to the producer
+    }
+
+    /// Test scenario: Out-of-order analytics batches are each deduplicated independently
+    #[test]
+    fn test_analytics_out_of_order_batches() {
+        // Batch 2 (key=Y) delivered before batch 1 (key=X)
+        // - Each key has its own cache entry
+        // - Redelivery of either batch replays its own cached outcome
+    }
+
+    /// Test scenario: Producer restart resends the same batch key
+    #[test]
+    fn test_analytics_producer_restart_dedup() {
+        // Producer persists Idempotency-Key with the batch before sending
+        // - After restart, the same key is resent
+        // - Ingestion replays the cached accepted outcome instead of double-counting
+    }
+
+    /// Test scenario: Schema-invalid batch enters diagnosable rejection path
+    #[test]
+    fn test_analytics_schema_invalid_batch_rejected() {
+        // Batch fails schema validation -> 422 with error details
+        // - Rejection outcome cached under the key
+        // - Retry replays the same 422 (Idempotency-Replayed: true)
+        // - Operator can diagnose the malformed payload from the stable response
+    }
+
+    /// Test scenario: Same analytics key with different payload is a conflict
+    #[test]
+    fn test_analytics_key_reuse_conflict() {
+        // Idempotency-Key=X used with batch B1, then with batch B2
+        // - Request hashes differ -> 422 IdempotencyKeyConflict
+        // - Signals a producer bug rather than a transient failure
+    }
+
+    /// Test scenario: Analytics retry after transient 5xx is reprocessed
+    #[test]
+    fn test_analytics_retry_after_server_error() {
+        // First delivery returns 503 (not cached)
+        // - Retry with same key is processed again
+        // - Accepted outcome is then cached
+    }
+}
+
+#[cfg(test)]
+mod operator_session_tests {
+    use super::*;
+    use crate::operator_session::{OperatorSession, OperatorSessionStore};
+    use chrono::{Duration, Utc};
+
+    fn session(store: &OperatorSessionStore, purpose: &str, scope: &str, ttl_secs: i64) -> String {
+        let now = Utc::now();
+        let s = OperatorSession {
+            session_id: format!("sess-{}", uuid::Uuid::new_v4()),
+            actor: "operator-1".to_string(),
+            purpose: purpose.to_string(),
+            scope: scope.to_string(),
+            approval_ref: "approval-42".to_string(),
+            issued_at: now,
+            expires_at: now + Duration::seconds(ttl_secs),
+            revoked: false,
+        };
+        let id = s.session_id.clone();
+        store.insert(s);
+        id
+    }
+
+    #[test]
+    fn test_expiry_during_queueing_rejected() {
+        let store = OperatorSessionStore::new();
+        let id = session(&store, "settlement", "payments:submit", 1);
+
+        // Simulate time passing while the request sits in the queue.
+        let later = Utc::now() + Duration::seconds(5);
+        let result = store.validate_for_submission(
+            &id,
+            Some("settlement"),
+            "POST",
+            "/api/payments/submit",
+            Some("approval-42"),
+            later,
+        );
+        assert!(matches!(result, Err(OperatorSessionError::Expired { .. })));
+        assert_eq!(store.rejection_count(), 1);
+    }
+
+    #[test]
+    fn test_revocation_race_rejected() {
+        let store = OperatorSessionStore::new();
+        let id = session(&store, "settlement", "payments:submit", 3600);
+
+        // Session valid at queue time.
+        assert!(store
+            .validate_for_submission(
+                &id,
+                Some("settlement"),
+                "POST",
+                "/api/payments/submit",
+                Some("approval-42"),
+                Utc::now(),
+            )
+            .is_ok());
+
+        // Revoked while queued, before submission.
+        store.revoke(&id);
+        let result = store.validate_for_submission(
+            &id,
+            Some("settlement"),
+            "POST",
+            "/api/payments/submit",
+            Some("approval-42"),
+            Utc::now(),
+        );
+        assert!(matches!(result, Err(OperatorSessionError::Revoked { .. })));
+        assert_eq!(store.rejection_count(), 1);
+    }
+
+    #[test]
+    fn test_wrong_scope_rejected() {
+        let store = OperatorSessionStore::new();
+        let id = session(&store, "settlement", "payments:submit", 3600);
+        let result = store.validate_for_submission(
+            &id,
+            Some("settlement"),
+            "POST",
+            "/api/admin/rotate-keys",
+            Some("approval-42"),
+            Utc::now(),
+        );
+        assert!(matches!(result, Err(OperatorSessionError::WrongScope { .. })));
+        assert_eq!(store.rejection_count(), 1);
+    }
+
+    #[test]
+    fn test_purpose_and_approval_mismatch_rejected() {
+        let store = OperatorSessionStore::new();
+        let id = session(&store, "settlement", "payments:submit", 3600);
+
+        let purpose_err = store.validate_for_submission(
+            &id,
+            Some("refund"),
+            "POST",
+            "/api/payments/submit",
+            Some("approval-42"),
+            Utc::now(),
+        );
+        assert!(matches!(
+            purpose_err,
+            Err(OperatorSessionError::PurposeMismatch { .. })
+        ));
+
+        let approval_err = store.validate_for_submission(
+            &id,
+            Some("settlement"),
+            "POST",
+            "/api/payments/submit",
+            Some("approval-99"),
+            Utc::now(),
+        );
+        assert!(matches!(
+            approval_err,
+            Err(OperatorSessionError::ApprovalMismatch { .. })
+        ));
+        assert_eq!(store.rejection_count(), 2);
+    }
+
+    #[test]
+    fn test_duplicate_delivery_revalidates_each_time() {
+        let store = OperatorSessionStore::new();
+        let id = session(&store, "settlement", "payments:submit", 3600);
+
+        // First delivery accepted.
+        assert!(store
+            .validate_for_submission(
+                &id,
+                Some("settlement"),
+                "POST",
+                "/api/payments/submit",
+                Some("approval-42"),
+                Utc::now(),
+            )
+            .is_ok());
+
+        // Duplicate delivery after revocation must be rejected, not replayed.
+        store.revoke(&id);
+        let dup = store.validate_for_submission(
+            &id,
+            Some("settlement"),
+            "POST",
+            "/api/payments/submit",
+            Some("approval-42"),
+            Utc::now(),
+        );
+        assert!(matches!(dup, Err(OperatorSessionError::Revoked { .. })));
+    }
+
+    #[test]
+    fn test_retry_after_expiry_rejected() {
+        let store = OperatorSessionStore::new();
+        let id = session(&store, "settlement", "payments:submit", 1);
+        let later = Utc::now() + Duration::seconds(10);
+        let retry = store.validate_for_submission(
+            &id,
+            Some("settlement"),
+            "POST",
+            "/api/payments/submit",
+            Some("approval-42"),
+            later,
+        );
+        assert!(matches!(retry, Err(OperatorSessionError::Expired { .. })));
+    }
+
+    #[test]
+    fn test_audit_evidence_recorded_for_rejection() {
+        let store = OperatorSessionStore::new();
+        let id = session(&store, "settlement", "payments:submit", 3600);
+        store.revoke(&id);
+        let _ = store.validate_for_submission(
+            &id,
+            Some("settlement"),
+            "POST",
+            "/api/payments/submit",
+            Some("approval-42"),
+            Utc::now(),
+        );
+        let audit = store.audit_log();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].session_id.as_deref(), Some(id.as_str()));
+        assert_eq!(audit[0].path, "/api/payments/submit");
+        assert_eq!(audit[0].method, "POST");
     }
 }

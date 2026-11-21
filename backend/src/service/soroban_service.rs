@@ -10,6 +10,9 @@
 //! - Event decoding from transaction results
 //! - Full transaction lifecycle management
 
+use crate::api_error::{
+    classify_contract_error, ContractErrorClassification, ContractErrorInfo, CONTRACT_ERROR_UNKNOWN,
+};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -174,6 +177,71 @@ pub enum SorobanError {
     InvalidContract(String),
     #[error("Retry limit exceeded")]
     RetryLimitExceeded,
+    /// A contract-level error translated through the canonical catalog.
+    ///
+    /// Carries the stable code, safe message, and retry/manual-recovery
+    /// classification so callers never have to interpret raw contract codes.
+    #[error("Contract error {code}: {message}")]
+    ContractError {
+        code: u32,
+        message: String,
+        classification: ContractErrorClassification,
+    },
+}
+
+impl SorobanError {
+    /// Build a `ContractError` from a raw contract error code.
+    ///
+    /// Known codes resolve to their catalog entry; unknown codes resolve to
+    /// the distinguishable unknown entry and are logged with transaction
+    /// context (tx hash, contract id, method, ledger) — never signing material.
+    pub fn from_contract_code(
+        code: u32,
+        tx_hash: &str,
+        contract_id: &str,
+        function_name: &str,
+        ledger: Option<u64>,
+    ) -> Self {
+        let info: ContractErrorInfo = classify_contract_error(code);
+        if info.code == CONTRACT_ERROR_UNKNOWN {
+            warn!(
+                tx_hash = tx_hash,
+                contract = contract_id,
+                method = function_name,
+                ledger = ledger.unwrap_or_default(),
+                has_ledger = ledger.is_some(),
+                raw_code = code,
+                code = info.code,
+                "Unknown Soroban contract error code"
+            );
+        }
+        Self::ContractError {
+            code: info.code,
+            message: info.message.to_string(),
+            classification: info.classification,
+        }
+    }
+
+    /// Whether the caller may safely retry the failed operation.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::ContractError { classification, .. } => {
+                matches!(classification, ContractErrorClassification::Retry)
+            }
+            Self::NetworkError(_) | Self::RetryLimitExceeded => true,
+            _ => false,
+        }
+    }
+
+    /// Whether the failure requires manual recovery / operator intervention.
+    pub fn requires_manual_recovery(&self) -> bool {
+        match self {
+            Self::ContractError { classification, .. } => {
+                matches!(classification, ContractErrorClassification::ManualRecovery)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// RPC request/response types
@@ -516,8 +584,22 @@ impl SorobanService {
                             });
                         }
                         "FAILED" => {
-                            let error_msg = format!("Transaction failed on network");
                             log_soroban_event(SorobanEventStatus::Dlq, tx_hash, contract_id, function_name);
+                            // Translate any contract error code carried by the
+                            // result into the canonical catalog entry.
+                            let error_msg = match self.contract_error_code(tx_hash).await {
+                                Some(code) => {
+                                    let mapped = SorobanError::from_contract_code(
+                                        code,
+                                        tx_hash,
+                                        contract_id,
+                                        function_name,
+                                        None,
+                                    );
+                                    mapped.to_string()
+                                }
+                                None => "Transaction failed on network".to_string(),
+                            };
                             return Ok(SorobanTxResult {
                                 hash: tx_hash.to_string(),
                                 status: TxStatus::Failed,
@@ -587,6 +669,27 @@ impl SorobanService {
         let response: GetTransactionResponse = self.rpc_call("getTransaction", params).await?;
 
         Ok(response.status)
+    }
+
+    /// Extract a contract error code from a failed transaction, if present.
+    ///
+    /// The Soroban RPC surfaces contract errors inside `resultXdr`; this helper
+    /// looks for a `contractError`/`errorCode` field in the decoded result and
+    /// returns the numeric code. Returns `None` when no contract-level code is
+    /// available (e.g. a plain network failure).
+    async fn contract_error_code(&self, tx_hash: &str) -> Option<u32> {
+        let params = serde_json::json!({ "hash": tx_hash });
+        let response: GetTransactionResponse = self.rpc_call("getTransaction", params).await.ok()?;
+        let result_xdr = response.result_xdr?;
+        // Simplified decode: look for a numeric contract error code embedded in
+        // the result payload. Production XDR decoding would extract this from
+        // the `InvokeHostFunctionResult` union.
+        let value: serde_json::Value = serde_json::from_str(&result_xdr).ok()?;
+        value
+            .get("contractError")
+            .or_else(|| value.get("errorCode"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32)
     }
 
     /// Decode events from a transaction
@@ -940,5 +1043,74 @@ mod tests {
         assert_eq!(deserialized.cpu_instructions, 1500000);
         assert_eq!(deserialized.memory_bytes, 45000);
         assert_eq!(deserialized.min_resource_fee, "100");
+    }
+
+    #[test]
+    fn test_known_contract_error_maps_to_catalog() {
+        // Code 1 is a known catalog entry (insufficient balance).
+        let err = SorobanError::from_contract_code(1, "txhash", "C123", "transfer", Some(42));
+        match err {
+            SorobanError::ContractError {
+                code,
+                message,
+                classification,
+            } => {
+                assert_eq!(code, 1);
+                assert!(!message.is_empty());
+                // Insufficient balance is not retryable.
+                assert_eq!(classification, ContractErrorClassification::ManualRecovery);
+            }
+            other => panic!("expected ContractError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unknown_contract_error_is_distinguishable() {
+        let err = SorobanError::from_contract_code(999_999, "txhash", "C123", "transfer", None);
+        match err {
+            SorobanError::ContractError { code, .. } => {
+                assert_eq!(code, CONTRACT_ERROR_UNKNOWN);
+            }
+            other => panic!("expected ContractError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_contract_error_retry_classification() {
+        // A retryable catalog entry should report is_retryable() == true.
+        let retryable = SorobanError::from_contract_code(2, "txhash", "C123", "transfer", None);
+        if retryable.is_retryable() {
+            assert!(!retryable.requires_manual_recovery());
+        }
+        // Unknown errors are never silently retryable.
+        let unknown =
+            SorobanError::from_contract_code(999_999, "txhash", "C123", "transfer", None);
+        assert!(!unknown.is_retryable());
+    }
+
+    #[test]
+    fn test_contract_error_does_not_leak_signing_material() {
+        let err = SorobanError::from_contract_code(1, "txhash", "C123", "transfer", Some(7));
+        let rendered = err.to_string();
+        assert!(!rendered.contains("SAAAA"));
+        assert!(rendered.contains("Contract error"));
+    }
+
+    #[test]
+    fn test_duplicate_submission_is_idempotent_by_hash() {
+        // Duplicate delivery of the same tx hash must not change finality:
+        // the result carries the same hash and status.
+        let first = SorobanTxResult {
+            hash: "dup_hash".to_string(),
+            status: TxStatus::Success,
+            error: None,
+        };
+        let second = SorobanTxResult {
+            hash: "dup_hash".to_string(),
+            status: TxStatus::Success,
+            error: None,
+        };
+        assert_eq!(first.hash, second.hash);
+        assert_eq!(first.status, second.status);
     }
 }

@@ -1,4 +1,64 @@
 // Tournament-related types
+
+/**
+ * Watermark describing the realtime stream position a snapshot was taken at.
+ * Clients must apply subsequent websocket events only when their sequence is
+ * exactly `sequence + 1`; anything else is a gap or a stale event and requires
+ * a replacement snapshot.
+ */
+export interface TournamentStreamWatermark {
+  /** Monotonic server-side sequence number for the tournament stream. */
+  sequence: number;
+  /** Server timestamp (ISO 8601) at which the snapshot was produced. */
+  snapshotAt: string;
+  /** Optional opaque stream identifier (e.g. per-tournament channel). */
+  streamId?: string;
+}
+
+/**
+ * Snapshot envelope returned by tournament read endpoints. `watermark` is the
+ * stream position from which subsequent events can be applied.
+ */
+export interface TournamentSnapshot<T> {
+  data: T;
+  watermark: TournamentStreamWatermark;
+}
+
+/** How an optimistic mutation should be rolled back when it fails. */
+export type RollbackStrategy =
+  | 'none'
+  | 'restore_previous'
+  | 'refetch_resource'
+  | 'invalidate_and_refetch';
+
+/** How a mutation resolves conflicts with newer authoritative server state. */
+export type ConflictStrategy =
+  | 'server_wins'
+  | 'reject_if_stale'
+  | 'client_wins'
+  | 'manual_reconcile';
+
+/**
+ * Metadata every tournament mutation declares so the client can centralize
+ * rollback/reconciliation and decide whether it may be queued offline.
+ */
+export interface OptimisticMutationMeta {
+  /** Whether the UI applies the change before server confirmation. */
+  optimistic: boolean;
+  /** Safe rollback/refetch strategy for each affected resource. */
+  rollback: RollbackStrategy;
+  /** Conflict resolution when server state is newer than the local view. */
+  conflict: ConflictStrategy;
+  /** Resources (cache keys) affected by the mutation. */
+  affects: string[];
+  /** Whether the mutation may be queued for offline replay. */
+  offlineQueueable: boolean;
+  /** Idempotency key required for queueable mutations. */
+  idempotencyKey?: string;
+  /** Expiry (ISO 8601) after which a queued command must not be replayed. */
+  expiresAt?: string;
+}
+
 export interface Tournament {
   id: string;
   name: string;

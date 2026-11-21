@@ -994,193 +994,135 @@ model ApiKey {
   @@index([userId])
 }
 
-enum ExperimentStatus {
-  DRAFT
-  RUNNING
-  PAUSED
-  STOPPED
-  COMPLETED
+// ---------------------------------------------------------------------------
+// Product analytics: durable event identity, deduplication and rejection path
+// ---------------------------------------------------------------------------
+
+enum AnalyticsEventStatus {
+  ACCEPTED
+  REJECTED
 }
 
-enum ExperimentStopReason {
-  GUARDRAIL_HARM
-  GUARDRAIL_INCONCLUSIVE
-  MANUAL
-  SCHEDULE_ENDED
-  INSUFFICIENT_SAMPLE
+// One row per accepted event. The (producerId, eventId) unique constraint is
+// the durable deduplication boundary: retries of the same event converge to a
+// single accepted row regardless of delivery order or producer restarts.
+model AnalyticsEvent {
+  id             String               @id @default(uuid())
+  producerId     String
+  eventId        String
+  eventName      String
+  schemaVersion  String
+  status         AnalyticsEventStatus @default(ACCEPTED)
+  occurredAt     DateTime
+  receivedAt     DateTime             @default(now())
+  // Anonymous analytics subject reference; never a raw auth identifier.
+  subjectRef     String?
+  // Event properties only. Identity links are stored separately.
+  payload        Json                 @default("{}")
+  requestHash    String?              @db.Char(64)
+  createdAt      DateTime             @default(now())
+
+  @@unique([producerId, eventId])
+  @@index([eventName, occurredAt])
+  @@index([subjectRef, occurredAt])
+  @@index([schemaVersion])
+  @@index([receivedAt])
 }
 
-model ExperimentDefinition {
-  id                 String           @id @default(uuid())
-  key                String           @unique
-  name               String
+// Diagnosable rejection path for malformed / schema-invalid events. Kept in a
+// separate table so rejected deliveries never pollute accepted event data.
+model AnalyticsEventRejection {
+  id            String   @id @default(uuid())
+  producerId    String
+  eventId       String?
+  eventName     String?
+  schemaVersion String?
+  reason        String   // e.g. MALFORMED_JSON, SCHEMA_INVALID, UNKNOWN_SCHEMA_VERSION
+  detail        String?
+  rawPayload    Json?
+  receivedAt    DateTime @default(now())
+  createdAt     DateTime @default(now())
+
+  @@index([producerId, eventId])
+  @@index([reason])
+  @@index([receivedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Privacy-safe identity stitching (kept separate from event payloads)
+// ---------------------------------------------------------------------------
+
+enum AnalyticsIdentityLinkStatus {
+  ACTIVE
+  REVOKED
+}
+
+// Purpose-limited, consent-aware link between an anonymous analytics subject
+// and an authenticated account. Account identity is referenced by an opaque
+// accountRef (not the raw user id / email / auth identifier) so exported
+// analytics never exposes raw authentication identifiers.
+model AnalyticsIdentityLink {
+  id             String                       @id @default(uuid())
+  anonymousRef   String
+  accountRef     String
+  purpose        String                       @default("PRODUCT_ANALYTICS")
+  consentVersion String?
+  status         AnalyticsIdentityLinkStatus  @default(ACTIVE)
+  linkedAt       DateTime                     @default(now())
+  revokedAt      DateTime?
+  // Deterministic merge semantics: the earliest link wins on collision.
+  mergedIntoRef  String?
+  metadata       Json                         @default("{}")
+  createdAt      DateTime                     @default(now())
+  updatedAt      DateTime                     @updatedAt
+
+  @@unique([anonymousRef, accountRef, purpose])
+  @@index([anonymousRef, status])
+  @@index([accountRef, status])
+  @@index([purpose])
+  @@index([revokedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Governed metric catalog
+// ---------------------------------------------------------------------------
+
+enum MetricPrivacyClass {
+  PUBLIC
+  INTERNAL
+  CONFIDENTIAL
+  RESTRICTED
+}
+
+enum MetricDeprecationState {
+  ACTIVE
+  DEPRECATED
+  RETIRED
+}
+
+model MetricCatalogEntry {
+  id                 String                 @id @default(uuid())
+  name               String                 @unique
+  displayName        String
   description        String?
-  status             ExperimentStatus @default(DRAFT)
-  version            Int              @default(1)
-  // Deterministic assignment configuration
-  scope              String           @default("global")
-  salt               String
-  trafficAllocation  Decimal          @default(1) @db.Decimal(5, 4)
-  holdoutPercent     Decimal          @default(0) @db.Decimal(5, 4)
-  variants           Json             @default("[]")
-  exclusionRules     Json             @default("[]")
-  requiresConsent    Boolean          @default(true)
-  // Guardrail analysis configuration
-  primaryMetric      String
-  guardrailMetrics   Json             @default("[]")
-  minimumSample      Int              @default(0)
-  analysisWindowDays Int              @default(14)
-  stopThresholds     Json             @default("{}")
-  startedAt          DateTime?
-  stoppedAt          DateTime?
-  stopReason         ExperimentStopReason?
-  createdAt          DateTime         @default(now())
-  updatedAt          DateTime         @updatedAt
-  deletedAt          DateTime?
-  assignments        ExperimentAssignment[]
-  exposures          ExperimentExposure[]
-  guardrailSamples   GuardrailMetricSample[]
+  owner              String
+  queryDefinition    String
+  sourceEvents       String[]               @default([])
+  sourceTables       String[]               @default([])
+  freshnessSeconds   Int?
+  privacyClass       MetricPrivacyClass     @default(INTERNAL)
+  deprecationState   MetricDeprecationState @default(ACTIVE)
+  definitionVersion  Int                    @default(1)
+  definitionHash     String?                @db.Char(64)
+  reviewedBy         String?
+  reviewedAt         DateTime?
+  deprecatedAt       DateTime?
+  metadata           Json                   @default("{}")
+  createdAt          DateTime               @default(now())
+  updatedAt          DateTime               @updatedAt
 
-  @@index([status])
-  @@index([deletedAt])
-}
-
-model ExperimentAssignment {
-  id            String               @id @default(uuid())
-  experimentId  String
-  experiment    ExperimentDefinition @relation(fields: [experimentId], references: [id], onDelete: Cascade)
-  userId        String
-  user          User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
-  variant       String
-  assignmentVersion Int              @default(1)
-  bucket        Int
-  isHoldout     Boolean              @default(false)
-  assignedAt    DateTime             @default(now())
-  metadata      Json                 @default("{}")
-  exposures     ExperimentExposure[]
-
-  @@unique([experimentId, userId])
-  @@index([experimentId, variant])
-  @@index([userId])
-}
-
-model ExperimentExposure {
-  id           String               @id @default(uuid())
-  experimentId String
-  experiment   ExperimentDefinition @relation(fields: [experimentId], references: [id], onDelete: Cascade)
-  assignmentId String
-  assignment   ExperimentAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
-  userId       String
-  user         User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
-  variant      String
-  surface      String
-  sessionId    String?
-  exposedAt    DateTime             @default(now())
-  metadata     Json                 @default("{}")
-
-  @@index([experimentId, exposedAt])
-  @@index([assignmentId])
-  @@index([userId])
-}
-
-model GuardrailMetricSample {
-  id           String               @id @default(uuid())
-  experimentId String
-  experiment   ExperimentDefinition @relation(fields: [experimentId], references: [id], onDelete: Cascade)
-  metric       String
-  variant      String
-  value        Decimal              @db.Decimal(20, 7)
-  sampleCount  Int                  @default(1)
-  windowStart  DateTime
-  windowEnd    DateTime
-  metadata     Json                 @default("{}")
-  createdAt    DateTime             @default(now())
-
-  @@index([experimentId, metric, variant])
-  @@index([windowStart, windowEnd])
-}
-
-model LeaderboardSnapshot {
-  id            String                    @id @default(uuid())
-  leaderboardId String
-  leaderboard   Leaderboard               @relation(fields: [leaderboardId], references: [id], onDelete: Cascade)
-  version       Int
-  generatedAt   DateTime                  @default(now())
-  expiresAt     DateTime
-  entryCount    Int                       @default(0)
-  metadata      Json                      @default("{}")
-  entries       LeaderboardSnapshotEntry[]
-
-  @@unique([leaderboardId, version])
-  @@index([leaderboardId, generatedAt])
-  @@index([expiresAt])
-}
-
-model LeaderboardSnapshotEntry {
-  id         String              @id @default(uuid())
-  snapshotId String
-  snapshot   LeaderboardSnapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
-  userId     String
-  rank       Int
-  score      Decimal             @db.Decimal(20, 7)
-  tieBreak   String
-  metadata   Json                @default("{}")
-
-  @@unique([snapshotId, userId])
-  @@index([snapshotId, rank])
-  @@index([userId])
-}
-
-enum PrivacyDeletionStatus {
-  PENDING
-  IN_PROGRESS
-  AWAITING_RETENTION
-  COMPLETED
-  FAILED
-}
-
-enum PrivacyDeletionTargetStatus {
-  PENDING
-  ACKNOWLEDGED
-  RETRYING
-  FAILED
-  RETAINED
-}
-
-model PrivacyDeletionJob {
-  id             String                @id @default(uuid())
-  userId         String
-  user           User?                 @relation(fields: [userId], references: [id], onDelete: SetNull)
-  status         PrivacyDeletionStatus @default(PENDING)
-  requestedBy    String?
-  reason         String?
-  requestedAt    DateTime              @default(now())
-  completedAt    DateTime?
-  attemptCount   Int                   @default(0)
-  lastAttemptAt  DateTime?
-  metadata       Json                  @default("{}")
-  acknowledgements PrivacyDeletionAcknowledgement[]
-
-  @@index([userId])
-  @@index([status])
-  @@index([requestedAt])
-}
-
-model PrivacyDeletionAcknowledgement {
-  id           String                    @id @default(uuid())
-  jobId        String
-  job          PrivacyDeletionJob        @relation(fields: [jobId], references: [id], onDelete: Cascade)
-  system       String
-  status       PrivacyDeletionTargetStatus @default(PENDING)
-  attemptCount Int                       @default(0)
-  lastAttemptAt DateTime?
-  acknowledgedAt DateTime?
-  retentionUntil DateTime?
-  errorCode    String?
-  metadata     Json                      @default("{}")
-  updatedAt    DateTime                  @updatedAt
-
-  @@unique([jobId, system])
-  @@index([jobId, status])
+  @@index([owner])
+  @@index([privacyClass])
+  @@index([deprecationState])
 }
 

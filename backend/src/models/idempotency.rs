@@ -45,6 +45,12 @@ pub struct IdempotencyConflict {
     pub new_hash: String,
     pub original_timestamp: DateTime<Utc>,
     pub conflict_type: ConflictType,
+    /// User scope of the stored (original) record, when known.
+    pub original_user_scope: Option<String>,
+    /// User scope of the incoming request, when known.
+    pub new_user_scope: Option<String>,
+    /// Strategy that was applied (or should be applied) to resolve the conflict.
+    pub conflict_strategy: ConflictStrategy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +59,106 @@ pub enum ConflictType {
     MethodMismatch,
     RouteMismatch,
     UserMismatch,
+    /// The stored record has expired and can no longer be replayed.
+    Expired,
+}
+
+/// How a replay should behave when it collides with existing server state.
+///
+/// Offline command queues must declare one of these strategies per command so
+/// that replay surfaces conflicts instead of silently overwriting newer state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictStrategy {
+    /// Reject the replay and surface the conflict to the caller.
+    Reject,
+    /// Return the originally cached response without re-applying the mutation.
+    ReturnCached,
+    /// Only apply if the server state has not changed since the command was queued.
+    FailIfStale,
+}
+
+impl Default for ConflictStrategy {
+    fn default() -> Self {
+        Self::Reject
+    }
+}
+
+impl ConflictStrategy {
+    /// Parse a strategy from its wire representation, defaulting to `Reject`.
+    pub fn from_wire(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "return_cached" => Self::ReturnCached,
+            "fail_if_stale" => Self::FailIfStale,
+            _ => Self::Reject,
+        }
+    }
+}
+
+/// User scope attached to an idempotency record so that logout or account
+/// switch can purge only the commands belonging to that scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdempotencyUserScope {
+    /// Stable identifier of the authenticated user.
+    pub user_id: String,
+    /// Optional session/device identifier to further narrow the scope.
+    pub session_id: Option<String>,
+}
+
+impl IdempotencyUserScope {
+    pub fn new(user_id: impl Into<String>) -> Self {
+        Self {
+            user_id: user_id.into(),
+            session_id: None,
+        }
+    }
+
+    pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Canonical string form used for storage and comparison.
+    pub fn as_scope_key(&self) -> String {
+        match &self.session_id {
+            Some(session) => format!("{}:{}", self.user_id, session),
+            None => self.user_id.clone(),
+        }
+    }
+}
+
+/// Metadata describing a queued offline command.
+///
+/// Every queued command must declare an idempotency key, an expiry, a user
+/// scope and a conflict strategy. Commands that cannot be safely replayed
+/// (payments, match actions, etc.) must be rejected from offline mode.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfflineCommandMetadata {
+    pub idempotency_key: String,
+    pub expires_at: DateTime<Utc>,
+    pub user_scope: IdempotencyUserScope,
+    pub conflict_strategy: ConflictStrategy,
+}
+
+impl OfflineCommandMetadata {
+    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        now >= self.expires_at
+    }
+
+    /// Validate the metadata against the current time and user scope.
+    pub fn validate(
+        &self,
+        now: DateTime<Utc>,
+        current_scope: &IdempotencyUserScope,
+    ) -> Result<(), ConflictType> {
+        if self.is_expired(now) {
+            return Err(ConflictType::Expired);
+        }
+        if self.user_scope != *current_scope {
+            return Err(ConflictType::UserMismatch);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +205,12 @@ pub struct CachedResponse {
     pub headers: serde_json::Value,
     pub body: serde_json::Value,
     pub created_at: DateTime<Utc>,
+    /// User scope the cached response belongs to, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_scope: Option<String>,
+    /// Conflict strategy declared by the queued command, when known.
+    #[serde(default)]
+    pub conflict_strategy: ConflictStrategy,
 }
 
 impl CachedResponse {
@@ -114,7 +226,20 @@ impl CachedResponse {
             headers,
             body,
             created_at: Utc::now(),
+            user_scope: None,
+            conflict_strategy: ConflictStrategy::default(),
         }
+    }
+
+    /// Attach the user scope and conflict strategy to a cached response.
+    pub fn with_scope_and_strategy(
+        mut self,
+        user_scope: impl Into<String>,
+        conflict_strategy: ConflictStrategy,
+    ) -> Self {
+        self.user_scope = Some(user_scope.into());
+        self.conflict_strategy = conflict_strategy;
+        self
     }
 
     pub fn size_bytes(&self) -> usize {
@@ -221,4 +346,83 @@ pub struct IdempotencyMetricsSnapshot {
     pub conflicts: u64,
     pub redis_errors: u64,
     pub hit_rate: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    fn scope() -> IdempotencyUserScope {
+        IdempotencyUserScope::new("user-1").with_session("session-a")
+    }
+
+    fn metadata(expires_at: DateTime<Utc>) -> OfflineCommandMetadata {
+        OfflineCommandMetadata {
+            idempotency_key: "key-1".to_string(),
+            expires_at,
+            user_scope: scope(),
+            conflict_strategy: ConflictStrategy::Reject,
+        }
+    }
+
+    #[test]
+    fn scope_key_includes_session_when_present() {
+        assert_eq!(scope().as_scope_key(), "user-1:session-a");
+        assert_eq!(IdempotencyUserScope::new("user-2").as_scope_key(), "user-2");
+    }
+
+    #[test]
+    fn conflict_strategy_parses_wire_values() {
+        assert_eq!(ConflictStrategy::from_wire("return_cached"), ConflictStrategy::ReturnCached);
+        assert_eq!(ConflictStrategy::from_wire("FAIL_IF_STALE"), ConflictStrategy::FailIfStale);
+        assert_eq!(ConflictStrategy::from_wire("unknown"), ConflictStrategy::Reject);
+    }
+
+    #[test]
+    fn metadata_rejects_expired_commands() {
+        let now = Utc::now();
+        let expired = metadata(now - Duration::seconds(1));
+        assert_eq!(expired.validate(now, &scope()), Err(ConflictType::Expired));
+    }
+
+    #[test]
+    fn metadata_rejects_account_switch() {
+        let now = Utc::now();
+        let meta = metadata(now + Duration::hours(1));
+        let other = IdempotencyUserScope::new("user-2");
+        assert_eq!(meta.validate(now, &other), Err(ConflictType::UserMismatch));
+        assert!(meta.validate(now, &scope()).is_ok());
+    }
+
+    #[test]
+    fn cached_response_carries_scope_and_strategy() {
+        let cached = CachedResponse::new(
+            "hash".to_string(),
+            200,
+            serde_json::json!({}),
+            serde_json::json!({"ok": true}),
+        )
+        .with_scope_and_strategy("user-1", ConflictStrategy::FailIfStale);
+
+        assert_eq!(cached.user_scope.as_deref(), Some("user-1"));
+        assert_eq!(cached.conflict_strategy, ConflictStrategy::FailIfStale);
+    }
+
+    #[test]
+    fn conflict_serializes_scope_and_strategy() {
+        let conflict = IdempotencyConflict {
+            key: "key-1".to_string(),
+            original_hash: "a".to_string(),
+            new_hash: "b".to_string(),
+            original_timestamp: Utc::now(),
+            conflict_type: ConflictType::UserMismatch,
+            original_user_scope: Some("user-1".to_string()),
+            new_user_scope: Some("user-2".to_string()),
+            conflict_strategy: ConflictStrategy::Reject,
+        };
+        let json = serde_json::to_value(&conflict).unwrap();
+        assert_eq!(json["conflict_strategy"], "reject");
+        assert_eq!(json["original_user_scope"], "user-1");
+    }
 }
