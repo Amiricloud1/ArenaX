@@ -8,6 +8,21 @@ use uuid::Uuid;
 const PROFILE_CACHE_VERSION: &str = "v1";
 const PROFILE_CACHE_TTL_SECONDS: u64 = 60;
 
+/// Maximum accepted avatar upload size (5 MiB).
+pub const AVATAR_MAX_UPLOAD_BYTES: usize = 5 * 1024 * 1024;
+/// Maximum accepted source image dimensions (width or height).
+pub const AVATAR_MAX_SOURCE_DIMENSION: u32 = 4096;
+/// Bounded derivative dimensions produced by the pipeline.
+pub const AVATAR_DERIVATIVE_SIZES: [u32; 3] = [64, 128, 256];
+/// Allowed MIME types for avatar uploads.
+pub const AVATAR_ALLOWED_MIME_TYPES: [&str; 3] = ["image/jpeg", "image/png", "image/webp"];
+/// Stable processing states exposed to clients.
+pub const AVATAR_STATE_PENDING: &str = "pending";
+pub const AVATAR_STATE_PROCESSING: &str = "processing";
+pub const AVATAR_STATE_READY: &str = "ready";
+pub const AVATAR_STATE_REJECTED: &str = "rejected";
+pub const AVATAR_STATE_FAILED: &str = "failed";
+
 use crate::api_error::ApiError;
 use crate::models::match_models::{EloHistory, UserElo};
 use crate::models::user::{User, UserProfile};
@@ -999,4 +1014,81 @@ pub struct UserStats {
     pub win_streak: i32,
     pub loss_streak: i32,
     pub elo_history: Vec<EloHistory>,
+}
+
+#[cfg(test)]
+mod avatar_pipeline_tests {
+    use super::*;
+
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&[0, 0, 0, 13]); // IHDR length
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes
+    }
+
+    #[test]
+    fn rejects_empty_payload() {
+        assert!(validate_avatar_payload("image/png", &[]).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_payload() {
+        let mut bytes = png_header(10, 10);
+        bytes.resize(AVATAR_MAX_UPLOAD_BYTES + 1, 0);
+        assert!(validate_avatar_payload("image/png", &bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_disallowed_declared_type() {
+        let bytes = png_header(10, 10);
+        assert!(validate_avatar_payload("image/gif", &bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_mime_spoofing() {
+        // Declared PNG but payload is JPEG magic.
+        let bytes = vec![0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0];
+        assert!(validate_avatar_payload("image/png", &bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_payload() {
+        let bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
+        assert!(validate_avatar_payload("image/png", &bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_dimensions() {
+        let bytes = png_header(AVATAR_MAX_SOURCE_DIMENSION + 1, 10);
+        assert!(validate_avatar_payload("image/png", &bytes).is_err());
+    }
+
+    #[test]
+    fn accepts_valid_png() {
+        let bytes = png_header(512, 512);
+        let validated = validate_avatar_payload("image/png", &bytes).expect("valid");
+        assert_eq!(validated.mime, "image/png");
+        assert_eq!((validated.width, validated.height), (512, 512));
+    }
+
+    #[test]
+    fn strips_jpeg_metadata_segments() {
+        // SOI, APP1 (EXIF), then a minimal SOF0 + SOS.
+        let mut bytes = vec![0xFF, 0xD8];
+        bytes.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x08, 1, 2, 3, 4, 5, 6]);
+        bytes.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02]);
+        let cleaned = strip_image_metadata("image/jpeg", &bytes);
+        assert!(!cleaned.windows(2).any(|w| w == [0xFF, 0xE1]));
+        assert!(cleaned.starts_with(&[0xFF, 0xD8]));
+    }
+
+    #[test]
+    fn derivative_dimensions_are_bounded() {
+        assert_eq!(bounded_derivative_dimensions(1024, 512, 256), (256, 128));
+        assert_eq!(bounded_derivative_dimensions(100, 100, 256), (100, 100));
+        assert_eq!(bounded_derivative_dimensions(0, 0, 256), (0, 0));
+    }
 }

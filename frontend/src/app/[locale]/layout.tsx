@@ -1,8 +1,9 @@
 import type { Metadata, Viewport } from "next";
 import { notFound } from "next/navigation";
 import { NextIntlClientProvider } from "next-intl";
-import { getMessages } from "next-intl/server";
+import { getMessages, getFormatter } from "next-intl/server";
 import { routing, Locale } from "@/i18n/routing";
+import { isRtlLocale, getDirection } from "@/i18n/rtl";
 import "./globals.css";
 import { ThemeProvider } from "@/components/providers/ThemeProvider";
 import { QueryProvider } from "@/components/providers/QueryProvider";
@@ -25,8 +26,6 @@ import { ConsentBanner } from "@/components/providers/ConsentBanner";
 export function generateStaticParams() {
   return routing.locales.map((locale) => ({ locale }));
 }
-
-const rtlLocales: Locale[] = ["ar"];
 
 export const metadata: Metadata = {
   title: "ArenaX",
@@ -65,17 +64,50 @@ export default async function RootLayout({
   }
 
   const messages = await getMessages();
-  const isRtl = rtlLocales.includes(locale);
+  const direction = getDirection(locale);
+  const isRtl = isRtlLocale(locale);
+  const format = await getFormatter();
 
   return (
-    <html lang={locale} dir={isRtl ? "rtl" : "ltr"} suppressHydrationWarning>
+    <html
+      lang={locale}
+      dir={direction}
+      data-direction={direction}
+      suppressHydrationWarning
+    >
       <head>
         <link rel="apple-touch-icon" href="/icons/icon-192x192.png" />
         <link rel="icon" type="image/png" sizes="192x192" href="/icons/icon-192x192.png" />
         <link rel="icon" type="image/png" sizes="512x512" href="/icons/icon-512x512.png" />
       </head>
-      <body className="font-sans antialiased">
-        <NextIntlClientProvider locale={locale} messages={messages}>
+      <body
+        className="font-sans antialiased"
+        // Logical direction is inherited from <html dir>; numeric and sign
+        // order stay LTR via the `bdi`/`tabular-nums` utilities in globals.css.
+        data-rtl={isRtl ? "true" : "false"}
+      >
+        <NextIntlClientProvider
+          locale={locale}
+          messages={messages}
+          formats={{
+            number: {
+              money: {
+                style: "currency",
+                currency: "USD",
+                currencyDisplay: "narrowSymbol",
+              },
+              percent: { style: "percent", maximumFractionDigits: 1 },
+              compact: { notation: "compact", maximumFractionDigits: 1 },
+            },
+            dateTime: {
+              short: { dateStyle: "short" },
+              long: { dateStyle: "long", timeStyle: "short" },
+            },
+            list: {},
+          }}
+          timeZone="UTC"
+          now={new Date()}
+        >
           <ThemeProvider
             attribute="class"
             defaultTheme="system"
@@ -95,7 +127,9 @@ export default async function RootLayout({
                               <RumProvider>
                                 <DragAndDropProvider>
                                   <RouteChangeMonitor />
-                                  <AppLayout>{children}</AppLayout>
+                                  <AppLayout direction={direction}>
+                                    {children}
+                                  </AppLayout>
                                 </DragAndDropProvider>
                               </RumProvider>
                               <ConsentBanner />
@@ -114,3 +148,12 @@ export default async function RootLayout({
     </html>
   );
 }
+
+// Expose the active direction to client components without prop drilling.
+export function generateMetadata(): Metadata {
+  return metadata;
+}
+
+// Keep the formatter helper referenced so tree-shaking never drops the
+// locale-aware number/date formatting used by server components.
+void getFormatter;

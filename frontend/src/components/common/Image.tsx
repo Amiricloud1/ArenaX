@@ -9,7 +9,7 @@
 /* eslint-disable @next/next/no-img-element */
 
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { ImageOff } from "lucide-react";
+import { ImageOff, Loader2, RefreshCw, Crop } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useReducedMotion } from "@/hooks/useReducedMotion";
 import { generateImageSizes } from "@/lib/imageLoader";
@@ -36,6 +36,21 @@ export const LQIP_WIDTH = 32;
 export const LQIP_QUALITY = 20;
 /** Default responsive widths generated for the srcset. */
 const DEFAULT_WIDTHS = [320, 420, 768, 1024, 1280, 1536];
+
+/**
+ * Stable processing state for avatar uploads/transformations (issue #246).
+ * `idle` renders normally; `processing` shows a stable indicator while the
+ * previous avatar stays visible; `error` shows a recoverable, accessible error.
+ */
+export type AvatarProcessingState = "idle" | "processing" | "error";
+
+/** Accessible, recoverable error surfaced when scanning/transformation fails. */
+export interface AvatarProcessingError {
+  /** Human-readable, non-technical message shown to the user. */
+  message: string;
+  /** Optional retry handler; renders a "Try again" control when provided. */
+  onRetry?: () => void;
+}
 
 export interface ProgressiveImageProps
   extends Omit<
@@ -68,6 +83,22 @@ export interface ProgressiveImageProps
   wrapperClassName?: string;
   /** Called once the full image has loaded. */
   onLoad?: () => void;
+  /**
+   * Avatar processing state (issue #246). When `processing`, the previous
+   * avatar remains rendered with a stable overlay indicator. When `error`,
+   * the previous avatar is preserved and a recoverable error is announced.
+   */
+  processingState?: AvatarProcessingState;
+  /** Recoverable error details shown when `processingState === "error"`. */
+  processingError?: AvatarProcessingError;
+  /** Accessible label for the crop control. Omit to hide the crop control. */
+  cropLabel?: string;
+  /** Invoked when the user activates the crop control. */
+  onCrop?: () => void;
+  /** Accessible label for the replace control. Omit to hide it. */
+  replaceLabel?: string;
+  /** Invoked when the user activates the replace control. */
+  onReplace?: () => void;
 }
 
 const isRemote = (src: string) => /^https?:\/\//i.test(src);
@@ -130,10 +161,17 @@ export function ProgressiveImage({
   style,
   width,
   height,
+  processingState = "idle",
+  processingError,
+  cropLabel,
+  onCrop,
+  replaceLabel,
+  onReplace,
   ...imgProps
 }: ProgressiveImageProps) {
   const prefersReducedMotion = useReducedMotion();
   const wrapperRef = useRef<HTMLDivElement>(null);
+  const replaceInputRef = useRef<HTMLInputElement>(null);
   // Start "in view" for priority images, or when IntersectionObserver is
   // unavailable (SSR / old browsers) so the image always eventually loads.
   const [inView, setInView] = useState(priority);
@@ -210,6 +248,29 @@ export function ProgressiveImage({
     ? ""
     : "transition-opacity duration-500 ease-out";
 
+  const isProcessing = processingState === "processing";
+  const hasError = processingState === "error";
+  const hasControls = Boolean(onCrop || onReplace);
+
+  // Keyboard/gamepad activation for the custom controls. Enter/Space and the
+  // common gamepad "A"/"X" mapped buttons (via keydown) all trigger activation.
+  const activateOnKey = useCallback(
+    (handler?: () => void) => (event: React.KeyboardEvent) => {
+      if (!handler) return;
+      if (
+        event.key === "Enter" ||
+        event.key === " " ||
+        event.key === "Spacebar" ||
+        event.key === "GamepadA" ||
+        event.key === "GamepadX"
+      ) {
+        event.preventDefault();
+        handler();
+      }
+    },
+    []
+  );
+
   return (
     <div
       ref={wrapperRef}
@@ -223,7 +284,8 @@ export function ProgressiveImage({
         height,
         ...style,
       }}
-      aria-busy={!loaded && !showBrokenState}
+      aria-busy={(!loaded && !showBrokenState) || isProcessing}
+      data-processing-state={processingState}
     >
       {/* LQIP / skeleton layer */}
       {!showBrokenState &&
@@ -290,6 +352,90 @@ export function ProgressiveImage({
         >
           <ImageOff className="h-6 w-6" aria-hidden="true" />
           <span className="text-xs">Image unavailable</span>
+        </div>
+      )}
+
+      {/* Processing overlay — previous avatar stays visible underneath. */}
+      {isProcessing && !showBrokenState && (
+        <div
+          className="absolute inset-0 flex items-center justify-center bg-black/40"
+          data-testid="avatar-processing"
+        >
+          <Loader2
+            className={cn(
+              "h-6 w-6 text-white",
+              !prefersReducedMotion && "animate-spin"
+            )}
+            aria-hidden="true"
+          />
+          <span role="status" aria-live="polite" className="sr-only">
+            Updating avatar…
+          </span>
+        </div>
+      )}
+
+      {/* Recoverable error — previous avatar is preserved, error is announced. */}
+      {hasError && !showBrokenState && (
+        <div
+          role="alert"
+          className="absolute inset-x-0 bottom-0 flex flex-col gap-1 bg-destructive/90 p-2 text-destructive-foreground"
+          data-testid="avatar-error"
+        >
+          <span className="text-xs">
+            {processingError?.message ?? "Couldn't update your avatar."}
+          </span>
+          {processingError?.onRetry && (
+            <button
+              type="button"
+              onClick={processingError.onRetry}
+              onKeyDown={activateOnKey(processingError.onRetry)}
+              className="inline-flex items-center gap-1 self-start rounded px-2 py-1 text-xs font-medium underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+            >
+              <RefreshCw className="h-3 w-3" aria-hidden="true" />
+              Try again
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Accessible crop / replace controls. */}
+      {hasControls && !showBrokenState && (
+        <div className="absolute inset-x-0 top-0 flex justify-end gap-1 p-1">
+          {onCrop && (
+            <button
+              type="button"
+              aria-label={cropLabel ?? "Crop avatar"}
+              onClick={onCrop}
+              onKeyDown={activateOnKey(onCrop)}
+              disabled={isProcessing}
+              className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-black/60 text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white disabled:opacity-50"
+            >
+              <Crop className="h-4 w-4" aria-hidden="true" />
+            </button>
+          )}
+          {onReplace && (
+            <>
+              <button
+                type="button"
+                aria-label={replaceLabel ?? "Replace avatar"}
+                onClick={() => replaceInputRef.current?.click()}
+                onKeyDown={activateOnKey(() => replaceInputRef.current?.click())}
+                disabled={isProcessing}
+                className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-black/60 text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white disabled:opacity-50"
+              >
+                <RefreshCw className="h-4 w-4" aria-hidden="true" />
+              </button>
+              <input
+                ref={replaceInputRef}
+                type="file"
+                accept="image/png,image/jpeg,image/webp"
+                className="sr-only"
+                tabIndex={-1}
+                aria-hidden="true"
+                onChange={() => onReplace()}
+              />
+            </>
+          )}
         </div>
       )}
 

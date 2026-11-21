@@ -5,6 +5,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useReducedMotion } from "@/hooks/useReducedMotion";
+import { useGamepadNavigation } from "@/hooks/useGamepadNavigation";
 
 interface ModalProps {
   isOpen: boolean;
@@ -59,6 +60,14 @@ export function Modal({
   const previousActiveElement = useRef<HTMLElement | null>(null);
   const prefersReducedMotion = useReducedMotion();
 
+  // Gamepad / switch input: B (back) or switch cancel exits the modal.
+  // Only the top-most modal should respond, so we gate on isOpen.
+  useGamepadNavigation({
+    enabled: isOpen,
+    onBack: closeOnEscape ? onClose : undefined,
+    onCancel: closeOnEscape ? onClose : undefined,
+  });
+
   // Store previously focused element when modal opens
   useEffect(() => {
     if (isOpen) {
@@ -71,32 +80,50 @@ export function Modal({
     if (!isOpen || !modalRef.current) return;
 
     const modal = modalRef.current;
-    const focusableElements = modal.querySelectorAll(
-      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
-    );
-    const firstFocusable = focusableElements[0] as HTMLElement;
-    const lastFocusable = focusableElements[focusableElements.length - 1] as HTMLElement;
+    const getFocusable = () =>
+      Array.from(
+        modal.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        )
+      ).filter((el) => el.offsetParent !== null || el === document.activeElement);
+
+    const focusableElements = getFocusable();
+    const firstFocusable = focusableElements[0];
+    const lastFocusable = focusableElements[focusableElements.length - 1];
 
     // Focus first element when modal opens
     if (firstFocusable) {
       firstFocusable.focus();
+    } else {
+      // Fallback: focus the dialog container itself so keyboard/gamepad users
+      // are not stranded outside the modal.
+      modal.focus();
     }
 
-    // Trap focus within modal
+    // Trap focus within modal (keyboard Tab/Shift+Tab)
     const handleTab = (e: KeyboardEvent) => {
       if (e.key !== "Tab") return;
 
+      const elements = getFocusable();
+      if (elements.length === 0) {
+        e.preventDefault();
+        modal.focus();
+        return;
+      }
+      const first = elements[0];
+      const last = elements[elements.length - 1];
+
       if (e.shiftKey) {
         // Shift + Tab
-        if (document.activeElement === firstFocusable) {
+        if (document.activeElement === first || document.activeElement === modal) {
           e.preventDefault();
-          lastFocusable?.focus();
+          last.focus();
         }
       } else {
         // Tab
-        if (document.activeElement === lastFocusable) {
+        if (document.activeElement === last) {
           e.preventDefault();
-          firstFocusable?.focus();
+          first.focus();
         }
       }
     };
@@ -201,9 +228,11 @@ export function Modal({
           >
             <motion.div
               ref={modalRef}
+              tabIndex={-1}
               {...contentMotionProps}
               className={cn(
                 "bg-background border rounded-lg shadow-xl pointer-events-auto w-full",
+                "focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
                 sizeClasses[size],
                 className
               )}
@@ -221,8 +250,9 @@ export function Modal({
                   )}
                   {showCloseButton && (
                     <button
+                      type="button"
                       onClick={onClose}
-                      className="text-muted-foreground hover:text-foreground transition-colors p-1 rounded-md hover:bg-muted"
+                      className="text-muted-foreground hover:text-foreground transition-colors p-1 rounded-md hover:bg-muted focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
                       aria-label="Close modal"
                     >
                       <X className="h-5 w-5" />

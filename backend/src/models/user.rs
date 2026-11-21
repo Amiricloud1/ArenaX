@@ -37,6 +37,92 @@ pub struct User {
     /// Soft-delete marker (GDPR/NDPR erasure). Set at account deletion;
     /// PII fields are anonymised and login is refused.
     pub deleted_at: Option<DateTime<Utc>>,
+    // Avatar pipeline state (privacy-safe upload/transformation).
+    /// Stable processing state of the most recent avatar upload attempt.
+    pub avatar_processing_state: Option<AvatarProcessingState>,
+    /// Bounded derivative URLs generated from the last successful upload.
+    /// The previous avatar (`avatar_url`) is only replaced once these are ready.
+    pub avatar_thumbnail_url: Option<String>,
+    pub avatar_medium_url: Option<String>,
+    /// User-visible, recoverable error from the last failed upload attempt.
+    pub avatar_processing_error: Option<String>,
+    /// Timestamp of the last avatar state transition (upload/scan/transform).
+    pub avatar_updated_at: Option<DateTime<Utc>>,
+}
+
+/// Stable, persisted processing state for the avatar pipeline.
+///
+/// Stored as a lowercase string in the database so the value is stable across
+/// deploys and readable by operators. The previous avatar remains intact for
+/// every state other than `Ready`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AvatarProcessingState {
+    /// Upload accepted; awaiting scan/transformation.
+    Pending,
+    /// Malware/content scan in progress.
+    Scanning,
+    /// Scan passed; generating bounded derivatives.
+    Transforming,
+    /// Derivatives ready; safe to render in public UI.
+    Ready,
+    /// Scan or transformation failed; previous avatar preserved.
+    Failed,
+}
+
+impl AvatarProcessingState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AvatarProcessingState::Pending => "pending",
+            AvatarProcessingState::Scanning => "scanning",
+            AvatarProcessingState::Transforming => "transforming",
+            AvatarProcessingState::Ready => "ready",
+            AvatarProcessingState::Failed => "failed",
+        }
+    }
+
+    /// Parse a persisted state string. Unknown values are treated as `Failed`
+    /// so an unexpected state never exposes an unprocessed original.
+    pub fn from_str_lossy(value: &str) -> Self {
+        match value {
+            "pending" => AvatarProcessingState::Pending,
+            "scanning" => AvatarProcessingState::Scanning,
+            "transforming" => AvatarProcessingState::Transforming,
+            "ready" => AvatarProcessingState::Ready,
+            _ => AvatarProcessingState::Failed,
+        }
+    }
+
+    /// Whether the pipeline has settled (no further transitions expected).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, AvatarProcessingState::Ready | AvatarProcessingState::Failed)
+    }
+
+    /// Whether derivatives from this state may be rendered publicly.
+    pub fn is_renderable(&self) -> bool {
+        matches!(self, AvatarProcessingState::Ready)
+    }
+}
+
+impl std::fmt::Display for AvatarProcessingState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AvatarProcessingState {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(AvatarProcessingState::Pending),
+            "scanning" => Ok(AvatarProcessingState::Scanning),
+            "transforming" => Ok(AvatarProcessingState::Transforming),
+            "ready" => Ok(AvatarProcessingState::Ready),
+            "failed" => Ok(AvatarProcessingState::Failed),
+            _ => Err(()),
+        }
+    }
 }
 
 impl User {
@@ -138,4 +224,10 @@ pub struct UserProfile {
     pub skill_score: Option<i32>,
     pub fair_play_score: Option<i32>,
     pub is_bad_actor: Option<bool>,
+    // Avatar pipeline state exposed to the client so it can render a stable
+    // processing indicator and a recoverable error without leaking originals.
+    pub avatar_processing_state: Option<AvatarProcessingState>,
+    pub avatar_thumbnail_url: Option<String>,
+    pub avatar_medium_url: Option<String>,
+    pub avatar_processing_error: Option<String>,
 }

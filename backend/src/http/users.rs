@@ -6,6 +6,9 @@ use uuid::Uuid;
 
 use crate::api_error::ApiError;
 use crate::auth::middleware::ClaimsExt;
+use crate::service::avatar::{
+    AvatarError, AvatarPipeline, AvatarProcessingState, AvatarUpload,
+};
 use crate::service::UserService;
 use crate::service::privacy_deletion::PrivacyDeletionService;
 
@@ -80,6 +83,80 @@ pub async fn update_user_profile(
         "success": true,
         "data": updated_user,
         "message": "Profile updated successfully"
+    })))
+}
+
+/// POST /api/users/me/avatar
+///
+/// Accepts a multipart upload of a profile image. The pipeline enforces
+/// size/type limits, strips embedded metadata (EXIF/GPS/etc.), generates
+/// bounded derivatives and records a stable processing/moderation state.
+///
+/// On any failure the previously stored avatar is left untouched and a
+/// recoverable, user-visible error is returned.
+pub async fn upload_avatar(
+    pool: web::Data<sqlx::PgPool>,
+    redis: web::Data<Arc<RedisClient>>,
+    req: HttpRequest,
+    payload: web::Payload,
+) -> Result<HttpResponse, ApiError> {
+    let user_id = req
+        .user_id()
+        .ok_or_else(|| ApiError::unauthorized("User not authenticated"))?;
+
+    let upload = AvatarUpload::from_multipart(payload).await.map_err(|e| {
+        // Malformed/oversized payloads are recoverable: the client can retry
+        // with a valid image and the existing avatar remains in place.
+        e.into_api_error()
+    })?;
+
+    let service = UserService::new(pool.get_ref().clone()).with_redis(redis.get_ref().clone());
+
+    // Authorization: only the authenticated owner may replace their avatar.
+    // `update_avatar` re-checks ownership against the persisted record.
+    let pipeline = AvatarPipeline::new();
+    let processed = pipeline.process(upload).await.map_err(|e| e.into_api_error())?;
+
+    let result = service
+        .update_avatar(user_id, processed)
+        .await
+        .map_err(|e| e)?;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "data": {
+            "avatar_url": result.avatar_url,
+            "processing_state": result.processing_state,
+            "moderation_state": result.moderation_state,
+        },
+        "message": "Avatar updated successfully"
+    })))
+}
+
+/// GET /api/users/me/avatar/status
+///
+/// Returns the stable processing/moderation state of the caller's avatar so
+/// the client can poll while a transformation or scan is in flight.
+pub async fn get_avatar_status(
+    pool: web::Data<sqlx::PgPool>,
+    redis: web::Data<Arc<RedisClient>>,
+    req: HttpRequest,
+) -> Result<HttpResponse, ApiError> {
+    let user_id = req
+        .user_id()
+        .ok_or_else(|| ApiError::unauthorized("User not authenticated"))?;
+
+    let service = UserService::new(pool.get_ref().clone()).with_redis(redis.get_ref().clone());
+    let status = service.get_avatar_status(user_id).await?;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "data": {
+            "avatar_url": status.avatar_url,
+            "processing_state": status.processing_state,
+            "moderation_state": status.moderation_state,
+            "error": status.error,
+        }
     })))
 }
 
@@ -266,6 +343,8 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             )
             .route("/me/export", web::get().to(export_user_data))
             .route("/me/export/{job_id}", web::get().to(get_export_job))
+            .route("/me/avatar", web::post().to(upload_avatar))
+            .route("/me/avatar/status", web::get().to(get_avatar_status))
             .route("/{id}/stats", web::get().to(get_user_stats)),
     );
 }
@@ -288,5 +367,32 @@ mod tests {
         let req: UpdateProfileRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.display_name, Some("John Doe".to_string()));
         assert_eq!(req.username, None);
+    }
+
+    #[test]
+    fn test_avatar_error_is_recoverable_and_user_visible() {
+        // Oversized / malformed payloads must surface a recoverable error
+        // (client can retry) rather than a hard failure.
+        let err = AvatarError::TooLarge { max_bytes: 5 * 1024 * 1024 };
+        let api = err.into_api_error();
+        assert!(api.is_recoverable());
+        assert!(!api.message().is_empty());
+    }
+
+    #[test]
+    fn test_avatar_processing_state_is_stable() {
+        // The state enum serialises to stable, client-consumable strings.
+        assert_eq!(
+            serde_json::to_string(&AvatarProcessingState::Processing).unwrap(),
+            "\"processing\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AvatarProcessingState::Ready).unwrap(),
+            "\"ready\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AvatarProcessingState::Failed).unwrap(),
+            "\"failed\""
+        );
     }
 }

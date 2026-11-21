@@ -1,5 +1,40 @@
 import type { BracketMatch, ScoreReport } from "./bracket";
 
+/**
+ * Locale-aware formatting hints attached to match data (#245).
+ *
+ * The server remains authoritative for the raw numeric values; these fields
+ * only describe *how* the client should present them so that money,
+ * percentages, durations and dates follow the active locale's rules.
+ */
+export interface MatchLocaleFormatting {
+  /** BCP 47 locale tag the values should be formatted for (e.g. "ar-EG"). */
+  locale: string;
+  /** IANA time zone used for date/time formatting. */
+  timeZone?: string;
+  /** ISO 4217 currency code for prize/payout amounts. */
+  currency?: string;
+  /** Whether the locale renders right-to-left. */
+  direction?: "ltr" | "rtl";
+}
+
+/** A duration expressed in seconds, formatted per the active locale. */
+export interface LocalizedDuration {
+  /** Raw duration in seconds (authoritative numeric value). */
+  seconds: number;
+  /** Locale-formatted display string (e.g. "1:05", "١:٠٥"). */
+  formatted: string;
+}
+
+/** A score pair formatted per the active locale, preserving semantic order. */
+export interface LocalizedScore {
+  player1: number;
+  player2: number;
+  /** Locale-formatted display string for each side. */
+  formattedPlayer1: string;
+  formattedPlayer2: string;
+}
+
 // Match-related types
 export interface Match {
   id: string;
@@ -76,6 +111,10 @@ export interface MatchRound {
   scorePlayer2: number;
   winner?: 'player1' | 'player2' | 'draw';
   duration?: number; // in seconds
+  /** Locale-formatted duration for display (#245). */
+  localizedDuration?: LocalizedDuration;
+  /** Locale-formatted score pair for display (#245). */
+  localizedScore?: LocalizedScore;
   keyEvents?: string[];
 }
 
@@ -111,6 +150,10 @@ export interface MatchDetail extends MatchWithPlayers {
   replayUrl?: string;
   canDispute?: boolean;
   disputeDeadline?: string;
+  /** Locale formatting hints for this match's money, dates and durations (#245). */
+  localeFormatting?: MatchLocaleFormatting;
+  /** Locale-formatted dispute deadline for display (#245). */
+  localizedDisputeDeadline?: string;
 }
 
 export interface MatchHubEvent {

@@ -1,7 +1,46 @@
+export type AvatarProcessingState =
+  | 'idle'
+  | 'uploading'
+  | 'scanning'
+  | 'transforming'
+  | 'ready'
+  | 'failed';
+
+/**
+ * Bounded derivatives generated from a validated, metadata-stripped upload.
+ * Only these URLs are ever rendered in public UI surfaces.
+ */
+export interface AvatarDerivatives {
+  small: string;
+  medium: string;
+  large: string;
+}
+
+/**
+ * Tracks the lifecycle of an avatar upload/transformation.
+ * `previousAvatar` stays referenced (and rendered) until `state === 'ready'`,
+ * so a failed scan or transformation never blanks out the current avatar.
+ */
+export interface AvatarProcessingStatus {
+  state: AvatarProcessingState;
+  /** Stable identifier for the in-flight or completed processing job. */
+  jobId?: string;
+  /** The avatar currently displayed; preserved across failures. */
+  previousAvatar?: string;
+  /** Derivatives for the newly processed avatar; only set when ready. */
+  derivatives?: AvatarDerivatives;
+  /** User-visible, recoverable error message when state is 'failed'. */
+  error?: string;
+  /** Whether the user can retry after a failure. */
+  retryable?: boolean;
+}
+
 export interface PublicProfile {
   id: string;
   username: string;
   avatar?: string;
+  avatarDerivatives?: AvatarDerivatives;
+  avatarProcessing?: AvatarProcessingStatus;
   bio?: string;
   socialLinks?: { twitter?: string; discord?: string; twitch?: string; github?: string };
   elo: number;
@@ -125,6 +164,8 @@ export interface UserProfileUpdate {
   username?: string;
   bio?: string;
   avatar?: string;
+  avatarDerivatives?: AvatarDerivatives;
+  avatarProcessing?: AvatarProcessingStatus;
   socialLinks?: {
     twitter?: string;
     discord?: string;

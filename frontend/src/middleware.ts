@@ -93,6 +93,14 @@ function extractToken(request: NextRequest): string | null {
 /** Supported locale codes — keep in sync with src/i18n/routing.ts */
 const SUPPORTED_LOCALES = ["en", "es", "ar", "fr", "yo"] as const;
 
+/** Locales written right-to-left — keep in sync with src/i18n/routing.ts */
+const RTL_LOCALES = ["ar"] as const;
+
+/** Resolve the writing direction for a locale. */
+function detectDirection(locale: string): "rtl" | "ltr" {
+  return (RTL_LOCALES as readonly string[]).includes(locale) ? "rtl" : "ltr";
+}
+
 /**
  * Strip the locale prefix from a pathname so the path table below is
  * locale-agnostic.  "/en/dashboard" → "/dashboard"

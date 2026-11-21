@@ -71,6 +71,40 @@ export default defineConfig({
       testMatch: /state-sync\/.*\.spec\.ts/,
       use: { ...devices["Desktop Chrome"] },
     },
+    // RTL locale coverage. The app uses `localePrefix: "always"`, so RTL
+    // specs navigate to "/ar/..." and assert mirrored layout, navigation
+    // order, and semantic numeric/sign order. Snapshots are kept in a
+    // locale-specific directory so LTR baselines are never overwritten.
+    {
+      name: "chromium-rtl",
+      use: {
+        ...devices["Desktop Chrome"],
+        locale: "ar",
+        // RTL layout is exercised at the same deterministic viewport as LTR
+        // so mirrored-layout diffs are attributable to direction, not size.
+        viewport: { width: 1280, height: 720 },
+        deviceScaleFactor: 1,
+        colorScheme: "light",
+        timezoneId: "UTC",
+      },
+      snapshotPathTemplate:
+        "{snapshotDir}/{testFilePath}/{arg}-{projectName}-{platform}{ext}",
+    },
+    // Gamepad / switch-input coverage. Specs in `e2e/gamepad` install the
+    // synthetic gamepad fixture before navigation; this project only pins
+    // the deterministic environment those specs rely on.
+    {
+      name: "chromium-gamepad",
+      testMatch: /gamepad\/.*\.spec\.ts/,
+      use: {
+        ...devices["Desktop Chrome"],
+        viewport: { width: 1280, height: 720 },
+        deviceScaleFactor: 1,
+        colorScheme: "light",
+        locale: "en-US",
+        timezoneId: "UTC",
+      },
+    },
   ],
   webServer: {
     // Build and serve the production bundle so bundle-budget and

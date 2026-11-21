@@ -815,6 +815,56 @@ export class AnalyticsService {
       assignmentVersion,
     });
   }
+
+  // ── Wallet context transitions ────────────────────────────────────────────
+  // Only coarse transition kinds and booleans are recorded. Addresses, chain
+  // ids, signatures and quote contents must never be forwarded here.
+
+  trackWalletContextTransition(transition: WalletContextTransition): void {
+    this.track("wallet_context_transition", {
+      transition: transition.kind,
+      hadPendingQuote: transition.hadPendingQuote,
+      hadUnsignedPreview: transition.hadUnsignedPreview,
+      hadSubmittedTransaction: transition.hadSubmittedTransaction,
+      consentRenewed: transition.consentRenewed,
+    });
+  }
+
+  // ── Gamepad input usage ───────────────────────────────────────────────────
+
+  trackGamepadInputUsage(usage: GamepadInputUsage): void {
+    this.track("gamepad_input_usage", {
+      action: usage.action,
+      surface: usage.surface,
+      inputMethod: usage.inputMethod,
+      duplicateSuppressed: usage.duplicateSuppressed,
+      reducedMotion: usage.reducedMotion,
+    });
+  }
+
+  // ── Locale / RTL rendering ────────────────────────────────────────────────
+
+  trackLocaleRender(context: LocaleRenderContext): void {
+    this.track("locale_render", {
+      locale: context.locale,
+      direction: context.direction,
+      surface: context.surface,
+      pluralCategoryUsed: context.pluralCategoryUsed,
+      numberFormatterUsed: context.numberFormatterUsed,
+    });
+  }
+
+  // ── Avatar processing outcomes ────────────────────────────────────────────
+
+  trackAvatarProcessing(outcome: AvatarProcessingOutcome): void {
+    this.track("avatar_processing", {
+      stage: outcome.stage,
+      status: outcome.status,
+      reason: outcome.reason,
+      previousAvatarRetained: outcome.previousAvatarRetained,
+      recoverable: outcome.recoverable,
+    });
+  }
 }
 
 // Singleton

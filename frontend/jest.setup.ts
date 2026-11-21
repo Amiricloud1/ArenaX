@@ -52,30 +52,89 @@ if (typeof window !== "undefined" && typeof Element !== "undefined" &&
 
 // jsdom doesn't implement matchMedia — provide a minimal stub so components
 // that probe prefers-reduced-motion / prefers-contrast don't crash in tests.
+// The stub tracks listeners and exposes `__setMatches` so reduced-motion and
+// RTL suites can flip media queries at runtime and assert on re-render.
+type MediaQueryListener = (event: MediaQueryListEvent) => void;
+
+interface TestMediaQueryList extends MediaQueryList {
+  __setMatches: (matches: boolean) => void;
+}
+
+const mediaQueryLists = new Map<string, TestMediaQueryList>();
+
+function createMediaQueryList(query: string): TestMediaQueryList {
+  const listeners = new Set<MediaQueryListener>();
+  const mql = {
+    matches: false,
+    media: query,
+    onchange: null as MediaQueryListener | null,
+    addListener: (listener: MediaQueryListener) => listeners.add(listener),
+    removeListener: (listener: MediaQueryListener) => listeners.delete(listener),
+    addEventListener: (_type: string, listener: MediaQueryListener) => listeners.add(listener),
+    removeEventListener: (_type: string, listener: MediaQueryListener) => listeners.delete(listener),
+    dispatchEvent: () => false,
+    __setMatches(matches: boolean) {
+      mql.matches = matches;
+      const event = { matches, media: query } as MediaQueryListEvent;
+      mql.onchange?.(event);
+      listeners.forEach((listener) => listener(event));
+    },
+  };
+  return mql as unknown as TestMediaQueryList;
+}
+
 if (typeof window !== "undefined" && typeof window.matchMedia !== "function") {
   Object.defineProperty(window, "matchMedia", {
     writable: true,
-    value: (query: string) => ({
-      matches: false,
-      media: query,
-      onchange: null,
-      addListener: () => {},
-      removeListener: () => {},
-      addEventListener: () => {},
-      removeEventListener: () => {},
-      dispatchEvent: () => false,
-    }),
+    value: (query: string) => {
+      const existing = mediaQueryLists.get(query);
+      if (existing) return existing;
+      const created = createMediaQueryList(query);
+      mediaQueryLists.set(query, created);
+      return created;
+    },
   });
 }
+
+// Helper for tests that need to simulate prefers-reduced-motion / RTL media
+// queries. Safe to call even when a suite has replaced window.matchMedia.
+(globalThis as { setMediaQueryMatches?: (query: string, matches: boolean) => void })
+  .setMediaQueryMatches = (query: string, matches: boolean) => {
+  const mql = mediaQueryLists.get(query);
+  if (mql) {
+    mql.__setMatches(matches);
+  } else if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+    const created = createMediaQueryList(query);
+    mediaQueryLists.set(query, created);
+    created.__setMatches(matches);
+  }
+};
 
 // jsdom doesn't implement ResizeObserver — provide a no-op stub so hooks that
 // observe layout (e.g. useResponsive) can mount in tests. Suites that need to
 // assert on callback behavior override `global.ResizeObserver` themselves.
+// The stub records observed targets so RTL layout tests can assert on them.
 if (typeof global.ResizeObserver === "undefined") {
   global.ResizeObserver = class {
-    observe(): void {}
-    unobserve(): void {}
-    disconnect(): void {}
+    static instances: Array<{ targets: Set<Element> }> = [];
+    targets = new Set<Element>();
+
+    constructor() {
+      (global.ResizeObserver as unknown as { instances: Array<{ targets: Set<Element> }> })
+        .instances.push(this);
+    }
+
+    observe(target: Element): void {
+      this.targets.add(target);
+    }
+
+    unobserve(target: Element): void {
+      this.targets.delete(target);
+    }
+
+    disconnect(): void {
+      this.targets.clear();
+    }
   } as unknown as typeof ResizeObserver;
 }
 

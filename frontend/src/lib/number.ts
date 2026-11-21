@@ -88,6 +88,151 @@ export function formatPercent(
   return `${roundTo(value, decimals)}%`;
 }
 
+// ---------------------------------------------------------------------------
+// Locale-aware formatting (Intl)
+// ---------------------------------------------------------------------------
+
+/**
+ * Format a monetary amount using locale-aware currency formatting.
+ * @example
+ * formatCurrency(1234.5, "USD", "en-US") // "$1,234.50"
+ * formatCurrency(1234.5, "EUR", "de-DE") // "1.234,50 €"
+ */
+export function formatCurrency(
+  amount: number,
+  currency: string,
+  locale = "en-US",
+  options?: Intl.NumberFormatOptions
+): string {
+  return new Intl.NumberFormat(locale, {
+    style: "currency",
+    currency,
+    ...options,
+  }).format(amount);
+}
+
+/**
+ * Format a ratio (0–1) or an already-percent value as a locale-aware
+ * percentage string.
+ * @example
+ * formatPercentLocale(0.756, "en-US") // "75.6%"
+ * formatPercentLocale(0.756, "de-DE") // "75,6 %"
+ */
+export function formatPercentLocale(
+  n: number,
+  locale = "en-US",
+  options: { decimals?: number; alreadyPercent?: boolean } = {}
+): string {
+  const { decimals = 1, alreadyPercent = false } = options;
+  const value = alreadyPercent ? n / 100 : n;
+  return new Intl.NumberFormat(locale, {
+    style: "percent",
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  }).format(value);
+}
+
+/**
+ * Format a duration in seconds as a locale-aware, human-readable string.
+ * Uses the largest sensible unit (days, hours, minutes, seconds).
+ * @example
+ * formatDuration(3725, "en-US") // "1 hr, 2 min, 5 sec"
+ */
+export function formatDuration(
+  totalSeconds: number,
+  locale = "en-US",
+  options?: Intl.NumberFormatOptions
+): string {
+  const seconds = Math.max(0, Math.round(totalSeconds));
+  const units: Array<{ unit: Intl.NumberFormatOptions["unit"]; size: number }> = [
+    { unit: "day", size: 86_400 },
+    { unit: "hour", size: 3_600 },
+    { unit: "minute", size: 60 },
+    { unit: "second", size: 1 },
+  ];
+  let remaining = seconds;
+  const parts: string[] = [];
+  for (const { unit, size } of units) {
+    const value = Math.floor(remaining / size);
+    remaining -= value * size;
+    if (value > 0 || (parts.length === 0 && unit === "second")) {
+      parts.push(
+        new Intl.NumberFormat(locale, {
+          style: "unit",
+          unit,
+          unitDisplay: "short",
+          ...options,
+        }).format(value)
+      );
+    }
+  }
+  return parts.join(", ");
+}
+
+/**
+ * Format a date (or timestamp) using locale-aware date formatting.
+ * @example
+ * formatDateLocale(new Date("2024-01-15"), "en-US") // "1/15/2024"
+ * formatDateLocale(new Date("2024-01-15"), "de-DE") // "15.1.2024"
+ */
+export function formatDateLocale(
+  date: Date | number | string,
+  locale = "en-US",
+  options?: Intl.DateTimeFormatOptions
+): string {
+  const value = date instanceof Date ? date : new Date(date);
+  return new Intl.DateTimeFormat(locale, options).format(value);
+}
+
+/**
+ * Format a relative time offset (e.g. "3 days ago") using locale rules.
+ * @example
+ * formatRelativeTime(-3, "day", "en-US") // "3 days ago"
+ */
+export function formatRelativeTime(
+  value: number,
+  unit: Intl.RelativeTimeFormatUnit,
+  locale = "en-US",
+  options?: Intl.RelativeTimeFormatOptions
+): string {
+  return new Intl.RelativeTimeFormat(locale, {
+    numeric: "auto",
+    ...options,
+  }).format(value, unit);
+}
+
+/**
+ * Select the correct plural category for a count using locale plural rules.
+ * Returns the CLDR plural category ("zero" | "one" | "two" | "few" | "many" | "other").
+ * @example
+ * selectPlural(1, "en-US") // "one"
+ * selectPlural(2, "en-US") // "other"
+ */
+export function selectPlural(
+  count: number,
+  locale = "en-US",
+  options?: Intl.PluralRulesOptions
+): Intl.LDMLPluralRule {
+  return new Intl.PluralRules(locale, options).select(count);
+}
+
+/**
+ * Pick a localized message form from a plural-forms map using locale rules.
+ * Falls back to the "other" form when the category is missing.
+ * @example
+ * pluralize(2, { one: "{n} match", other: "{n} matches" }, "en-US") // "2 matches"
+ */
+export function pluralize(
+  count: number,
+  forms: Partial<Record<Intl.LDMLPluralRule, string>>,
+  locale = "en-US",
+  options?: Intl.PluralRulesOptions
+): string {
+  const category = selectPlural(count, locale, options);
+  const template = forms[category] ?? forms.other ?? "";
+  return template.replace(/\{n\}/g, formatNumber(count, locale));
+}
+
 /**
  * Format an ordinal number: 1 → "1st", 2 → "2nd", 11 → "11th"
  */
