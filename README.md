@@ -55,3 +55,6 @@ A drill passes only when measured RTO and RPO are within the objectives above an
 
 <!-- handsoff-issue-175 -->
 - #175: Correlate audit records across a complete user action
+
+<!-- handsoff-issue-176 -->
+- #176: Add contract tests for every external provider adapter
