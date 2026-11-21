@@ -84,3 +84,6 @@ All canonical service responses use explicit boundary representations so clients
 
 <!-- handsoff-issue-177 -->
 - #177: Normalize locale, currency, and timezone at API boundaries
+
+<!-- handsoff-issue-178 -->
+- #178: Complete the Rust party lifecycle API
