@@ -44,10 +44,22 @@ export default defineConfig({
     {
       name: "chromium",
       use: { ...devices["Desktop Chrome"] },
+      // Failure-injection and consent specs run against the production build
+      // (see webServer below) so bundle-budget assertions reflect shipped code.
+      testMatch: [
+        "**/error-boundaries.spec.ts",
+        "**/analytics-consent.spec.ts",
+        "**/bundle-budget.spec.ts",
+      ],
     },
     {
       name: "chromium-mobile",
       use: { ...devices["Pixel 5"] },
+      testMatch: [
+        "**/error-boundaries.spec.ts",
+        "**/analytics-consent.spec.ts",
+        "**/bundle-budget.spec.ts",
+      ],
     },
     {
       // Browser-level coverage for realtime snapshot/event reconciliation,
@@ -61,7 +73,9 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: "npm run dev",
+    // Build and serve the production bundle so bundle-budget and
+    // hydration-cost checks measure the shipped output, not the dev server.
+    command: "npm run build && npm run start",
     // NOTE: with next-intl `localePrefix: "always"`, "/" is a 307 redirect to
     // "/en", so probing "/" never yields a 200 and Playwright waits until
     // timeout. Probe the default-locale home (public, renders 200) instead.

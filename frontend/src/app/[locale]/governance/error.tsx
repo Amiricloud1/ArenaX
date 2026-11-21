@@ -1,7 +1,6 @@
 "use client";
 
-import { useEffect } from "react";
-import { PageError } from "@/components/common/PageError";
+import { RouteErrorBoundary } from "@/components/common/RouteErrorBoundary";
 
 type GovernanceErrorLike = Error & {
   digest?: string;

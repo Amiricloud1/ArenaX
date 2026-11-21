@@ -6,6 +6,13 @@ module.exports = {
     "<rootDir>/node_modules/",
     "<rootDir>/e2e/",
     "<rootDir>/.next/",
+    // Fixture directories hold valid/invalid analytics event samples and
+    // error-report payloads consumed by tests — they are not test suites.
+    "<rootDir>/src/analytics/__fixtures__/",
+    "<rootDir>/src/analytics/fixtures/",
+    "<rootDir>/src/errors/__fixtures__/",
+    "<rootDir>/src/errors/fixtures/",
+    "<rootDir>/__fixtures__/",
   ],
   // Collect coverage from the new realtime/offline/optimistic/redirect modules
   // as well as the existing client and data-boundary code.

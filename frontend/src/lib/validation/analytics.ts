@@ -59,6 +59,223 @@ export interface ValidationAnalyticsSnapshot {
   lastUpdated: string;
 }
 
+// ─── Cross-client event schema registry (#249) ────────────────────────────────
+
+/**
+ * Current schema version for analytics events. Bump this whenever a breaking
+ * change is introduced and register a migration in `registerEventMigration`.
+ */
+export const SCHEMA_VERSION = 1;
+
+export type EventProducer = "frontend" | "server";
+
+export interface AnalyticsEventFieldSpec {
+  /** Field name (dot notation for nested fields). */
+  name: string;
+  /** Whether the field is required. */
+  required: boolean;
+  /** Allowed primitive type. */
+  type: "string" | "number" | "boolean" | "object" | "array";
+}
+
+export interface AnalyticsEventContract {
+  /** Unique event name, e.g. "validation.attempt". */
+  name: string;
+  /** Owning team or module. */
+  owner: string;
+  /** Human-readable purpose of the event. */
+  purpose: string;
+  /** Schema version this contract describes. */
+  version: number;
+  /** Required and optional fields. */
+  fields: AnalyticsEventFieldSpec[];
+  /** Attribute names that must never be emitted (PII, secrets, etc.). */
+  prohibited: string[];
+}
+
+export interface AnalyticsEvent {
+  /** Event name matching a registered contract. */
+  name: string;
+  /** Schema version the producer emitted. */
+  version: number;
+  /** Producer that emitted the event. */
+  producer: EventProducer;
+  /** Event payload. */
+  payload: Record<string, unknown>;
+}
+
+export interface EventValidationResult {
+  valid: boolean;
+  /** Event name (or "<unknown>" if missing). */
+  name: string;
+  /** Human-readable error messages. */
+  errors: string[];
+  /** Prohibited attributes that were found in the payload. */
+  prohibitedFound: string[];
+  /** True when the event version differs from the contract version. */
+  versionMismatch: boolean;
+}
+
+const _contracts = new Map<string, AnalyticsEventContract>();
+const _migrations = new Map<string, (payload: Record<string, unknown>) => Record<string, unknown>>();
+
+/** Registers (or replaces) an event contract. */
+export function registerEventContract(contract: AnalyticsEventContract): void {
+  _contracts.set(contract.name, contract);
+}
+
+/** Returns a registered contract, if any. */
+export function getEventContract(name: string): AnalyticsEventContract | undefined {
+  return _contracts.get(name);
+}
+
+/** Lists all registered contracts. */
+export function listEventContracts(): AnalyticsEventContract[] {
+  return Array.from(_contracts.values());
+}
+
+/**
+ * Registers a migration hook that upgrades a payload from `fromVersion` to
+ * `fromVersion + 1`. Breaking changes must ship with a migration.
+ */
+export function registerEventMigration(
+  eventName: string,
+  fromVersion: number,
+  migrate: (payload: Record<string, unknown>) => Record<string, unknown>,
+): void {
+  _migrations.set(`${eventName}@${fromVersion}`, migrate);
+}
+
+/**
+ * Applies registered migrations to bring an event payload up to the current
+ * contract version. Returns the migrated event, or the original if no
+ * migration path exists.
+ */
+export function migrateEvent(event: AnalyticsEvent): AnalyticsEvent {
+  const contract = _contracts.get(event.name);
+  if (!contract) return event;
+
+  let version = event.version;
+  let payload = event.payload;
+
+  while (version < contract.version) {
+    const migrate = _migrations.get(`${event.name}@${version}`);
+    if (!migrate) break;
+    try {
+      payload = migrate(payload);
+    } catch {
+      break;
+    }
+    version += 1;
+  }
+
+  return { ...event, version, payload };
+}
+
+function typeOf(value: unknown): AnalyticsEventFieldSpec["type"] | "null" | "undefined" {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (Array.isArray(value)) return "array";
+  return typeof value as AnalyticsEventFieldSpec["type"];
+}
+
+/**
+ * Validates a single analytics event against the registry: required/optional
+ * fields, prohibited sensitive attributes, and schema version.
+ */
+export function validateEvent(event: AnalyticsEvent): EventValidationResult {
+  const errors: string[] = [];
+  const prohibitedFound: string[] = [];
+  const name = typeof event?.name === "string" && event.name ? event.name : "<unknown>";
+
+  const contract = _contracts.get(name);
+  if (!contract) {
+    return {
+      valid: false,
+      name,
+      errors: [`No contract registered for event "${name}"`],
+      prohibitedFound,
+      versionMismatch: false,
+    };
+  }
+
+  const versionMismatch = event.version !== contract.version;
+  if (versionMismatch) {
+    errors.push(
+      `Event "${name}" version ${event.version} does not match contract version ${contract.version}`,
+    );
+  }
+
+  const payload = event.payload ?? {};
+
+  for (const field of contract.fields) {
+    const value = payload[field.name];
+    const actual = typeOf(value);
+    if (actual === "undefined" || actual === "null") {
+      if (field.required) errors.push(`Missing required field "${field.name}"`);
+      continue;
+    }
+    if (actual !== field.type) {
+      errors.push(
+        `Field "${field.name}" expected ${field.type} but received ${actual}`,
+      );
+    }
+  }
+
+  for (const attr of contract.prohibited) {
+    if (Object.prototype.hasOwnProperty.call(payload, attr) && payload[attr] !== undefined) {
+      prohibitedFound.push(attr);
+      errors.push(`Prohibited attribute "${attr}" must not be emitted`);
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    name,
+    errors,
+    prohibitedFound,
+    versionMismatch,
+  };
+}
+
+/** Validates a batch of events, returning per-event results in order. */
+export function validateBatch(events: AnalyticsEvent[]): EventValidationResult[] {
+  return events.map(validateEvent);
+}
+
+// ─── Built-in contracts ───────────────────────────────────────────────────────
+
+registerEventContract({
+  name: "validation.attempt",
+  owner: "frontend-platform",
+  purpose: "Track schema validation attempts for UX and reliability monitoring",
+  version: SCHEMA_VERSION,
+  fields: [
+    { name: "schemaName", required: true, type: "string" },
+    { name: "success", required: true, type: "boolean" },
+    { name: "failedFields", required: true, type: "array" },
+    { name: "durationMs", required: true, type: "number" },
+    { name: "timestamp", required: true, type: "string" },
+    { name: "context", required: false, type: "string" },
+  ],
+  prohibited: ["email", "password", "token", "ssn", "cardNumber", "cvv", "authorization"],
+});
+
+registerEventContract({
+  name: "validation.governance-violation",
+  owner: "frontend-platform",
+  purpose: "Track governance policy violations for operator review",
+  version: SCHEMA_VERSION,
+  fields: [
+    { name: "policy", required: true, type: "string" },
+    { name: "message", required: true, type: "string" },
+    { name: "severity", required: true, type: "string" },
+    { name: "schemaName", required: true, type: "string" },
+    { name: "timestamp", required: true, type: "string" },
+  ],
+  prohibited: ["email", "password", "token", "ssn", "cardNumber", "cvv", "authorization"],
+});
+
 // ─── Governance ───────────────────────────────────────────────────────────────
 
 export interface ValidationGovernancePolicy {
@@ -140,6 +357,20 @@ export function registerGovernancePolicy(policy: ValidationGovernancePolicy): vo
  * Called by `createValidationResolver` automatically.
  */
 export function recordValidationAttempt(event: ValidationAttemptEvent): void {
+  // Validate against the cross-client contract before recording (#249).
+  const result = validateEvent({
+    name: "validation.attempt",
+    version: SCHEMA_VERSION,
+    producer: "frontend",
+    payload: event as unknown as Record<string, unknown>,
+  });
+  if (!result.valid) {
+    if (process.env.NODE_ENV === "development") {
+      console.warn("[ArenaX Validation] Rejected analytics event", result.errors);
+    }
+    return;
+  }
+
   _events.unshift(event);
   if (_events.length > MAX_EVENTS) _events.length = MAX_EVENTS;
 

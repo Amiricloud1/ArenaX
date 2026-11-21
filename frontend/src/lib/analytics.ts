@@ -7,7 +7,20 @@ import type {
   ConsentState,
   SessionProperties,
 } from "@/types/analytics";
-import { getAnalyticsConsentCookie, setAnalyticsConsentCookie } from "@/lib/consentCookie";
+import {
+  getAnalyticsConsentCookie,
+  setAnalyticsConsentCookie,
+} from "@/lib/consentCookie";
+import {
+  CONSENT_VERSION,
+  loadConsentRecord,
+  saveConsentRecord,
+  type ConsentRecord,
+} from "@/lib/consentRecord";
+import {
+  validateEvent,
+  type EventValidationResult,
+} from "@/lib/analyticsSchema";
 
 const SESSION_KEY = "arenax:analytics:session";
 
@@ -220,6 +233,10 @@ function generateId(): string {
 }
 
 function loadConsent(): ConsentState {
+  const record = loadConsentRecord();
+  if (record) {
+    return { analytics: record.analytics, updatedAt: record.updatedAt };
+  }
   return { analytics: getAnalyticsConsentCookie(), updatedAt: null };
 }
 
@@ -298,13 +315,51 @@ export class AnalyticsService {
     return { ...this.consent };
   }
 
+  /**
+   * Returns the authoritative, versioned consent record. The record is the
+   * source of truth shared with the server and queued-event processing.
+   */
+  getConsentRecord(): ConsentRecord {
+    const stored = loadConsentRecord();
+    if (stored) return stored;
+    return {
+      analytics: this.consent.analytics,
+      version: CONSENT_VERSION,
+      updatedAt: this.consent.updatedAt,
+    };
+  }
+
   setConsent(analytics: "granted" | "denied"): void {
     this.consent = { analytics, updatedAt: Date.now() };
     saveConsent(this.consent);
+    saveConsentRecord({
+      analytics,
+      version: CONSENT_VERSION,
+      updatedAt: this.consent.updatedAt,
+    });
 
     if (analytics === "denied") {
-      this.scrubSession();
+      this.withdrawConsent();
     }
+  }
+
+  /**
+   * Withdraws analytics consent: halts future non-essential events, clears any
+   * queued events, scrubs identifiers, and notifies adapters to reset.
+   */
+  withdrawConsent(): void {
+    const updatedAt = Date.now();
+    this.consent = { analytics: "denied", updatedAt };
+    saveConsent(this.consent);
+    saveConsentRecord({
+      analytics: "denied",
+      version: CONSENT_VERSION,
+      updatedAt,
+    });
+
+    this.queue = [];
+    this.scrubSession();
+    this.adapters.forEach((a) => a.reset?.());
   }
 
   private scrubSession(): void {
@@ -318,6 +373,23 @@ export class AnalyticsService {
       screenHeight: 0,
       sessionStart: 0,
     };
+  }
+
+  /**
+   * Re-reads the authoritative consent record at dispatch time so that
+   * withdrawals made in another tab or by the server take effect immediately.
+   */
+  private isConsentGranted(): boolean {
+    const record = loadConsentRecord();
+    if (record) {
+      this.consent = { analytics: record.analytics, updatedAt: record.updatedAt };
+    } else {
+      this.consent = {
+        analytics: getAnalyticsConsentCookie(),
+        updatedAt: this.consent.updatedAt,
+      };
+    }
+    return this.consent.analytics === "granted";
   }
 
   // ── Session ───────────────────────────────────────────────────────────────
@@ -417,18 +489,53 @@ export class AnalyticsService {
 
   // ── Tracking ──────────────────────────────────────────────────────────────
 
+  /**
+   * Validates an event against the schema registry. Returns the validation
+   * result without dispatching; useful for producers and tests.
+   */
+  validate(event: AnalyticsEventName, props?: Record<string, unknown>): EventValidationResult {
+    return validateEvent(event, props);
+  }
+
   track(event: AnalyticsEventName, props?: Record<string, unknown>): void {
-    if (this.consent.analytics !== "granted") return;
+    // Re-check authoritative consent at dispatch time.
+    if (!this.isConsentGranted()) return;
+
+    const validation = validateEvent(event, props);
+    if (!validation.valid) {
+      // Drop invalid events rather than leaking unvalidated/sensitive data.
+      if (typeof console !== "undefined") {
+        console.warn(
+          `[analytics] dropped invalid event "${event}": ${validation.errors.join("; ")}`,
+        );
+      }
+      return;
+    }
 
     const payload: AnalyticsPayload = {
       event,
       timestamp: Date.now(),
       sessionId: this.session.sessionId,
       userId: this.session.userId,
-      ...(props ?? {}),
+      ...validation.sanitized,
     } as AnalyticsPayload;
 
-    this.adapters.forEach((a) => a.track(payload));
+    this.queue.push(payload);
+    this.flush();
+  }
+
+  private flush(): void {
+    // Re-check consent before delivering queued events; a withdrawal between
+    // enqueue and delivery must suppress delivery.
+    if (!this.isConsentGranted()) {
+      this.queue = [];
+      return;
+    }
+    const pending = this.queue;
+    this.queue = [];
+    pending.forEach((payload) => {
+      this.adapters.forEach((a) => a.track(payload));
+    });
   }
 
   // ── Operational observability ─────────────────────────────────────────────
