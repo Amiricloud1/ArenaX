@@ -1,5 +1,8 @@
 import { User, EloPoint } from "@/types/user";
 import type { PublicProfile, PlayerStats, Achievement, FriendEntry, ActivityEvent } from '@/types/profile';
+import { offlineQueue } from '@/lib/offlineQueue';
+import { mutationRegistry } from '@/lib/mutationRegistry';
+import { consumeReturnDestination } from '@/lib/returnDestination';
 
 /**
  * Identity / permission scope that must accompany every user-data access.
@@ -316,5 +319,48 @@ export function getProfileById(
 
   const result = MOCK_PROFILES[id] ?? null;
   if (result && cache) cache.set(scope, 'profile', result);
+  return result;
+}
+
+/**
+ * Purge all offline commands scoped to the given user. Must be called on
+ * logout and on account switch so queued mutations never leak across
+ * identities or replay against a different server account.
+ */
+export function purgeUserOfflineState(userId: string | null | undefined): void {
+  offlineQueue.purgeScope(userId ?? null);
+  mutationRegistry.clearScope(userId ?? null);
+}
+
+/**
+ * Restore the validated post-auth destination (if any) exactly once.
+ * Returns `null` when no safe destination was recorded.
+ */
+export function restoreAuthReturnDestination(): string | null {
+  return consumeReturnDestination();
+}
+
+/**
+ * Route a user-scoped mutation through the centralized optimistic
+ * reconciliation path. Unsafe operations are rejected from offline mode by
+ * the queue itself; here we only declare the resource scope and rollback.
+ */
+export async function updateUserProfile(
+  userId: string,
+  patch: Partial<Pick<User, 'username' | 'bio' | 'avatar' | 'socialLinks'>>,
+): Promise<User> {
+  const result = await mutationRegistry.mutate<User>({
+    resource: `user:${userId}`,
+    optimistic: true,
+    idempotencyKey: `user-profile:${userId}:${JSON.stringify(patch)}`,
+    apply: (current) => (current ? { ...current, ...patch } : current),
+    rollback: 'refetch',
+    request: async () => {
+      // Server remains authoritative; this is the canonical boundary.
+      const base = MOCK_PROFILES[userId]?.profile;
+      if (!base) throw new Error('Profile not found');
+      return { ...currentUser, ...patch } as User;
+    },
+  });
   return result;
 }

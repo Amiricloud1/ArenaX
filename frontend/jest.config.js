@@ -7,6 +7,15 @@ module.exports = {
     "<rootDir>/e2e/",
     "<rootDir>/.next/",
   ],
+  // Collect coverage from the new realtime/offline/optimistic/redirect modules
+  // as well as the existing client and data-boundary code.
+  collectCoverageFrom: [
+    "src/**/*.{ts,tsx,js,jsx}",
+    "!src/**/*.d.ts",
+    "!src/**/__tests__/**",
+    "!src/**/*.test.{ts,tsx,js,jsx}",
+    "!src/**/*.spec.{ts,tsx,js,jsx}",
+  ],
   moduleNameMapper: {
     "^@/(.*)$": "<rootDir>/src/$1",
     "\\.(css|less|scss|sass)$": "<rootDir>/__mocks__/styleMock.js",

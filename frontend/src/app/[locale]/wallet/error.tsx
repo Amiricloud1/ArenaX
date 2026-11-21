@@ -43,6 +43,10 @@ export default function WalletError({
           classification === "manual-recovery" ? reset : undefined
         }
       />
+      <p className="sr-only" role="status" aria-live="polite">
+        Wallet data could not be loaded. No financial actions were queued
+        offline. Use the retry button to reload your wallet from the server.
+      </p>
     </div>
   );
 }

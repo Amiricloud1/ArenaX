@@ -2,6 +2,12 @@ import createMiddleware from "next-intl/middleware";
 import { NextRequest, NextResponse } from "next/server";
 import { routing } from "./i18n/routing";
 import { NONCE_HEADER, buildContentSecurityPolicy, cspHeaderName, generateNonce } from "./lib/csp";
+import {
+  RETURN_TO_PARAM,
+  RETURN_TO_COOKIE,
+  sanitizeReturnTo,
+  buildLoginRedirectUrl,
+} from "./lib/return-to";
 
 const intlMiddleware = createMiddleware(routing);
 
@@ -201,16 +207,31 @@ export default async function middleware(request: NextRequest) {
   const authRedirect = async (): Promise<NextResponse | null> => {
     if (routeType === "public") return null;
 
-    const loginUrl = new URL(`/${locale}/login`, request.url);
-    loginUrl.searchParams.set(
-      "redirect",
+    // Validate the intended destination before it ever reaches the login URL
+    // or a cookie. Unsafe/encoded/open-redirect attempts collapse to null and
+    // the login page falls back to a safe default after authentication.
+    const returnTo = sanitizeReturnTo(
       `${pathname}${request.nextUrl.search}`,
+      locale,
     );
+    const loginUrl = buildLoginRedirectUrl(request.url, locale, returnTo);
 
     const deny = (url: URL): NextResponse => {
       const redirect = NextResponse.redirect(url);
       redirect.headers.set(headerName, csp);
       copyIntlMeaningfulHeaders(intlResponse, redirect, headerName);
+      // Persist the validated destination once so the login/registration/
+      // OAuth callback flows can restore it without trusting the query string
+      // alone. Only set when we actually have a safe local destination.
+      if (returnTo) {
+        redirect.cookies.set(RETURN_TO_COOKIE, returnTo, {
+          httpOnly: true,
+          sameSite: "lax",
+          secure: process.env.NODE_ENV === "production",
+          path: "/",
+          maxAge: 60 * 30,
+        });
+      }
       return redirect;
     };
 
@@ -241,6 +262,47 @@ export default async function middleware(request: NextRequest) {
 
   const redirect = await authRedirect();
   if (redirect) return redirect;
+
+  // ── Post-auth restore (single use) ───────────────────────────────────────
+  // When an authenticated user lands on a login/register/OAuth-callback path
+  // carrying a validated return destination, bounce them to it exactly once
+  // and clear the marker so a private/unavailable resource cannot loop.
+  const isAuthEntryPath =
+    strippedPath === "/login" ||
+    strippedPath === "/register" ||
+    strippedPath.startsWith("/auth/");
+  if (isAuthEntryPath) {
+    const token = extractToken(request);
+    const payload = token ? parseJwtPayload(token) : null;
+    const now = Math.floor(Date.now() / 1000);
+    const authenticated =
+      !!payload && payload.exp !== undefined && payload.exp > now;
+
+    if (authenticated) {
+      const candidate =
+        request.nextUrl.searchParams.get(RETURN_TO_PARAM) ??
+        request.cookies.get(RETURN_TO_COOKIE)?.value ??
+        null;
+      const destination = sanitizeReturnTo(candidate, locale);
+      // Only restore when the destination is not itself an auth entry path,
+      // otherwise we would ping-pong between login and the target.
+      const destinationPath = destination
+        ? stripLocale(destination.split("?")[0])
+        : null;
+      const destinationIsAuthEntry =
+        destinationPath === "/login" ||
+        destinationPath === "/register" ||
+        (destinationPath?.startsWith("/auth/") ?? false);
+
+      if (destination && !destinationIsAuthEntry) {
+        const restore = NextResponse.redirect(new URL(destination, request.url));
+        restore.headers.set(headerName, csp);
+        copyIntlMeaningfulHeaders(intlResponse, restore, headerName);
+        restore.cookies.delete(RETURN_TO_COOKIE);
+        return restore;
+      }
+    }
+  }
 
   // Auth passed (or public route) — forward locale + nonce + user context.
   const token = routeType === "public" ? null : extractToken(request);
