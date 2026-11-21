@@ -13,6 +13,14 @@
 // ─── Event types ──────────────────────────────────────────────────────────────
 
 export interface ValidationAttemptEvent {
+  /** Stable, producer-assigned event ID (UUID v4). Used for durable deduplication. */
+  eventId: string;
+  /** Schema version of the event payload, e.g. "1". */
+  schemaVersion: string;
+  /** Stable identifier of the producer that emitted the event. */
+  producerId: string;
+  /** Pseudonymous analytics subject ID (never a raw auth identifier). */
+  subjectId: string;
   /** Schema name (from `defineSchema`). */
   schemaName: string;
   /** Whether validation passed. */
@@ -58,6 +66,223 @@ export interface ValidationAnalyticsSnapshot {
   topFailingFields: ValidationFieldStats[];
   lastUpdated: string;
 }
+
+// ─── Cross-client event schema registry (#249) ────────────────────────────────
+
+/**
+ * Current schema version for analytics events. Bump this whenever a breaking
+ * change is introduced and register a migration in `registerEventMigration`.
+ */
+export const SCHEMA_VERSION = 1;
+
+export type EventProducer = "frontend" | "server";
+
+export interface AnalyticsEventFieldSpec {
+  /** Field name (dot notation for nested fields). */
+  name: string;
+  /** Whether the field is required. */
+  required: boolean;
+  /** Allowed primitive type. */
+  type: "string" | "number" | "boolean" | "object" | "array";
+}
+
+export interface AnalyticsEventContract {
+  /** Unique event name, e.g. "validation.attempt". */
+  name: string;
+  /** Owning team or module. */
+  owner: string;
+  /** Human-readable purpose of the event. */
+  purpose: string;
+  /** Schema version this contract describes. */
+  version: number;
+  /** Required and optional fields. */
+  fields: AnalyticsEventFieldSpec[];
+  /** Attribute names that must never be emitted (PII, secrets, etc.). */
+  prohibited: string[];
+}
+
+export interface AnalyticsEvent {
+  /** Event name matching a registered contract. */
+  name: string;
+  /** Schema version the producer emitted. */
+  version: number;
+  /** Producer that emitted the event. */
+  producer: EventProducer;
+  /** Event payload. */
+  payload: Record<string, unknown>;
+}
+
+export interface EventValidationResult {
+  valid: boolean;
+  /** Event name (or "<unknown>" if missing). */
+  name: string;
+  /** Human-readable error messages. */
+  errors: string[];
+  /** Prohibited attributes that were found in the payload. */
+  prohibitedFound: string[];
+  /** True when the event version differs from the contract version. */
+  versionMismatch: boolean;
+}
+
+const _contracts = new Map<string, AnalyticsEventContract>();
+const _migrations = new Map<string, (payload: Record<string, unknown>) => Record<string, unknown>>();
+
+/** Registers (or replaces) an event contract. */
+export function registerEventContract(contract: AnalyticsEventContract): void {
+  _contracts.set(contract.name, contract);
+}
+
+/** Returns a registered contract, if any. */
+export function getEventContract(name: string): AnalyticsEventContract | undefined {
+  return _contracts.get(name);
+}
+
+/** Lists all registered contracts. */
+export function listEventContracts(): AnalyticsEventContract[] {
+  return Array.from(_contracts.values());
+}
+
+/**
+ * Registers a migration hook that upgrades a payload from `fromVersion` to
+ * `fromVersion + 1`. Breaking changes must ship with a migration.
+ */
+export function registerEventMigration(
+  eventName: string,
+  fromVersion: number,
+  migrate: (payload: Record<string, unknown>) => Record<string, unknown>,
+): void {
+  _migrations.set(`${eventName}@${fromVersion}`, migrate);
+}
+
+/**
+ * Applies registered migrations to bring an event payload up to the current
+ * contract version. Returns the migrated event, or the original if no
+ * migration path exists.
+ */
+export function migrateEvent(event: AnalyticsEvent): AnalyticsEvent {
+  const contract = _contracts.get(event.name);
+  if (!contract) return event;
+
+  let version = event.version;
+  let payload = event.payload;
+
+  while (version < contract.version) {
+    const migrate = _migrations.get(`${event.name}@${version}`);
+    if (!migrate) break;
+    try {
+      payload = migrate(payload);
+    } catch {
+      break;
+    }
+    version += 1;
+  }
+
+  return { ...event, version, payload };
+}
+
+function typeOf(value: unknown): AnalyticsEventFieldSpec["type"] | "null" | "undefined" {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (Array.isArray(value)) return "array";
+  return typeof value as AnalyticsEventFieldSpec["type"];
+}
+
+/**
+ * Validates a single analytics event against the registry: required/optional
+ * fields, prohibited sensitive attributes, and schema version.
+ */
+export function validateEvent(event: AnalyticsEvent): EventValidationResult {
+  const errors: string[] = [];
+  const prohibitedFound: string[] = [];
+  const name = typeof event?.name === "string" && event.name ? event.name : "<unknown>";
+
+  const contract = _contracts.get(name);
+  if (!contract) {
+    return {
+      valid: false,
+      name,
+      errors: [`No contract registered for event "${name}"`],
+      prohibitedFound,
+      versionMismatch: false,
+    };
+  }
+
+  const versionMismatch = event.version !== contract.version;
+  if (versionMismatch) {
+    errors.push(
+      `Event "${name}" version ${event.version} does not match contract version ${contract.version}`,
+    );
+  }
+
+  const payload = event.payload ?? {};
+
+  for (const field of contract.fields) {
+    const value = payload[field.name];
+    const actual = typeOf(value);
+    if (actual === "undefined" || actual === "null") {
+      if (field.required) errors.push(`Missing required field "${field.name}"`);
+      continue;
+    }
+    if (actual !== field.type) {
+      errors.push(
+        `Field "${field.name}" expected ${field.type} but received ${actual}`,
+      );
+    }
+  }
+
+  for (const attr of contract.prohibited) {
+    if (Object.prototype.hasOwnProperty.call(payload, attr) && payload[attr] !== undefined) {
+      prohibitedFound.push(attr);
+      errors.push(`Prohibited attribute "${attr}" must not be emitted`);
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    name,
+    errors,
+    prohibitedFound,
+    versionMismatch,
+  };
+}
+
+/** Validates a batch of events, returning per-event results in order. */
+export function validateBatch(events: AnalyticsEvent[]): EventValidationResult[] {
+  return events.map(validateEvent);
+}
+
+// ─── Built-in contracts ───────────────────────────────────────────────────────
+
+registerEventContract({
+  name: "validation.attempt",
+  owner: "frontend-platform",
+  purpose: "Track schema validation attempts for UX and reliability monitoring",
+  version: SCHEMA_VERSION,
+  fields: [
+    { name: "schemaName", required: true, type: "string" },
+    { name: "success", required: true, type: "boolean" },
+    { name: "failedFields", required: true, type: "array" },
+    { name: "durationMs", required: true, type: "number" },
+    { name: "timestamp", required: true, type: "string" },
+    { name: "context", required: false, type: "string" },
+  ],
+  prohibited: ["email", "password", "token", "ssn", "cardNumber", "cvv", "authorization"],
+});
+
+registerEventContract({
+  name: "validation.governance-violation",
+  owner: "frontend-platform",
+  purpose: "Track governance policy violations for operator review",
+  version: SCHEMA_VERSION,
+  fields: [
+    { name: "policy", required: true, type: "string" },
+    { name: "message", required: true, type: "string" },
+    { name: "severity", required: true, type: "string" },
+    { name: "schemaName", required: true, type: "string" },
+    { name: "timestamp", required: true, type: "string" },
+  ],
+  prohibited: ["email", "password", "token", "ssn", "cardNumber", "cvv", "authorization"],
+});
 
 // ─── Governance ───────────────────────────────────────────────────────────────
 
@@ -140,6 +365,20 @@ export function registerGovernancePolicy(policy: ValidationGovernancePolicy): vo
  * Called by `createValidationResolver` automatically.
  */
 export function recordValidationAttempt(event: ValidationAttemptEvent): void {
+  // Validate against the cross-client contract before recording (#249).
+  const result = validateEvent({
+    name: "validation.attempt",
+    version: SCHEMA_VERSION,
+    producer: "frontend",
+    payload: event as unknown as Record<string, unknown>,
+  });
+  if (!result.valid) {
+    if (process.env.NODE_ENV === "development") {
+      console.warn("[ArenaX Validation] Rejected analytics event", result.errors);
+    }
+    return;
+  }
+
   _events.unshift(event);
   if (_events.length > MAX_EVENTS) _events.length = MAX_EVENTS;
 
@@ -316,4 +555,302 @@ export function auditSuccessRates(threshold = 0.3): ValidationGovernanceViolatio
   }
 
   return violations;
+}
+
+// ─── Experiment boundary validation ───────────────────────────────────────────
+//
+// These validators guard the client/data boundary for feature experiments.
+// They are intentionally dependency-free and never throw: callers receive a
+// discriminated result so malformed payloads (from the network, storage, or a
+// stale server) are rejected before they can influence assignment, exposure
+// logging, or guardrail decisions.
+
+export interface BoundaryIssue {
+  /** Dot-notation path to the offending value ("" for the root). */
+  path: string;
+  message: string;
+}
+
+export type BoundaryResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; issues: BoundaryIssue[] };
+
+/** Maximum accepted length for identifiers (experiment keys, variant keys, units). */
+export const EXPERIMENT_ID_MAX_LENGTH = 128;
+
+const EXPERIMENT_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const ISO_TIMESTAMP_PATTERN =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isExperimentKey(value: unknown): value is string {
+  return (
+    isNonEmptyString(value) &&
+    value.length <= EXPERIMENT_ID_MAX_LENGTH &&
+    EXPERIMENT_KEY_PATTERN.test(value)
+  );
+}
+
+function isIsoTimestamp(value: unknown): value is string {
+  return typeof value === "string" && ISO_TIMESTAMP_PATTERN.test(value) && !Number.isNaN(Date.parse(value));
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+// ── Assignment request ────────────────────────────────────────────────────────
+
+export interface ExperimentAssignmentRequest {
+  /** Stable experiment identifier. */
+  experimentKey: string;
+  /** Version of the experiment definition used to compute the assignment. */
+  assignmentVersion: number;
+  /** Stable unit identifier (e.g. hashed user id); never a raw PII value. */
+  unitId: string;
+  /** Whether the participant has consented to experiment participation. */
+  consent: boolean;
+  /** Exclusion reasons that must force the control/holdout bucket. */
+  exclusions?: string[];
+}
+
+export function validateExperimentAssignmentRequest(
+  input: unknown,
+): BoundaryResult<ExperimentAssignmentRequest> {
+  const issues: BoundaryIssue[] = [];
+  if (!isPlainObject(input)) {
+    return { ok: false, issues: [{ path: "", message: "Assignment request must be an object" }] };
+  }
+
+  if (!isExperimentKey(input.experimentKey)) {
+    issues.push({
+      path: "experimentKey",
+      message: `experimentKey must be a non-empty key of at most ${EXPERIMENT_ID_MAX_LENGTH} characters`,
+    });
+  }
+  if (!Number.isInteger(input.assignmentVersion) || (input.assignmentVersion as number) < 1) {
+    issues.push({ path: "assignmentVersion", message: "assignmentVersion must be a positive integer" });
+  }
+  if (!isNonEmptyString(input.unitId) || input.unitId.length > EXPERIMENT_ID_MAX_LENGTH) {
+    issues.push({
+      path: "unitId",
+      message: `unitId must be a non-empty string of at most ${EXPERIMENT_ID_MAX_LENGTH} characters`,
+    });
+  }
+  if (typeof input.consent !== "boolean") {
+    issues.push({ path: "consent", message: "consent must be a boolean" });
+  }
+  if (input.exclusions !== undefined && !isStringArray(input.exclusions)) {
+    issues.push({ path: "exclusions", message: "exclusions must be an array of strings" });
+  }
+
+  if (issues.length > 0) return { ok: false, issues };
+
+  return {
+    ok: true,
+    value: {
+      experimentKey: input.experimentKey as string,
+      assignmentVersion: input.assignmentVersion as number,
+      unitId: input.unitId as string,
+      consent: input.consent as boolean,
+      exclusions: input.exclusions as string[] | undefined,
+    },
+  };
+}
+
+// ── Exposure payload ──────────────────────────────────────────────────────────
+
+export interface ExperimentExposurePayload {
+  experimentKey: string;
+  assignmentVersion: number;
+  variantKey: string;
+  unitId: string;
+  /** ISO-8601 timestamp of when the experience was presented. */
+  exposedAt: string;
+  /** Optional surface where the experience was presented (e.g. "match-lobby"). */
+  surface?: string;
+}
+
+export function validateExperimentExposurePayload(
+  input: unknown,
+): BoundaryResult<ExperimentExposurePayload> {
+  const issues: BoundaryIssue[] = [];
+  if (!isPlainObject(input)) {
+    return { ok: false, issues: [{ path: "", message: "Exposure payload must be an object" }] };
+  }
+
+  if (!isExperimentKey(input.experimentKey)) {
+    issues.push({ path: "experimentKey", message: "experimentKey is invalid" });
+  }
+  if (!Number.isInteger(input.assignmentVersion) || (input.assignmentVersion as number) < 1) {
+    issues.push({ path: "assignmentVersion", message: "assignmentVersion must be a positive integer" });
+  }
+  if (!isExperimentKey(input.variantKey)) {
+    issues.push({ path: "variantKey", message: "variantKey is invalid" });
+  }
+  if (!isNonEmptyString(input.unitId) || input.unitId.length > EXPERIMENT_ID_MAX_LENGTH) {
+    issues.push({ path: "unitId", message: "unitId is invalid" });
+  }
+  if (!isIsoTimestamp(input.exposedAt)) {
+    issues.push({ path: "exposedAt", message: "exposedAt must be an ISO-8601 timestamp" });
+  }
+  if (input.surface !== undefined && !isNonEmptyString(input.surface)) {
+    issues.push({ path: "surface", message: "surface must be a non-empty string when provided" });
+  }
+
+  if (issues.length > 0) return { ok: false, issues };
+
+  return {
+    ok: true,
+    value: {
+      experimentKey: input.experimentKey as string,
+      assignmentVersion: input.assignmentVersion as number,
+      variantKey: input.variantKey as string,
+      unitId: input.unitId as string,
+      exposedAt: input.exposedAt as string,
+      surface: input.surface as string | undefined,
+    },
+  };
+}
+
+// ── Guardrail analysis response ───────────────────────────────────────────────
+
+export type GuardrailDecision =
+  | "insufficient-data"
+  | "safe-to-ship"
+  | "harmful"
+  | "inconclusive";
+
+export interface GuardrailMetricResult {
+  metric: string;
+  /** Observed effect (lift) for the metric; negative means harm. */
+  lift: number;
+  /** Two-sided p-value for the observed effect. */
+  pValue: number;
+  /** Whether the metric is a guardrail (harm is a stop condition). */
+  guardrail: boolean;
+  /** Whether telemetry for this metric was missing. */
+  missing: boolean;
+}
+
+export interface GuardrailAnalysisResponse {
+  experimentKey: string;
+  assignmentVersion: number;
+  decision: GuardrailDecision;
+  /** Number of samples observed in the analysis window. */
+  sampleSize: number;
+  /** Minimum sample required before a decision can be made. */
+  minimumSample: number;
+  /** Whether the multiple-comparison correction was applied. */
+  multipleComparisonAdjusted: boolean;
+  metrics: GuardrailMetricResult[];
+  /** ISO-8601 timestamp of when the analysis was produced. */
+  analyzedAt: string;
+}
+
+const GUARDRAIL_DECISIONS: readonly GuardrailDecision[] = [
+  "insufficient-data",
+  "safe-to-ship",
+  "harmful",
+  "inconclusive",
+];
+
+export function validateGuardrailAnalysisResponse(
+  input: unknown,
+): BoundaryResult<GuardrailAnalysisResponse> {
+  const issues: BoundaryIssue[] = [];
+  if (!isPlainObject(input)) {
+    return { ok: false, issues: [{ path: "", message: "Guardrail analysis must be an object" }] };
+  }
+
+  if (!isExperimentKey(input.experimentKey)) {
+    issues.push({ path: "experimentKey", message: "experimentKey is invalid" });
+  }
+  if (!Number.isInteger(input.assignmentVersion) || (input.assignmentVersion as number) < 1) {
+    issues.push({ path: "assignmentVersion", message: "assignmentVersion must be a positive integer" });
+  }
+  if (
+    typeof input.decision !== "string" ||
+    !GUARDRAIL_DECISIONS.includes(input.decision as GuardrailDecision)
+  ) {
+    issues.push({
+      path: "decision",
+      message: `decision must be one of: ${GUARDRAIL_DECISIONS.join(", ")}`,
+    });
+  }
+  if (!Number.isInteger(input.sampleSize) || (input.sampleSize as number) < 0) {
+    issues.push({ path: "sampleSize", message: "sampleSize must be a non-negative integer" });
+  }
+  if (!Number.isInteger(input.minimumSample) || (input.minimumSample as number) < 1) {
+    issues.push({ path: "minimumSample", message: "minimumSample must be a positive integer" });
+  }
+  if (typeof input.multipleComparisonAdjusted !== "boolean") {
+    issues.push({
+      path: "multipleComparisonAdjusted",
+      message: "multipleComparisonAdjusted must be a boolean",
+    });
+  }
+  if (!isIsoTimestamp(input.analyzedAt)) {
+    issues.push({ path: "analyzedAt", message: "analyzedAt must be an ISO-8601 timestamp" });
+  }
+
+  if (!Array.isArray(input.metrics)) {
+    issues.push({ path: "metrics", message: "metrics must be an array" });
+  } else {
+    input.metrics.forEach((metric, index) => {
+      const path = `metrics[${index}]`;
+      if (!isPlainObject(metric)) {
+        issues.push({ path, message: "metric must be an object" });
+        return;
+      }
+      if (!isNonEmptyString(metric.metric)) {
+        issues.push({ path: `${path}.metric`, message: "metric must be a non-empty string" });
+      }
+      if (!isFiniteNumber(metric.lift)) {
+        issues.push({ path: `${path}.lift`, message: "lift must be a finite number" });
+      }
+      if (!isFiniteNumber(metric.pValue) || metric.pValue < 0 || metric.pValue > 1) {
+        issues.push({ path: `${path}.pValue`, message: "pValue must be a number between 0 and 1" });
+      }
+      if (typeof metric.guardrail !== "boolean") {
+        issues.push({ path: `${path}.guardrail`, message: "guardrail must be a boolean" });
+      }
+      if (typeof metric.missing !== "boolean") {
+        issues.push({ path: `${path}.missing`, message: "missing must be a boolean" });
+      }
+    });
+  }
+
+  if (issues.length > 0) return { ok: false, issues };
+
+  return {
+    ok: true,
+    value: {
+      experimentKey: input.experimentKey as string,
+      assignmentVersion: input.assignmentVersion as number,
+      decision: input.decision as GuardrailDecision,
+      sampleSize: input.sampleSize as number,
+      minimumSample: input.minimumSample as number,
+      multipleComparisonAdjusted: input.multipleComparisonAdjusted as boolean,
+      metrics: (input.metrics as GuardrailMetricResult[]).map((metric) => ({
+        metric: metric.metric,
+        lift: metric.lift,
+        pValue: metric.pValue,
+        guardrail: metric.guardrail,
+        missing: metric.missing,
+      })),
+      analyzedAt: input.analyzedAt as string,
+    },
+  };
 }

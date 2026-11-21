@@ -1,3 +1,4 @@
+use crate::contract_errors::{ContractError, ContractErrorCatalog, RecoveryClass};
 use chrono::{DateTime, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -157,6 +158,62 @@ impl TransactionMonitor {
         );
 
         Ok(())
+    }
+
+    /// Record a transaction failure caused by a contract error.
+    ///
+    /// The raw contract error is mapped through the canonical catalog so that
+    /// the persisted message and logs carry a stable code and safe message.
+    /// Unknown errors remain distinguishable (via their `unknown_*` code) and
+    /// are logged with transaction context. Signing material is never logged.
+    pub async fn record_contract_failure(
+        &self,
+        transaction_id: Uuid,
+        operation: &str,
+        raw_error: &str,
+        duration_ms: i64,
+    ) -> Result<ContractError, sqlx::Error> {
+        let mapped = ContractErrorCatalog::map(raw_error);
+
+        // Log with transaction context, never including signing material.
+        match mapped.recovery {
+            RecoveryClass::Retry => {
+                warn!(
+                    transaction_id = %transaction_id,
+                    operation = %operation,
+                    error_code = %mapped.code,
+                    recovery = %mapped.recovery,
+                    duration_ms = duration_ms,
+                    "Transaction failed with retryable contract error"
+                );
+            }
+            RecoveryClass::ManualRecovery => {
+                error!(
+                    transaction_id = %transaction_id,
+                    operation = %operation,
+                    error_code = %mapped.code,
+                    recovery = %mapped.recovery,
+                    duration_ms = duration_ms,
+                    "Transaction failed with contract error requiring manual recovery"
+                );
+            }
+            RecoveryClass::Unknown => {
+                error!(
+                    transaction_id = %transaction_id,
+                    operation = %operation,
+                    error_code = %mapped.code,
+                    recovery = %mapped.recovery,
+                    duration_ms = duration_ms,
+                    "Transaction failed with unknown contract error"
+                );
+            }
+        }
+
+        let stored_message = format!("[{}] {}", mapped.code, mapped.message);
+        self.record_failure(transaction_id, stored_message, duration_ms)
+            .await?;
+
+        Ok(mapped)
     }
 
     /// Record transaction retry
@@ -421,5 +478,62 @@ mod tests {
         let stats = TransactionStatistics::default();
         assert_eq!(stats.total_transactions, 0);
         assert_eq!(stats.completed_transactions, 0);
+    }
+
+    #[test]
+    fn test_contract_failure_mapping_retryable() {
+        let mapped = ContractErrorCatalog::map("InsufficientBalance");
+        assert_eq!(mapped.recovery, RecoveryClass::Retry);
+        assert!(!mapped.code.is_empty());
+        assert!(!mapped.message.is_empty());
+    }
+
+    #[test]
+    fn test_contract_failure_mapping_manual_recovery() {
+        let mapped = ContractErrorCatalog::map("Unauthorized");
+        assert_eq!(mapped.recovery, RecoveryClass::ManualRecovery);
+    }
+
+    #[test]
+    fn test_contract_failure_mapping_unknown_is_distinguishable() {
+        let mapped = ContractErrorCatalog::map("SomeFutureContractError");
+        assert_eq!(mapped.recovery, RecoveryClass::Unknown);
+        assert!(mapped.code.starts_with("unknown_"));
+        assert_ne!(mapped.code, ContractErrorCatalog::map("AnotherFutureError").code);
+    }
+
+    #[test]
+    fn test_contract_failure_message_has_no_signing_material() {
+        let mapped = ContractErrorCatalog::map("InsufficientBalance");
+        let lower = mapped.message.to_lowercase();
+        assert!(!lower.contains("secret"));
+        assert!(!lower.contains("private key"));
+        assert!(!lower.contains("signature"));
+    }
+
+    #[tokio::test]
+    async fn test_record_contract_failure_disabled_monitor() {
+        // When monitoring is disabled, no DB access occurs; the mapping is
+        // still returned so callers can act on the recovery classification.
+        let pool = match PgPool::connect_lazy("postgres://localhost/unused") {
+            Ok(pool) => Arc::new(pool),
+            Err(_) => return,
+        };
+        let monitor = TransactionMonitor::new(pool, false);
+        let mapped = monitor
+            .record_contract_failure(Uuid::new_v4(), "payment", "InsufficientBalance", 12)
+            .await
+            .expect("disabled monitor should not fail");
+        assert_eq!(mapped.recovery, RecoveryClass::Retry);
+    }
+
+    #[test]
+    fn test_duplicate_delivery_unknown_error_stable_code() {
+        // Duplicate delivery of the same unknown error must map to the same
+        // stable code so operators can deduplicate.
+        let first = ContractErrorCatalog::map("MysteryError");
+        let second = ContractErrorCatalog::map("MysteryError");
+        assert_eq!(first.code, second.code);
+        assert_eq!(first.recovery, RecoveryClass::Unknown);
     }
 }

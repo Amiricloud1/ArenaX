@@ -12,6 +12,9 @@ pub enum RealtimeEvent {
         balance_arenax_tokens: i64,
         balance_xlm: i64,
         timestamp: String,
+        /// Stream sequence allocated by the event bus. See [`StreamMeta`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_seq: Option<u64>,
     },
     MatchFound {
         match_id: Uuid,
@@ -19,12 +22,18 @@ pub enum RealtimeEvent {
         opponent_name: String,
         game_mode: String,
         timestamp: String,
+        /// Stream sequence allocated by the event bus. See [`StreamMeta`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_seq: Option<u64>,
     },
     MatchStatusChange {
         match_id: Uuid,
         from_status: String,
         to_status: String,
         timestamp: String,
+        /// Stream sequence allocated by the event bus. See [`StreamMeta`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_seq: Option<u64>,
     },
     /// Sequence-aware match state event (Issue #33).
     ///
@@ -63,6 +72,9 @@ pub enum RealtimeEvent {
         /// Human-readable detail (dispute reason, conflict description, ...).
         detail: Option<String>,
         timestamp: String,
+        /// Stream sequence allocated by the event bus. See [`StreamMeta`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_seq: Option<u64>,
     },
     Notification {
         id: Uuid,
@@ -70,21 +82,33 @@ pub enum RealtimeEvent {
         body: String,
         category: String,
         timestamp: String,
+        /// Stream sequence allocated by the event bus. See [`StreamMeta`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_seq: Option<u64>,
     },
     MatchCompleted {
         match_id: Uuid,
         winner_id: Uuid,
         elo_change: i32,
         timestamp: String,
+        /// Stream sequence allocated by the event bus. See [`StreamMeta`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_seq: Option<u64>,
     },
     MatchDisputed {
         match_id: Uuid,
         reason: String,
         timestamp: String,
+        /// Stream sequence allocated by the event bus. See [`StreamMeta`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_seq: Option<u64>,
     },
     MatchmakingMetricsUpdate {
         dashboard: serde_json::Value,
         timestamp: String,
+        /// Stream sequence allocated by the event bus. See [`StreamMeta`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_seq: Option<u64>,
     },
     /// Incremental leaderboard update (Issue #900).
     ///
@@ -112,7 +136,73 @@ pub enum RealtimeEvent {
         version: u64,
         changes: Vec<RankChange>,
         timestamp: String,
+        /// Stream sequence allocated by the event bus. See [`StreamMeta`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_seq: Option<u64>,
     },
+}
+
+impl RealtimeEvent {
+    /// The stream sequence carried by this event, if the bus allocated one.
+    ///
+    /// Events built by producers (before the bus stamps them) return `None`;
+    /// events delivered to clients always carry `Some(seq)`.
+    pub fn stream_seq(&self) -> Option<u64> {
+        match self {
+            RealtimeEvent::BalanceUpdate { stream_seq, .. }
+            | RealtimeEvent::MatchFound { stream_seq, .. }
+            | RealtimeEvent::MatchStatusChange { stream_seq, .. }
+            | RealtimeEvent::MatchStateSync { stream_seq, .. }
+            | RealtimeEvent::Notification { stream_seq, .. }
+            | RealtimeEvent::MatchCompleted { stream_seq, .. }
+            | RealtimeEvent::MatchDisputed { stream_seq, .. }
+            | RealtimeEvent::MatchmakingMetricsUpdate { stream_seq, .. }
+            | RealtimeEvent::LeaderboardDelta { stream_seq, .. } => *stream_seq,
+        }
+    }
+
+    /// Stamp this event with the sequence allocated by the event bus.
+    pub fn set_stream_seq(&mut self, seq: u64) {
+        match self {
+            RealtimeEvent::BalanceUpdate { stream_seq, .. }
+            | RealtimeEvent::MatchFound { stream_seq, .. }
+            | RealtimeEvent::MatchStatusChange { stream_seq, .. }
+            | RealtimeEvent::MatchStateSync { stream_seq, .. }
+            | RealtimeEvent::Notification { stream_seq, .. }
+            | RealtimeEvent::MatchCompleted { stream_seq, .. }
+            | RealtimeEvent::MatchDisputed { stream_seq, .. }
+            | RealtimeEvent::MatchmakingMetricsUpdate { stream_seq, .. }
+            | RealtimeEvent::LeaderboardDelta { stream_seq, .. } => *stream_seq = Some(seq),
+        }
+    }
+
+    /// The match this event belongs to, when it is match-scoped.
+    ///
+    /// Used by the bus to route events onto the right per-match stream.
+    pub fn match_id(&self) -> Option<Uuid> {
+        match self {
+            RealtimeEvent::MatchFound { match_id, .. }
+            | RealtimeEvent::MatchStatusChange { match_id, .. }
+            | RealtimeEvent::MatchStateSync { match_id, .. }
+            | RealtimeEvent::MatchCompleted { match_id, .. }
+            | RealtimeEvent::MatchDisputed { match_id, .. } => Some(*match_id),
+            _ => None,
+        }
+    }
+}
+
+/// Sequencing metadata attached to every event the bus delivers.
+///
+/// A client bootstraps from a REST snapshot that carries a `watermark` (the
+/// highest `stream_seq` reflected in that snapshot). It then applies live
+/// events only when `stream_seq == last_applied + 1`; anything lower is stale
+/// and anything higher is a gap that forces a fresh snapshot.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct StreamMeta {
+    /// Monotonic sequence number allocated by the event bus.
+    pub stream_seq: u64,
+    /// Highest sequence reflected in the snapshot the client bootstrapped from.
+    pub watermark: u64,
 }
 
 /// One player's movement on the leaderboard.
@@ -126,9 +216,30 @@ pub struct RankChange {
 }
 
 /// Envelope wrapping a realtime event for WebSocket delivery.
+///
+/// `stream_seq` is the sequence the bus allocated for this frame; `watermark`
+/// is the highest sequence the server has published so far. Clients compare
+/// `stream_seq` against their last applied sequence to detect gaps and stale
+/// frames, and use `watermark` to decide whether a snapshot is current.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WsEnvelope {
     pub event: RealtimeEvent,
+    #[serde(default)]
+    pub stream_seq: u64,
+    #[serde(default)]
+    pub watermark: u64,
+}
+
+impl WsEnvelope {
+    /// Build an envelope, taking the sequence from the event itself.
+    pub fn new(event: RealtimeEvent, watermark: u64) -> Self {
+        let stream_seq = event.stream_seq().unwrap_or_default();
+        Self {
+            event,
+            stream_seq,
+            watermark,
+        }
+    }
 }
 
 /// Messages received from the client over WebSocket.
@@ -147,12 +258,23 @@ pub enum ClientMessage {
         channel: String,
         event: RealtimeEvent,
     },
+    /// Ask the server to re-send a snapshot because the client detected a gap.
+    ResyncRequest {
+        channel: String,
+        /// Last sequence the client successfully applied.
+        last_applied_seq: u64,
+    },
 }
 
 /// Actix message for delivering a realtime event to an actor.
 #[derive(Debug, Clone, Message)]
 #[rtype(result = "()")]
 pub struct DeliverEvent(pub RealtimeEvent);
+
+/// Actix message for delivering a sequenced envelope to an actor.
+#[derive(Debug, Clone, Message)]
+#[rtype(result = "()")]
+pub struct DeliverEnvelope(pub WsEnvelope);
 
 /// Channel naming helpers for pub/sub routing.
 pub mod channels {
@@ -178,5 +300,60 @@ pub mod channels {
     /// everyone is the cost this whole delta scheme exists to avoid.
     pub fn leaderboard_channel(category: &str) -> String {
         format!("leaderboard:{}", category)
+    }
+}
+
+/// Sequence allocation helpers shared by the event bus and snapshot handlers.
+///
+/// The bus owns the authoritative counters; snapshot handlers read the current
+/// value to stamp their response `watermark` so a client can tell whether the
+/// snapshot it received is newer than the events it has already applied.
+pub mod sequencing {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Global stream counter for events that are not scoped to a match.
+    static GLOBAL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Allocate the next global stream sequence.
+    pub fn next_stream_seq() -> u64 {
+        GLOBAL_SEQ.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The highest global stream sequence allocated so far.
+    ///
+    /// Snapshot handlers embed this as the response `watermark`.
+    pub fn current_stream_seq() -> u64 {
+        GLOBAL_SEQ.load(Ordering::SeqCst)
+    }
+
+    /// Allocate the next sequence for a specific match stream.
+    ///
+    /// Per-match counters keep match events ordered independently of unrelated
+    /// traffic, so a busy global stream cannot make a match client see gaps.
+    pub fn next_match_version(match_id: uuid::Uuid) -> u64 {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use std::sync::OnceLock;
+
+        static MATCH_SEQ: OnceLock<Mutex<HashMap<uuid::Uuid, u64>>> = OnceLock::new();
+        let map = MATCH_SEQ.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = map.lock().expect("match sequence mutex poisoned");
+        let entry = guard.entry(match_id).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    /// The highest sequence allocated for a match stream.
+    ///
+    /// Match snapshot handlers embed this as the response `watermark`.
+    pub fn current_match_version(match_id: uuid::Uuid) -> u64 {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        use std::sync::OnceLock;
+
+        static MATCH_SEQ: OnceLock<Mutex<HashMap<uuid::Uuid, u64>>> = OnceLock::new();
+        let map = MATCH_SEQ.get_or_init(|| Mutex::new(HashMap::new()));
+        let guard = map.lock().expect("match sequence mutex poisoned");
+        guard.get(&match_id).copied().unwrap_or(0)
     }
 }

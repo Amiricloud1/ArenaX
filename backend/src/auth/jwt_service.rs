@@ -8,6 +8,8 @@ use thiserror::Error;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+pub mod operator_session;
+
 /// JWT-related errors
 #[derive(Debug, Error)]
 pub enum JwtError {
@@ -34,6 +36,18 @@ pub enum JwtError {
 
     #[error("Key rotation error: {0}")]
     KeyRotation(String),
+
+    #[error("Operator session expired")]
+    OperatorSessionExpired,
+
+    #[error("Operator session revoked")]
+    OperatorSessionRevoked,
+
+    #[error("Operator session scope mismatch: required {required}, held {held}")]
+    OperatorSessionScopeMismatch { required: String, held: String },
+
+    #[error("Operator session not found")]
+    OperatorSessionNotFound,
 }
 
 impl From<redis::RedisError> for JwtError {
@@ -1155,6 +1169,49 @@ impl JwtService {
     pub async fn check_key_rotation(&self) -> bool {
         let key_rotation = self.key_rotation.read().await;
         key_rotation.should_rotate()
+    }
+
+    /// Sign an arbitrary claims payload with the current signing key.
+    ///
+    /// Used by the operator-session service to mint short-lived privileged
+    /// session tokens. The signing key lives only in this service's in-memory
+    /// key-rotation state (sourced from the secret store) and is never written
+    /// to the operator session store.
+    pub(crate) async fn sign_claims<T: Serialize>(&self, claims: &T) -> Result<String, JwtError> {
+        let key_rotation = self.key_rotation.read().await;
+        let encoding_key = EncodingKey::from_secret(key_rotation.current_key.as_bytes());
+        encode(&Header::new(self.config.algorithm), claims, &encoding_key)
+            .map_err(|e| JwtError::TokenGeneration(e.to_string()))
+    }
+
+    /// Verify a token signed by this service and return its claims.
+    ///
+    /// Unlike [`JwtService::validate_token`] this does not consult the
+    /// session store — the operator-session service performs its own
+    /// revocation/expiry checks against the operator session table.
+    pub(crate) fn verify_signed_claims<T: for<'de> Deserialize<'de>>(
+        &self,
+        token: &str,
+        secret_key: &str,
+    ) -> Result<T, JwtError> {
+        let mut validation = Validation::new(self.config.algorithm);
+        validation.leeway = 0;
+        if let Some(ref issuer) = self.config.issuer {
+            validation.set_issuer(&[issuer]);
+        }
+        if let Some(ref audience) = self.config.audience {
+            validation.set_audience(&[audience]);
+        }
+        let decoding_key = DecodingKey::from_secret(secret_key.as_bytes());
+        let token_data = decode::<T>(token, &decoding_key, &validation)?;
+        Ok(token_data.claims)
+    }
+
+    /// Current signing key, for callers that need to verify tokens minted by
+    /// this service (e.g. the operator-session service). The key is never
+    /// persisted by those callers.
+    pub(crate) async fn current_signing_key(&self) -> String {
+        self.key_rotation.read().await.current_key.clone()
     }
 }
 

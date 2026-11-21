@@ -78,6 +78,12 @@ export const QK = {
     auditLogs: (params?: Record<string, unknown>) => ["admin", "auditLogs", params] as const,
     kycReviews: (params?: Record<string, unknown>) => ["admin", "kycReviews", params] as const,
   },
+  // Dashboard analytics (budgeted, catalogued metrics)
+  analytics: {
+    all: ["analytics"] as const,
+    metric: (metricId: string, params?: Record<string, unknown>) =>
+      ["analytics", metricId, params] as const,
+  },
 } as const;
 
 // ─── Stale-time constants ─────────────────────────────────────────────────────
@@ -88,6 +94,153 @@ const STALE = {
   LONG: 5 * 60_000,   // 5 min — mostly static (profiles, governance)
   IMMUTABLE: Infinity, // Never re-fetch (e.g. historical records)
 } as const;
+
+// ─── Analytics budgets & governed catalog (Issues #253 / #254) ────────────────
+
+/**
+ * Budget metadata attached to every dashboard query. Each query must declare:
+ * - `metricId`: the governed catalog entry (owner, definition, sources, privacy
+ *   class, deprecation state) that the dashboard renders.
+ * - `latencyTargetMs`: p95 latency target for the query.
+ * - `freshnessTargetMs`: maximum acceptable data age before it is "stale".
+ * - `maxRangeMs`: bounded time range the query may request.
+ * - `maxPageSize`: pagination cap enforced client-side.
+ */
+export interface AnalyticsBudget {
+  metricId: string;
+  latencyTargetMs: number;
+  freshnessTargetMs: number;
+  maxRangeMs: number;
+  maxPageSize: number;
+}
+
+/** Server-reported budget status for a dashboard response. */
+export interface BudgetStatus {
+  /** True when the backend flagged the result as exceeding a budget. */
+  exceeded?: boolean;
+  /** True when the result is known to be incomplete (truncated / partial). */
+  incomplete?: boolean;
+  /** Age of the underlying data in ms, as reported by the backend. */
+  dataAgeMs?: number;
+  /** Server-side query duration in ms, as reported by the backend. */
+  queryDurationMs?: number;
+  /** Machine-readable reason codes (e.g. "timeout", "range_truncated"). */
+  reasons?: string[];
+}
+
+/** Normalised stale/incomplete marker surfaced to dashboard components. */
+export interface BudgetMarker {
+  stale: boolean;
+  incomplete: boolean;
+  reasons: string[];
+  dataAgeMs?: number;
+  queryDurationMs?: number;
+}
+
+export const ANALYTICS_BUDGETS = {
+  walletBalance: {
+    metricId: "wallet.balance.current",
+    latencyTargetMs: 500,
+    freshnessTargetMs: 30_000,
+    maxRangeMs: 0, // point-in-time snapshot, no range
+    maxPageSize: 1,
+  },
+  walletTransactions: {
+    metricId: "wallet.transactions.volume",
+    latencyTargetMs: 1_500,
+    freshnessTargetMs: 60_000,
+    maxRangeMs: 90 * 24 * 60 * 60_000, // 90 days
+    maxPageSize: 100,
+  },
+  tournamentList: {
+    metricId: "tournament.list.active",
+    latencyTargetMs: 800,
+    freshnessTargetMs: 60_000,
+    maxRangeMs: 30 * 24 * 60 * 60_000, // 30 days
+    maxPageSize: 50,
+  },
+  tournamentParticipants: {
+    metricId: "tournament.participants.count",
+    latencyTargetMs: 800,
+    freshnessTargetMs: 30_000,
+    maxRangeMs: 0,
+    maxPageSize: 500,
+  },
+  leaderboard: {
+    metricId: "retention.leaderboard.weekly",
+    latencyTargetMs: 1_000,
+    freshnessTargetMs: 60_000,
+    maxRangeMs: 7 * 24 * 60 * 60_000, // 7 days
+    maxPageSize: 100,
+  },
+  serviceHealth: {
+    metricId: "service.health.audit",
+    latencyTargetMs: 2_000,
+    freshnessTargetMs: 5 * 60_000,
+    maxRangeMs: 30 * 24 * 60 * 60_000, // 30 days
+    maxPageSize: 200,
+  },
+} as const satisfies Record<string, AnalyticsBudget>;
+
+export type AnalyticsBudgetKey = keyof typeof ANALYTICS_BUDGETS;
+
+/** Clamps a requested page size to the budget's cap. */
+export function clampPageSize(requested: number | undefined, budget: AnalyticsBudget): number {
+  const size = requested ?? budget.maxPageSize;
+  return Math.max(1, Math.min(size, budget.maxPageSize));
+}
+
+/**
+ * Extracts a `BudgetStatus` from a raw API payload. Accepts either a top-level
+ * `budget` field or a `meta.budget` field so both envelope styles are covered.
+ */
+export function extractBudgetStatus(payload: unknown): BudgetStatus | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const obj = payload as Record<string, unknown>;
+  const direct = obj["budget"];
+  if (direct && typeof direct === "object") return direct as BudgetStatus;
+  const meta = obj["meta"];
+  if (meta && typeof meta === "object") {
+    const nested = (meta as Record<string, unknown>)["budget"];
+    if (nested && typeof nested === "object") return nested as BudgetStatus;
+  }
+  return undefined;
+}
+
+/**
+ * Builds the visible stale/incomplete marker for a dashboard query. A result is
+ * considered stale when the backend flags an exceeded budget or when the
+ * reported data age exceeds the freshness target.
+ */
+export function buildBudgetMarker(
+  budget: AnalyticsBudget,
+  status: BudgetStatus | undefined,
+): BudgetMarker {
+  const reasons = status?.reasons ? [...status.reasons] : [];
+  const ageExceeded =
+    typeof status?.dataAgeMs === "number" && status.dataAgeMs > budget.freshnessTargetMs;
+  const latencyExceeded =
+    typeof status?.queryDurationMs === "number" &&
+    status.queryDurationMs > budget.latencyTargetMs;
+  if (ageExceeded && !reasons.includes("freshness_exceeded")) reasons.push("freshness_exceeded");
+  if (latencyExceeded && !reasons.includes("latency_exceeded")) reasons.push("latency_exceeded");
+  const stale = Boolean(status?.exceeded) || ageExceeded || latencyExceeded;
+  const incomplete = Boolean(status?.incomplete) || reasons.includes("range_truncated");
+  return {
+    stale,
+    incomplete,
+    reasons,
+    dataAgeMs: status?.dataAgeMs,
+    queryDurationMs: status?.queryDurationMs,
+  };
+}
+
+/** Result shape returned by budgeted dashboard hooks. */
+export interface BudgetedResult<T> {
+  data: T;
+  budget: AnalyticsBudget;
+  marker: BudgetMarker;
+}
 
 // ─── Cache invalidation helpers ───────────────────────────────────────────────
 
@@ -366,6 +519,24 @@ export function useLeaderboard(period = "weekly") {
   });
 }
 
+/**
+ * Budgeted leaderboard query (retention metric). Surfaces a stale/incomplete
+ * marker when the backend reports an exceeded freshness or latency budget.
+ */
+export function useBudgetedLeaderboard(period = "weekly") {
+  const budget = ANALYTICS_BUDGETS.leaderboard;
+  return useQuery<BudgetedResult<unknown>>({
+    queryKey: QK.analytics.metric(budget.metricId, { period }),
+    queryFn: async () => {
+      const res = await apiClient.get(`/leaderboard`, { params: { period } });
+      const status = extractBudgetStatus(res);
+      return { data: res, budget, marker: buildBudgetMarker(budget, status) };
+    },
+    staleTime: STALE.MEDIUM,
+    refetchInterval: STALE.MEDIUM,
+  });
+}
+
 // ─── Notifications ────────────────────────────────────────────────────────────
 
 export interface ApiNotification {
@@ -484,5 +655,69 @@ export function useAuditLogs(params?: Record<string, unknown>) {
       return apiClient.get("/admin/audit-logs", { params: p });
     },
     staleTime: STALE.MEDIUM,
+  });
+}
+
+/**
+ * Budgeted service-health audit query. Enforces the pagination cap and bounded
+ * time range, and surfaces a stale/incomplete marker on exceeded budgets.
+ */
+export function useBudgetedServiceHealth(params?: { page?: number; limit?: number; from?: string; to?: string }) {
+  const budget = ANALYTICS_BUDGETS.serviceHealth;
+  const limit = clampPageSize(params?.limit, budget);
+  return useQuery<BudgetedResult<unknown>>({
+    queryKey: QK.analytics.metric(budget.metricId, { ...params, limit }),
+    queryFn: async () => {
+      const p: Record<string, string> = { limit: String(limit) };
+      if (params?.page != null) p["page"] = String(params.page);
+      if (params?.from) p["from"] = params.from;
+      if (params?.to) p["to"] = params.to;
+      const res = await apiClient.get("/admin/audit-logs", { params: p });
+      const status = extractBudgetStatus(res);
+      return { data: res, budget, marker: buildBudgetMarker(budget, status) };
+    },
+    staleTime: STALE.MEDIUM,
+  });
+}
+
+// ─── Budgeted wallet analytics ────────────────────────────────────────────────
+
+/**
+ * Budgeted wallet transaction-volume query. Enforces the pagination cap and
+ * bounded time range, and surfaces a stale/incomplete marker on exceeded
+ * budgets. Financial state remains server-authoritative — this hook only reads.
+ */
+export function useBudgetedWalletTransactions(params?: { page?: number; limit?: number; from?: string; to?: string }) {
+  const budget = ANALYTICS_BUDGETS.walletTransactions;
+  const limit = clampPageSize(params?.limit, budget);
+  return useQuery<BudgetedResult<unknown>>({
+    queryKey: QK.analytics.metric(budget.metricId, { ...params, limit }),
+    queryFn: async () => {
+      const p: Record<string, string> = { limit: String(limit) };
+      if (params?.page != null) p["page"] = String(params.page);
+      if (params?.from) p["from"] = params.from;
+      if (params?.to) p["to"] = params.to;
+      const res = await apiClient.get("/wallet/transactions", { params: p });
+      const status = extractBudgetStatus(res);
+      return { data: res, budget, marker: buildBudgetMarker(budget, status) };
+    },
+    staleTime: STALE.MEDIUM,
+  });
+}
+
+/**
+ * Budgeted wallet balance query. Point-in-time snapshot; no range or pagination.
+ * Surfaces a stale marker when the backend reports exceeded freshness budgets.
+ */
+export function useBudgetedWalletBalance() {
+  const budget = ANALYTICS_BUDGETS.walletBalance;
+  return useQuery<BudgetedResult<unknown>>({
+    queryKey: QK.analytics.metric(budget.metricId),
+    queryFn: async () => {
+      const res = await apiClient.get("/wallet/balance");
+      const status = extractBudgetStatus(res);
+      return { data: res, budget, marker: buildBudgetMarker(budget, status) };
+    },
+    staleTime: STALE.SHORT,
   });
 }

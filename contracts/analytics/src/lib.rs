@@ -167,6 +167,32 @@ pub struct HourlySnapshot {
 /// Number of hourly slots retained (7 days).
 pub const SNAPSHOT_WINDOW_HOURS: u64 = 168;
 
+/// Current analytics event schema version. Producers stamp every event with
+/// the version they encoded against so consumers can route/upgrade safely.
+pub const ANALYTICS_SCHEMA_VERSION: u32 = 1;
+
+/// Durable ingestion outcome for a producer-assigned analytics event ID.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EventOutcome {
+    /// Event was accepted and its deltas applied exactly once.
+    Accepted,
+    /// Event was rejected (malformed / schema-invalid); see `reason`.
+    Rejected,
+}
+
+/// Recorded ingestion result for an analytics event ID.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EventReceipt {
+    pub event_id: BytesN<32>,
+    pub schema_version: u32,
+    pub outcome: EventOutcome,
+    /// Machine-readable rejection reason (empty for accepted events).
+    pub reason: Symbol,
+    pub recorded_at: u64,
+}
+
 // ─── Storage Keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -193,6 +219,8 @@ pub enum DataKey {
     RegisteredContract(Symbol),
     /// Circular hourly buffer slot (slot = hour % 168).
     HourlySnapshot(u32),
+    /// Durable dedup record for a producer-assigned analytics event ID.
+    EventReceipt(BytesN<32>),
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -406,7 +434,21 @@ impl AnalyticsContract {
 
     /// Push-style event ingestion. Only callable by registered contracts:
     /// looks up the address for `contract_id` and requires its auth.
-    pub fn record_event(env: Env, contract_id: Symbol, event_type: Symbol, value: i128) {
+    ///
+    /// `event_id` is a producer-assigned stable identifier. Retries carrying
+    /// the same `event_id` converge to a single accepted event: the first
+    /// delivery applies the deltas and records an `Accepted` receipt; later
+    /// deliveries are no-ops that return the existing receipt. Malformed or
+    /// schema-invalid events are recorded as `Rejected` receipts (a
+    /// diagnosable rejection path) and never mutate aggregates.
+    pub fn record_event(
+        env: Env,
+        contract_id: Symbol,
+        event_id: BytesN<32>,
+        schema_version: u32,
+        event_type: Symbol,
+        value: i128,
+    ) -> EventReceipt {
         Self::require_not_paused(&env);
         let reporter: Address = env
             .storage()
@@ -414,6 +456,31 @@ impl AnalyticsContract {
             .get(&DataKey::RegisteredContract(contract_id.clone()))
             .expect("contract not registered");
         reporter.require_auth();
+
+        let now = env.ledger().timestamp();
+        let receipt_key = DataKey::EventReceipt(event_id.clone());
+
+        // Deduplication: a previously recorded outcome (accepted or rejected)
+        // is authoritative. Retries converge to the first outcome.
+        if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, EventReceipt>(&receipt_key)
+        {
+            return existing;
+        }
+
+        // Schema-version rollout: only the current version is ingestible.
+        if schema_version != ANALYTICS_SCHEMA_VERSION {
+            return Self::reject_event(
+                &env,
+                &receipt_key,
+                event_id,
+                schema_version,
+                Symbol::new(&env, "bad_schema"),
+                now,
+            );
+        }
 
         let is_tx = event_type == Symbol::new(&env, "transaction")
             || event_type == Symbol::new(&env, "tx");
@@ -423,10 +490,27 @@ impl AnalyticsContract {
         let is_fee =
             event_type == Symbol::new(&env, "fee") || event_type == Symbol::new(&env, "fees");
         if !(is_tx || is_volume || is_user || is_fee) {
-            panic!("unknown event type");
+            return Self::reject_event(
+                &env,
+                &receipt_key,
+                event_id,
+                schema_version,
+                Symbol::new(&env, "bad_type"),
+                now,
+            );
         }
 
-        let now = env.ledger().timestamp();
+        // Value sanity: volume/fee deltas must be non-negative.
+        if (is_volume || is_fee) && value < 0 {
+            return Self::reject_event(
+                &env,
+                &receipt_key,
+                event_id,
+                schema_version,
+                Symbol::new(&env, "bad_value"),
+                now,
+            );
+        }
         let mut snap: PlatformSnapshot = env
             .storage()
             .instance()
@@ -496,6 +580,35 @@ impl AnalyticsContract {
         bucket.total_users += d_users;
         bucket.total_fees_collected += d_fees;
         env.storage().persistent().set(&key, &bucket);
+
+        // Record the accepted outcome so retries converge to one event.
+        let receipt = EventReceipt {
+            event_id: event_id.clone(),
+            schema_version,
+            outcome: EventOutcome::Accepted,
+            reason: Symbol::new(&env, "ok"),
+            recorded_at: now,
+        };
+        env.storage().persistent().set(&receipt_key, &receipt);
+
+        env.events().publish(
+            (
+                soroban_sdk::symbol_short!("EVT_ACC"),
+                contract_id,
+                event_id,
+                schema_version,
+            ),
+            (event_type, value),
+        );
+
+        receipt
+    }
+
+    /// Query the recorded ingestion outcome for an event ID.
+    pub fn get_event_receipt(env: Env, event_id: BytesN<32>) -> Option<EventReceipt> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EventReceipt(event_id))
     }
 
     /// Single-read platform snapshot for dashboards.
@@ -823,6 +936,34 @@ impl AnalyticsContract {
         input.append(&salt.into());
         input.append(&player.clone().to_xdr(env));
         env.crypto().sha256(&input).into()
+    }
+
+    /// Persist a rejection receipt and emit a diagnosable rejection event.
+    fn reject_event(
+        env: &Env,
+        receipt_key: &DataKey,
+        event_id: BytesN<32>,
+        schema_version: u32,
+        reason: Symbol,
+        now: u64,
+    ) -> EventReceipt {
+        let receipt = EventReceipt {
+            event_id: event_id.clone(),
+            schema_version,
+            outcome: EventOutcome::Rejected,
+            reason: reason.clone(),
+            recorded_at: now,
+        };
+        env.storage().persistent().set(receipt_key, &receipt);
+        env.events().publish(
+            (
+                soroban_sdk::symbol_short!("EVT_REJ"),
+                event_id,
+                schema_version,
+            ),
+            reason,
+        );
+        receipt
     }
 
     fn require_admin(env: &Env) {

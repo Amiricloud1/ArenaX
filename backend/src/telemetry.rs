@@ -33,6 +33,98 @@ use opentelemetry_sdk::Resource;
 use sentry::ClientInitGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+/// Target used for analytics ingestion/dashboard budget telemetry. Operators
+/// can filter on this target (e.g. `RUST_LOG=analytics=info`) to isolate
+/// ingestion rejections and budget breaches from general request logs.
+pub const ANALYTICS_TARGET: &str = "analytics";
+
+/// Emit a structured span + error log for a rejected analytics event.
+///
+/// Called from the analytics ingestion boundary whenever an event is rejected
+/// (malformed payload, schema-version mismatch, unauthorized producer, or a
+/// deduplication conflict that cannot converge). The `correlation_id` is the
+/// stable event ID assigned by the producer, so an operator can trace a
+/// rejection back to the exact producer delivery attempt even after retries.
+///
+/// The span carries the correlation ID as a *field* (not a resource
+/// attribute) to keep cardinality bounded, and the `tracing::error!` call is
+/// what the `sentry_tracing` layer turns into a Sentry event (and, via
+/// `before_send`, a Slack alert for critical errors).
+pub fn record_analytics_rejection(
+    correlation_id: &str,
+    producer: &str,
+    reason: &str,
+    schema_version: Option<&str>,
+) {
+    let span = tracing::error_span!(
+        target: ANALYTICS_TARGET,
+        "analytics.event.rejected",
+        correlation_id = correlation_id,
+        producer = producer,
+        reason = reason,
+        schema_version = schema_version.unwrap_or("unknown"),
+    );
+    let _guard = span.enter();
+    tracing::error!(
+        target: ANALYTICS_TARGET,
+        correlation_id = correlation_id,
+        producer = producer,
+        reason = reason,
+        schema_version = schema_version.unwrap_or("unknown"),
+        "analytics event rejected"
+    );
+}
+
+/// Emit a structured span + warn/error log when a dashboard query exceeds its
+/// latency or freshness budget.
+///
+/// `budget_kind` is `"latency"` or `"freshness"`; `observed_ms` is the
+/// measured value and `budget_ms` the documented target. Breaches are logged
+/// at `warn` (degraded but served) or `error` (query timed out / data marked
+/// stale) depending on `timed_out`, so operators get an alertable signal
+/// without every slow query paging.
+pub fn record_dashboard_budget_breach(
+    dashboard: &str,
+    query_id: &str,
+    budget_kind: &str,
+    observed_ms: u64,
+    budget_ms: u64,
+    timed_out: bool,
+) {
+    let span = tracing::warn_span!(
+        target: ANALYTICS_TARGET,
+        "analytics.dashboard.budget_breach",
+        dashboard = dashboard,
+        query_id = query_id,
+        budget_kind = budget_kind,
+        observed_ms = observed_ms,
+        budget_ms = budget_ms,
+        timed_out = timed_out,
+    );
+    let _guard = span.enter();
+    if timed_out {
+        tracing::error!(
+            target: ANALYTICS_TARGET,
+            dashboard = dashboard,
+            query_id = query_id,
+            budget_kind = budget_kind,
+            observed_ms = observed_ms,
+            budget_ms = budget_ms,
+            "analytics dashboard query exceeded budget and timed out; serving stale/incomplete state"
+        );
+    } else {
+        tracing::warn!(
+            target: ANALYTICS_TARGET,
+            dashboard = dashboard,
+            query_id = query_id,
+            budget_kind = budget_kind,
+            observed_ms = observed_ms,
+            budget_ms = budget_ms,
+            "analytics dashboard query exceeded budget; serving stale/incomplete state"
+        );
+    }
+}
+
 /// Handle kept alive for the lifetime of the process so spans can be flushed
 /// and exported on shutdown, and so the Sentry client stays connected (and
 /// flushes on drop) for the process lifetime.

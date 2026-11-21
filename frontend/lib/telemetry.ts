@@ -70,6 +70,23 @@ const SENSITIVE_KEY_PATTERNS: RegExp[] = [
   /evidence/i,
   /payload/i,
   /body/i,
+  // Payment details (issue #248): never let card data or amounts tied to a
+  // payer leave the process through error reports.
+  /card/i,
+  /cvv/i,
+  /cvc/i,
+  /pan/i,
+  /iban/i,
+  /account[-_]?number/i,
+  /routing/i,
+  /payment/i,
+  /billing/i,
+  /amount/i,
+  /wallet/i,
+  /form/i,
+  /field/i,
+  /input/i,
+  /value/i,
 ];
 
 const REDACTED = "[REDACTED]";
@@ -106,6 +123,58 @@ export function redactHeaders(
   for (const [name, value] of Object.entries(headers)) {
     if (value === undefined) continue;
     out[name] = isSensitiveKey(name) ? REDACTED : String(value);
+  }
+  return out;
+}
+
+/**
+ * Safe, whitelisted context for client-side error reports (issue #248).
+ *
+ * Error boundaries must never forward raw error objects, props, form state, or
+ * request payloads. Only these keys survive; everything else is dropped rather
+ * than redacted so new fields cannot leak by default.
+ */
+export interface ErrorReportContext {
+  route?: string;
+  correlationId?: string;
+  errorName?: string;
+  digest?: string;
+}
+
+const SAFE_ERROR_CONTEXT_KEYS: ReadonlyArray<keyof ErrorReportContext> = [
+  "route",
+  "correlationId",
+  "errorName",
+  "digest",
+];
+
+/** Correlation IDs are opaque tokens; bound their length and charset. */
+const CORRELATION_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+
+function sanitizeScalar(value: unknown, maxLength = 256): string | undefined {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const text = String(value);
+  if (text.length === 0) return undefined;
+  return text.length > maxLength ? text.slice(0, maxLength) : text;
+}
+
+/**
+ * Reduce arbitrary error-boundary context to the privacy-safe whitelist.
+ * Unknown keys, nested objects, and non-scalar values are discarded.
+ */
+export function redactErrorContext(
+  context: Record<string, unknown> = {},
+): ErrorReportContext {
+  const out: ErrorReportContext = {};
+  for (const key of SAFE_ERROR_CONTEXT_KEYS) {
+    const raw = context[key];
+    if (key === "correlationId") {
+      const id = sanitizeScalar(raw, 128);
+      if (id && CORRELATION_ID_PATTERN.test(id)) out.correlationId = id;
+      continue;
+    }
+    const value = sanitizeScalar(raw);
+    if (value !== undefined) out[key] = value;
   }
   return out;
 }
@@ -210,5 +279,21 @@ export function buildTelemetryEvent(
     ...RESOURCE_ATTRIBUTES,
     event: name,
     context: redact(context),
+  };
+}
+
+/**
+ * Build a Sentry/Datadog-safe error event for a client error boundary.
+ * Only the whitelisted {@link ErrorReportContext} fields are included, so
+ * tokens, payment details, and raw form contents can never be attached.
+ */
+export function buildErrorTelemetryEvent(
+  name: string,
+  context: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    ...RESOURCE_ATTRIBUTES,
+    event: name,
+    context: redactErrorContext(context),
   };
 }

@@ -27,6 +27,49 @@ export interface StandardResponse<T = unknown> {
   message?: string;
   /** Request-scoped metadata injected by the interceptor. */
   meta: ResponseMeta;
+  /**
+   * Optional realtime metadata. Present on snapshot responses that are
+   * backed by an event stream, so clients can bootstrap a consistent view
+   * and then apply subsequent events from the declared sequence window.
+   */
+  realtime?: RealtimeSnapshotMeta;
+}
+
+/**
+ * Realtime bootstrap metadata attached to snapshot responses.
+ *
+ * A snapshot response declares the stream it belongs to and the sequence
+ * watermark up to which its payload is authoritative. Clients must:
+ *  - discard any event whose `seq` is `<= watermark` (already reflected),
+ *  - detect gaps when an event's `seq` is greater than `watermark + 1`
+ *    (or the last applied sequence) and request a replacement snapshot,
+ *  - reject events from a different `streamId` or an older `snapshotVersion`.
+ */
+export interface RealtimeSnapshotMeta {
+  /** Identifier of the event stream this snapshot belongs to. */
+  streamId: string;
+  /**
+   * Sequence number of the last event already reflected in `data`.
+   * Subsequent events with `seq > watermark` may be applied on top.
+   */
+  watermark: number;
+  /**
+   * Convenience alias for `watermark`; the stream sequence from which
+   * subsequent events can be applied. When both are present they must match.
+   */
+  streamSeq?: number;
+  /**
+   * Monotonic version of the snapshot itself. A snapshot with a lower
+   * version than one already applied must be rejected as stale.
+   */
+  snapshotVersion?: number;
+  /** ISO-8601 timestamp when the snapshot was generated server-side. */
+  generatedAt?: string;
+  /**
+   * How long (ms) the server retains events for replay from `watermark`.
+   * Clients that reconnect after this window must request a fresh snapshot.
+   */
+  retentionMs?: number;
 }
 
 /**
@@ -51,6 +94,94 @@ export interface ResponseMeta {
   cached: boolean;
   /** Applied transformation pipeline stages (for debugging). */
   transformations: string[];
+  /**
+   * Security scope the response belongs to. Authenticated query keys must
+   * include this scope so a cached response cannot outlive an account,
+   * workspace, role, or authorization change.
+   */
+  cacheScope: ResponseCacheScope;
+  /**
+   * Resource families touched by this response. Used by the cross-tab
+   * invalidation protocol to identify what to refetch without broadcasting
+   * private payloads.
+   */
+  resourceFamilies: ResourceFamily[];
+}
+
+// ─── Cache scope ──────────────────────────────────────────────────────────────
+
+/**
+ * Minimum stable identity/permission context for a cached response.
+ *
+ * `accountId` and `workspaceId` scope the cache to a single identity;
+ * `permissionVersion` (or `role`) invalidates entries when privileges change.
+ * Anonymous responses use `visibility: "public"` and may be shared.
+ */
+export interface ResponseCacheScope {
+  /** Stable account identifier, or `null` for anonymous requests. */
+  accountId: string | null;
+  /** Active workspace/tenant identifier, or `null` when not applicable. */
+  workspaceId: string | null;
+  /** Role or permission-set fingerprint used to invalidate on privilege change. */
+  permissionVersion: string | null;
+  /**
+   * `public` responses may be served from shared caches; `private` responses
+   * must never be stored in a shared cache (`Cache-Control: no-store`).
+   */
+  visibility: "public" | "private";
+}
+
+/**
+ * Build a stable cache key fragment from a scope. Private scopes always
+ * include the account/workspace/permission context; public scopes collapse
+ * to a single shared fragment.
+ */
+export function cacheScopeKey(scope: ResponseCacheScope): string {
+  if (scope.visibility === "public") return "public";
+  return [
+    "private",
+    scope.accountId ?? "anon",
+    scope.workspaceId ?? "none",
+    scope.permissionVersion ?? "none",
+  ].join(":");
+}
+
+/**
+ * Whether a response with this scope may be stored in a shared cache.
+ */
+export function isShareableScope(scope: ResponseCacheScope): boolean {
+  return scope.visibility === "public";
+}
+
+// ─── Resource families (cross-tab invalidation) ───────────────────────────────
+
+/**
+ * Coarse resource families used by the cross-tab invalidation protocol.
+ * Messages carry only family identifiers — never private payloads.
+ */
+export type ResourceFamily =
+  | "wallet"
+  | "profile"
+  | "membership"
+  | "notifications"
+  | "settings";
+
+export const RESOURCE_FAMILIES: readonly ResourceFamily[] = [
+  "wallet",
+  "profile",
+  "membership",
+  "notifications",
+  "settings",
+] as const;
+
+/**
+ * Narrow an arbitrary value to a `ResourceFamily`.
+ */
+export function isResourceFamily(value: unknown): value is ResourceFamily {
+  return (
+    typeof value === "string" &&
+    (RESOURCE_FAMILIES as readonly string[]).includes(value)
+  );
 }
 
 // ─── Paginated envelope ───────────────────────────────────────────────────────

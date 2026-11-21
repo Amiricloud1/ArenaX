@@ -24,9 +24,15 @@ use crate::{
     },
     http::auth_handler::ACCESS_TOKEN_COOKIE,
     middleware::security::validate_uuid,
-    service::feature_flags::{
-        CreateFlagRequest, FeatureFlagService, SetOverrideRequest, TrackEventRequest,
-        UpdateFlagRequest,
+    service::{
+        experiments::{
+            CreateExperimentRequest, ExperimentService, RecordExposureRequest,
+            UpdateExperimentRequest,
+        },
+        feature_flags::{
+            CreateFlagRequest, FeatureFlagService, SetOverrideRequest, TrackEventRequest,
+            UpdateFlagRequest,
+        },
     },
 };
 use actix_web::{web, HttpRequest, HttpResponse};
@@ -38,6 +44,12 @@ use uuid::Uuid;
 #[derive(Deserialize)]
 pub struct EvaluateQuery {
     /// Admins may evaluate flags as another user.
+    pub user_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AssignQuery {
+    /// Admins may assign experiments as another user.
     pub user_id: Option<String>,
 }
 
@@ -87,10 +99,22 @@ fn svc(db: &web::Data<PgPool>) -> FeatureFlagService {
     FeatureFlagService::new(db.get_ref().clone())
 }
 
+fn exp_svc(db: &web::Data<PgPool>) -> ExperimentService {
+    ExperimentService::new(db.get_ref().clone())
+}
+
 fn resolve_evaluate_user(
     claims: &Claims,
     query: &EvaluateQuery,
 ) -> Result<Uuid, ApiError> {
+    if let Some(raw) = &query.user_id {
+        require_admin(claims)?;
+        return validate_uuid(raw).map_err(|e| ApiError::BadRequest(e.to_string()));
+    }
+    claims_user_id(claims)
+}
+
+fn resolve_assign_user(claims: &Claims, query: &AssignQuery) -> Result<Uuid, ApiError> {
     if let Some(raw) = &query.user_id {
         require_admin(claims)?;
         return validate_uuid(raw).map_err(|e| ApiError::BadRequest(e.to_string()));
@@ -141,6 +165,128 @@ pub async fn track_event(
         .track_event(&path.into_inner(), user_id, body.into_inner())
         .await?;
     Ok(HttpResponse::NoContent().finish())
+}
+
+// ─── User-facing experiment assignment & exposure ────────────────────────────
+
+/// POST /api/experiments/{key}/assign
+pub async fn assign_experiment(
+    req: HttpRequest,
+    jwt: web::Data<Arc<JwtService>>,
+    db: web::Data<PgPool>,
+    path: web::Path<String>,
+    query: web::Query<AssignQuery>,
+) -> Result<HttpResponse, ApiError> {
+    let claims = extract_claims(&req, &jwt).await?;
+    let user_id = resolve_assign_user(&claims, &query)?;
+    let assignment = exp_svc(&db).assign(&path.into_inner(), user_id).await?;
+    Ok(HttpResponse::Ok().json(assignment))
+}
+
+/// POST /api/experiments/{key}/exposure
+pub async fn record_exposure(
+    req: HttpRequest,
+    jwt: web::Data<Arc<JwtService>>,
+    db: web::Data<PgPool>,
+    path: web::Path<String>,
+    body: web::Json<RecordExposureRequest>,
+) -> Result<HttpResponse, ApiError> {
+    let claims = extract_claims(&req, &jwt).await?;
+    let user_id = claims_user_id(&claims)?;
+    exp_svc(&db)
+        .record_exposure(&path.into_inner(), user_id, body.into_inner())
+        .await?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+// ─── Admin: experiment definitions & analysis ────────────────────────────────
+
+/// GET /api/experiments
+pub async fn list_experiments(
+    req: HttpRequest,
+    jwt: web::Data<Arc<JwtService>>,
+    db: web::Data<PgPool>,
+) -> Result<HttpResponse, ApiError> {
+    let claims = extract_claims(&req, &jwt).await?;
+    require_admin(&claims)?;
+    let experiments: Vec<_> = exp_svc(&db)
+        .list_experiments()
+        .await?
+        .iter()
+        .map(|e| e.to_response())
+        .collect();
+    Ok(HttpResponse::Ok().json(experiments))
+}
+
+/// POST /api/experiments
+pub async fn create_experiment(
+    req: HttpRequest,
+    jwt: web::Data<Arc<JwtService>>,
+    db: web::Data<PgPool>,
+    body: web::Json<CreateExperimentRequest>,
+) -> Result<HttpResponse, ApiError> {
+    let claims = extract_claims(&req, &jwt).await?;
+    require_admin(&claims)?;
+    let created_by = claims_user_id(&claims).ok();
+    let experiment = exp_svc(&db)
+        .create_experiment(body.into_inner(), created_by)
+        .await?;
+    Ok(HttpResponse::Created().json(experiment.to_response()))
+}
+
+/// GET /api/experiments/{key}
+pub async fn get_experiment(
+    req: HttpRequest,
+    jwt: web::Data<Arc<JwtService>>,
+    db: web::Data<PgPool>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, ApiError> {
+    let claims = extract_claims(&req, &jwt).await?;
+    require_admin(&claims)?;
+    let experiment = exp_svc(&db).get_experiment(&path.into_inner()).await?;
+    Ok(HttpResponse::Ok().json(experiment.to_response()))
+}
+
+/// PUT /api/experiments/{key}
+pub async fn update_experiment(
+    req: HttpRequest,
+    jwt: web::Data<Arc<JwtService>>,
+    db: web::Data<PgPool>,
+    path: web::Path<String>,
+    body: web::Json<UpdateExperimentRequest>,
+) -> Result<HttpResponse, ApiError> {
+    let claims = extract_claims(&req, &jwt).await?;
+    require_admin(&claims)?;
+    let experiment = exp_svc(&db)
+        .update_experiment(&path.into_inner(), body.into_inner())
+        .await?;
+    Ok(HttpResponse::Ok().json(experiment.to_response()))
+}
+
+/// DELETE /api/experiments/{key}
+pub async fn delete_experiment(
+    req: HttpRequest,
+    jwt: web::Data<Arc<JwtService>>,
+    db: web::Data<PgPool>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, ApiError> {
+    let claims = extract_claims(&req, &jwt).await?;
+    require_admin(&claims)?;
+    exp_svc(&db).delete_experiment(&path.into_inner()).await?;
+    Ok(HttpResponse::NoContent().finish())
+}
+
+/// GET /api/experiments/{key}/analysis
+pub async fn get_experiment_analysis(
+    req: HttpRequest,
+    jwt: web::Data<Arc<JwtService>>,
+    db: web::Data<PgPool>,
+    path: web::Path<String>,
+) -> Result<HttpResponse, ApiError> {
+    let claims = extract_claims(&req, &jwt).await?;
+    require_admin(&claims)?;
+    let analysis = exp_svc(&db).analyze(&path.into_inner()).await?;
+    Ok(HttpResponse::Ok().json(analysis))
 }
 
 // ─── Admin: remote configuration ──────────────────────────────────────────────
@@ -300,5 +446,16 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
                 web::delete().to(remove_override),
             )
             .route("/{key}/analytics", web::get().to(get_analytics)),
+    );
+    cfg.service(
+        web::scope("/experiments")
+            .route("/{key}/assign", web::post().to(assign_experiment))
+            .route("/{key}/exposure", web::post().to(record_exposure))
+            .route("/{key}/analysis", web::get().to(get_experiment_analysis))
+            .route("", web::get().to(list_experiments))
+            .route("", web::post().to(create_experiment))
+            .route("/{key}", web::get().to(get_experiment))
+            .route("/{key}", web::put().to(update_experiment))
+            .route("/{key}", web::delete().to(delete_experiment)),
     );
 }

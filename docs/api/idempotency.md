@@ -70,9 +70,59 @@ DELETE /api/idempotency/invalidate/{key}
 GET /api/idempotency/info
 ```
 
+## Offline Command Queue
+
+The client only replays mutations from an explicit **allowlist** of offline-safe commands. Every queued command must declare the following metadata; a command missing any field is rejected from the queue:
+
+| Field | Description |
+|-------|-------------|
+| `idempotencyKey` | UUID sent as `Idempotency-Key` on every replay attempt |
+| `expiresAt` | Absolute expiry; expired commands are dropped, never replayed |
+| `userScope` | The authenticated user the command belongs to |
+| `conflictStrategy` | How to resolve a conflict on replay (see below) |
+
+### Allowlisted Commands
+
+Only non-financial, non-competitive mutations are queueable, for example:
+
+| Command | Conflict strategy |
+|---------|-------------------|
+| Update profile preferences | `server-wins` (refetch) |
+| Mark notification as read | `idempotent` |
+| Save draft / local settings sync | `client-wins` (only if server version unchanged) |
+
+### Rejected Offline Operations
+
+The following are **never** queued and must fail fast while offline, surfacing a recoverable error to the user:
+
+- Any payment, refund, deposit, or withdrawal (`/api/payments/*`, `/api/wallets/*`)
+- Tournament registration (`/api/tournaments/join`)
+- Matchmaking queue entry (`/api/matchmaking/join`)
+- Any other financial or competitive action
+
+These require a live connection so the server remains authoritative.
+
+### Purge on Logout / Account Switch
+
+Queued commands are scoped to `userScope`. On logout or account switch the client purges all commands for the previous user; commands are never replayed under a different account.
+
+### Conflict Surfacing on Replay
+
+On reconnect, each command is replayed with its stored idempotency key. If the server reports a conflict (e.g. `409`, or a newer server version), the client **surfaces the conflict** to the user with a recoverable prompt (retry, discard, or review) rather than silently overwriting newer server state.
+
+## Optimistic Mutations: Rollback & Reconciliation
+
+Every optimistic mutation declares whether it is optimistic and provides a safe rollback/refetch strategy for each affected resource.
+
+- **Rollback**: on validation error or timeout, the affected resource is restored to its last known server snapshot (or refetched).
+- **Version guard**: each resource carries a server version/ETag. A late response whose version is older than the current server version is discarded and cannot overwrite newer state.
+- **Recoverable failure state**: failures are surfaced accessibly (announced to assistive tech) with a retry action; retries reuse the original idempotency key so duplicates are not created.
+
 ## Best Practices
 
 - Generate a new UUID for each distinct user action — never reuse keys across different operations.
 - Store the key alongside the pending operation in your client state so you can replay it on network failure.
 - If you receive a `409 PayloadMismatch`, it means you accidentally reused a key — generate a new one.
 - Keys are automatically cleaned up after TTL expiry; you don't need to delete them manually.
+- Only enqueue offline-safe commands; never queue payments or match actions.
+- Always set an expiry and user scope on queued commands, and purge on logout/account switch.

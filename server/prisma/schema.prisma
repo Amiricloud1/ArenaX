@@ -61,6 +61,9 @@ model User {
   organizedTournaments     Tournament[]
   leaderboardEntries       LeaderboardEntry[]
   apiKeys                  ApiKey[]
+  experimentAssignments    ExperimentAssignment[]
+  experimentExposures      ExperimentExposure[]
+  privacyDeletionJobs      PrivacyDeletionJob[]
 
   @@index([deletedAt])
   @@index([provider])
@@ -639,6 +642,7 @@ model Leaderboard {
   deletedAt   DateTime?
 
   entries     LeaderboardEntry[]
+  snapshots   LeaderboardSnapshot[]
 
   @@index([type])
   @@index([gameModeId])
@@ -996,5 +1000,137 @@ model ApiKey {
   updatedAt DateTime  @updatedAt
 
   @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Product analytics: durable event identity, deduplication and rejection path
+// ---------------------------------------------------------------------------
+
+enum AnalyticsEventStatus {
+  ACCEPTED
+  REJECTED
+}
+
+// One row per accepted event. The (producerId, eventId) unique constraint is
+// the durable deduplication boundary: retries of the same event converge to a
+// single accepted row regardless of delivery order or producer restarts.
+model AnalyticsEvent {
+  id             String               @id @default(uuid())
+  producerId     String
+  eventId        String
+  eventName      String
+  schemaVersion  String
+  status         AnalyticsEventStatus @default(ACCEPTED)
+  occurredAt     DateTime
+  receivedAt     DateTime             @default(now())
+  // Anonymous analytics subject reference; never a raw auth identifier.
+  subjectRef     String?
+  // Event properties only. Identity links are stored separately.
+  payload        Json                 @default("{}")
+  requestHash    String?              @db.Char(64)
+  createdAt      DateTime             @default(now())
+
+  @@unique([producerId, eventId])
+  @@index([eventName, occurredAt])
+  @@index([subjectRef, occurredAt])
+  @@index([schemaVersion])
+  @@index([receivedAt])
+}
+
+// Diagnosable rejection path for malformed / schema-invalid events. Kept in a
+// separate table so rejected deliveries never pollute accepted event data.
+model AnalyticsEventRejection {
+  id            String   @id @default(uuid())
+  producerId    String
+  eventId       String?
+  eventName     String?
+  schemaVersion String?
+  reason        String   // e.g. MALFORMED_JSON, SCHEMA_INVALID, UNKNOWN_SCHEMA_VERSION
+  detail        String?
+  rawPayload    Json?
+  receivedAt    DateTime @default(now())
+  createdAt     DateTime @default(now())
+
+  @@index([producerId, eventId])
+  @@index([reason])
+  @@index([receivedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Privacy-safe identity stitching (kept separate from event payloads)
+// ---------------------------------------------------------------------------
+
+enum AnalyticsIdentityLinkStatus {
+  ACTIVE
+  REVOKED
+}
+
+// Purpose-limited, consent-aware link between an anonymous analytics subject
+// and an authenticated account. Account identity is referenced by an opaque
+// accountRef (not the raw user id / email / auth identifier) so exported
+// analytics never exposes raw authentication identifiers.
+model AnalyticsIdentityLink {
+  id             String                       @id @default(uuid())
+  anonymousRef   String
+  accountRef     String
+  purpose        String                       @default("PRODUCT_ANALYTICS")
+  consentVersion String?
+  status         AnalyticsIdentityLinkStatus  @default(ACTIVE)
+  linkedAt       DateTime                     @default(now())
+  revokedAt      DateTime?
+  // Deterministic merge semantics: the earliest link wins on collision.
+  mergedIntoRef  String?
+  metadata       Json                         @default("{}")
+  createdAt      DateTime                     @default(now())
+  updatedAt      DateTime                     @updatedAt
+
+  @@unique([anonymousRef, accountRef, purpose])
+  @@index([anonymousRef, status])
+  @@index([accountRef, status])
+  @@index([purpose])
+  @@index([revokedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Governed metric catalog
+// ---------------------------------------------------------------------------
+
+enum MetricPrivacyClass {
+  PUBLIC
+  INTERNAL
+  CONFIDENTIAL
+  RESTRICTED
+}
+
+enum MetricDeprecationState {
+  ACTIVE
+  DEPRECATED
+  RETIRED
+}
+
+model MetricCatalogEntry {
+  id                 String                 @id @default(uuid())
+  name               String                 @unique
+  displayName        String
+  description        String?
+  owner              String
+  queryDefinition    String
+  sourceEvents       String[]               @default([])
+  sourceTables       String[]               @default([])
+  freshnessSeconds   Int?
+  privacyClass       MetricPrivacyClass     @default(INTERNAL)
+  deprecationState   MetricDeprecationState @default(ACTIVE)
+  definitionVersion  Int                    @default(1)
+  definitionHash     String?                @db.Char(64)
+  reviewedBy         String?
+  reviewedAt         DateTime?
+  deprecatedAt       DateTime?
+  metadata           Json                   @default("{}")
+  createdAt          DateTime               @default(now())
+  updatedAt          DateTime               @updatedAt
+
+  @@index([owner])
+  @@index([privacyClass])
+  @@index([deprecationState])
 }
 

@@ -1,10 +1,13 @@
 // Core models
 pub mod achievement;
+pub mod analytics;
 pub mod api_key;
 pub mod batch;
 pub mod dispute;
+pub mod experiment;
 pub mod idempotency;
 pub mod leaderboard;
+pub mod privacy_deletion;
 pub mod match_authority;
 pub mod match_models;
 pub mod matchmaker;
@@ -20,6 +23,9 @@ pub mod wallet;
 
 // Re-export commonly used types - explicit to avoid ambiguity
 pub use achievement::*;
+pub use analytics::{
+    AnalyticsEvent, AnalyticsEventRejection, IdentityLink, MetricCatalogEntry, QueryBudget,
+};
 // Explicit list (not `dispute::*`): `TicketStatus`/`CreateTicketRequest` are
 // deliberately distinct names from match_models' `DisputeStatus`/
 // `CreateDisputeRequest` to avoid a glob-export collision between the two
@@ -29,8 +35,10 @@ pub use dispute::{
     DisputeEvidence, DisputeHistoryEntry, EscalateDisputeRequest, EscalationLevel,
     ListDisputesQuery, RejectDisputeRequest, ResolveDisputeRequest, TicketStatus,
 };
+pub use experiment::*;
 pub use idempotency::*;
 pub use leaderboard::*;
+pub use privacy_deletion::*;
 pub use match_authority::*;
 pub use match_models::{
     CreateDisputeRequest, DisputeListResponse, DisputeStatus, EloHistory, EloResponse,

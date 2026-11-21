@@ -55,6 +55,15 @@ export interface Match {
    * as the WebSocket baseline so the snapshot and the stream converge.
    */
   version?: number;
+  /**
+   * Authoritative stream sequence watermark (#239). Every snapshot response
+   * carries the sequence of the last event already reflected in it; events with
+   * `seq <= streamSeq` are stale and must be rejected, and events with
+   * `seq > streamSeq + 1` indicate a gap that requires a replacement snapshot.
+   */
+  streamSeq?: number;
+  /** Alias for `streamSeq` used by the snapshot/event merge contract (#239). */
+  watermark?: number;
 }
 
 export type MatchStatus =
@@ -193,16 +202,70 @@ export interface MatchHubDetails {
   replayUrl?: string;
   /** Live-stream sequence baseline adopted from the authoritative snapshot (#33) */
   version?: number;
-  /** Locale formatting hints for this match's money, dates and durations (#245). */
-  localeFormatting?: MatchLocaleFormatting;
-  /** Locale-formatted score pair for display (#245). */
-  localizedScore?: LocalizedScore;
-  /** Locale-formatted scheduled time for display (#245). */
-  localizedScheduledTime?: string;
-  /** Locale-formatted prize pool for display (#245). */
-  localizedPrizePool?: string;
-  /** Locale-formatted dispute deadline for display (#245). */
-  localizedCanDisputeUntil?: string;
+  /** Authoritative stream sequence watermark for this snapshot (#239) */
+  streamSeq?: number;
+  /** Alias for `streamSeq` used by the snapshot/event merge contract (#239) */
+  watermark?: number;
+}
+
+// ─── Realtime Snapshot / Event Merge Contract (#239) ───────────────────────────
+
+/**
+ * Envelope for a single realtime event delivered over the WebSocket. `seq` is
+ * the server-assigned monotonic sequence number for the match stream.
+ */
+export interface RealtimeEventEnvelope<T = unknown> {
+  matchId: string;
+  /** Monotonic per-match sequence number assigned by the server */
+  seq: number;
+  /** Server timestamp (ISO-8601) at which the event was produced */
+  emittedAt: string;
+  /** Event kind, e.g. "score", "status", "chat", "spectator" */
+  type: string;
+  payload: T;
+}
+
+/** Why the client decided to request a replacement snapshot */
+export type RealtimeResyncReason =
+  | "gap" // an event arrived with seq > watermark + 1
+  | "stale" // an event arrived with seq <= watermark
+  | "reconnect" // socket reconnected; baseline may be outdated
+  | "retention_expired" // server no longer retains events after our watermark
+  | "manual"; // explicit user/operator request
+
+/** Request sent to the server to obtain a fresh authoritative snapshot */
+export interface RealtimeSnapshotRequest {
+  matchId: string;
+  /** Watermark the client currently holds; server may answer with a delta or full snapshot */
+  sinceSeq?: number;
+  reason: RealtimeResyncReason;
+  /** Client-generated id so duplicate requests can be coalesced */
+  requestId: string;
+}
+
+/** Result of applying an event to the local state */
+export type RealtimeApplyResult =
+  | { status: "applied"; seq: number }
+  | { status: "duplicate"; seq: number }
+  | { status: "stale"; seq: number; watermark: number }
+  | { status: "gap"; expectedSeq: number; receivedSeq: number }
+  | { status: "buffered"; seq: number };
+
+/**
+ * Client-side buffer/merge state for a match stream. Events that arrive ahead
+ * of the expected sequence are buffered until the gap is filled by a
+ * replacement snapshot; stale events are dropped without touching state.
+ */
+export interface RealtimeMergeState {
+  matchId: string;
+  /** Highest sequence number successfully applied to local state */
+  watermark: number;
+  /** Events received out of order, keyed by seq, awaiting the gap to close */
+  buffer: Map<number, RealtimeEventEnvelope>;
+  /** True while a replacement snapshot request is in flight */
+  resyncing: boolean;
+  /** Last resync reason, for diagnostics and accessible error messaging */
+  lastResyncReason?: RealtimeResyncReason;
 }
 
 // ─── Spectator Mode Types ──────────────────────────────────────────────────────

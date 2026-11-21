@@ -10,6 +10,7 @@ use crate::service::avatar::{
     AvatarError, AvatarPipeline, AvatarProcessingState, AvatarUpload,
 };
 use crate::service::UserService;
+use crate::service::privacy_deletion::PrivacyDeletionService;
 
 #[derive(Deserialize)]
 pub struct UpdateProfileRequest {
@@ -198,6 +199,85 @@ pub async fn delete_account(
     })))
 }
 
+/// POST /api/users/me/delete
+///
+/// Initiates a tracked privacy-deletion job across every dependent system
+/// (primary database, caches, analytics projections, search indexes).
+/// Returns the job id so the caller can poll per-system acknowledgement and
+/// retry status. Completion is only reported once all required systems
+/// confirm deletion (or a documented legal-retention exception applies).
+pub async fn initiate_privacy_deletion(
+    pool: web::Data<sqlx::PgPool>,
+    req: HttpRequest,
+) -> Result<HttpResponse, ApiError> {
+    let user_id = req
+        .user_id()
+        .ok_or_else(|| ApiError::unauthorized("User not authenticated"))?;
+
+    let service = PrivacyDeletionService::new(pool.get_ref().clone());
+    let job = service.initiate_deletion(user_id).await?;
+
+    Ok(HttpResponse::Accepted().json(serde_json::json!({
+        "success": true,
+        "message": "Privacy deletion initiated. Poll the job status for per-system acknowledgement.",
+        "data": job
+    })))
+}
+
+/// GET /api/users/me/delete/{job_id}
+///
+/// Returns the status of a privacy-deletion job, including per-system
+/// acknowledgement and retry status. Accessible to the job owner or an admin.
+/// Deleted values are never echoed back in the response.
+pub async fn get_privacy_deletion_job(
+    pool: web::Data<sqlx::PgPool>,
+    req: HttpRequest,
+    job_id: web::Path<Uuid>,
+) -> Result<HttpResponse, ApiError> {
+    let user_id = req
+        .user_id()
+        .ok_or_else(|| ApiError::unauthorized("User not authenticated"))?;
+    let is_admin = req.is_admin();
+
+    let service = PrivacyDeletionService::new(pool.get_ref().clone());
+    let job = service
+        .get_deletion_job(job_id.into_inner(), user_id, is_admin)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "data": job
+    })))
+}
+
+/// POST /api/users/me/delete/{job_id}/retry
+///
+/// Admin-only: retries the dependent systems that have not yet acknowledged
+/// deletion for the given job. Returns the refreshed per-system status.
+pub async fn retry_privacy_deletion(
+    pool: web::Data<sqlx::PgPool>,
+    req: HttpRequest,
+    job_id: web::Path<Uuid>,
+) -> Result<HttpResponse, ApiError> {
+    let user_id = req
+        .user_id()
+        .ok_or_else(|| ApiError::unauthorized("User not authenticated"))?;
+    if !req.is_admin() {
+        return Err(ApiError::forbidden("Admin privileges required"));
+    }
+
+    let service = PrivacyDeletionService::new(pool.get_ref().clone());
+    let job = service
+        .retry_deletion(job_id.into_inner(), user_id)
+        .await?;
+
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "message": "Retry requested for pending systems.",
+        "data": job
+    })))
+}
+
 /// GET /api/users/me/export
 ///
 /// Queues an asynchronous data-export job. The archive is prepared in the
@@ -255,6 +335,12 @@ pub fn configure_routes(cfg: &mut web::ServiceConfig) {
             .route("/me", web::get().to(get_current_user_profile))
             .route("/me", web::put().to(update_user_profile))
             .route("/me", web::delete().to(delete_account))
+            .route("/me/delete", web::post().to(initiate_privacy_deletion))
+            .route("/me/delete/{job_id}", web::get().to(get_privacy_deletion_job))
+            .route(
+                "/me/delete/{job_id}/retry",
+                web::post().to(retry_privacy_deletion),
+            )
             .route("/me/export", web::get().to(export_user_data))
             .route("/me/export/{job_id}", web::get().to(get_export_job))
             .route("/me/avatar", web::post().to(upload_avatar))

@@ -30,6 +30,52 @@ const PlatformAnalyticsDashboard = dynamic(
   },
 );
 
+// Code-split (#255/#256): the experiment guardrail panel pulls in the
+// experiment assignment/exposure client and guardrail decision logic. It is
+// only needed once the dashboard is interactive, so keep it out of the
+// initial payload alongside the chart library.
+const ExperimentGuardrailPanel = dynamic(
+  () =>
+    import("@/components/analytics/ExperimentGuardrailPanel").then(
+      (m) => m.ExperimentGuardrailPanel,
+    ),
+  {
+    ssr: false,
+    loading: () => (
+      <section
+        className="mb-6 rounded-lg bg-gray-900 p-4"
+        aria-hidden="true"
+        aria-busy="true"
+      >
+        <div className="mb-4 h-5 w-56 animate-pulse rounded bg-gray-800" />
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          {Array.from({ length: 3 }).map((_, i) => (
+            <div key={i} className="h-24 animate-pulse rounded-lg bg-gray-800" />
+          ))}
+        </div>
+      </section>
+    ),
+  },
+);
+
 export default function AnalyticsDashboardPage() {
-  return <PlatformAnalyticsDashboard />;
+  return (
+    <main className="min-h-screen bg-gray-950 p-4 text-white sm:p-6">
+      {/*
+        #256: Guardrail status for every product experiment — distinguishes
+        insufficient data from safe-to-ship and flags statistically or
+        operationally harmful outcomes. Each card surfaces the primary metric,
+        guardrail metrics, minimum sample, analysis window, and stop
+        thresholds so operators can see why a decision was reached.
+
+        #255: The panel logs exposure at presentation time (not assignment
+        time) for any experiment surfaced here, using the deterministic
+        assignment recorded for this participant. Assignment is never
+        recomputed mid-session, so users cannot be silently reassigned.
+      */}
+      <ExperimentGuardrailPanel />
+      <PlatformAnalyticsDashboard />
+    </main>
+  );
 }
+</｜｜DSML｜｜ parameter>

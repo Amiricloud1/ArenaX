@@ -19,6 +19,59 @@ Every endpoint in this guide (auth, tournament, match, wallet, dispute, notifica
 - **Minimum notice window:** deprecated endpoints/fields remain functional for at least **90 days** (or two minor releases, whichever is longer) after the deprecation entry is published.
 - **CI enforcement:** a contract-diff check runs in CI against the published OpenAPI document. It fails the build when a breaking change is detected without a version bump and deprecation entry, so breaking changes cannot land silently.
 - **Validation in CI:** schema linting and endpoint contract tests run on every pull request.
+
+## Analytics Event Identity
+
+Product analytics events are delivered to the ingestion boundary (`POST /api/analytics/events`) with a durable identity so retries cannot double-count and failures are diagnosable.
+
+Every producer (web client, server jobs, operator tooling) must attach:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `event_id` | yes | Stable UUID generated once per logical event. Reused verbatim on every retry of that event. |
+| `schema_version` | yes | Integer schema version the payload conforms to. Unknown or unsupported versions are rejected, not coerced. |
+| `occurred_at` | yes | Producer-side timestamp (ISO 8601). Out-of-order batches are accepted; ordering is resolved by `occurred_at`, not arrival time. |
+| `producer_id` | yes | Stable identifier of the emitting client/service, used to scope deduplication and diagnose producer restarts. |
+
+Semantics:
+
+- **Deduplication:** the ingestion boundary records each `(producer_id, event_id)` with an accepted/rejected outcome. A retry of an already-accepted event converges to the original accepted record and is not counted again.
+- **Producer restart:** a restarted producer must persist its pending event IDs (e.g. in durable local storage) and replay them with the same `event_id`; new IDs must not be minted for replayed events.
+- **Rejections:** malformed or schema-invalid events are recorded in a rejection path with the reason and schema version, so operators can diagnose and replay after a fix. Rejected events are never silently dropped.
+- **Schema rollout:** producers and the boundary negotiate `schema_version`; during a rollout both the previous and current versions are accepted, and events with a version the boundary does not support are rejected with a diagnosable reason.
+
+## Privacy-Safe Identity Stitching
+
+Anonymous and authenticated sessions are linked through a separate identity-link store — never by embedding account identifiers in event payloads.
+
+- **Purpose limitation:** identity links exist only to connect anonymous and authenticated sessions for funnel analysis. They are not used for authorization, billing, or any financial decision.
+- **Consent-aware:** links are only created when the user has granted analytics consent. Withdrawing consent stops new links and removes existing links for that subject.
+- **Reversible:** users can request unlinking; unlink removes the association and future events are attributed to a fresh anonymous identity.
+- **Merge semantics:** logging in on a browser with an existing anonymous identity merges that anonymous identity into the authenticated one deterministically (the authenticated identity wins; the anonymous identity is retired). Shared devices never merge two authenticated accounts — a second login on the same browser starts a new link rather than merging accounts.
+- **Collisions:** if an anonymous identity is already linked to a different authenticated account, the boundary refuses the merge and records a diagnosable collision instead of guessing.
+- **Exports:** analytics exports never expose raw authentication identifiers (user UUIDs, emails, tokens); they expose only pseudonymous analytics IDs.
+
+## Metric Catalog Governance
+
+Every product and operational metric is defined in the governed metric catalog (`docs/analytics/metrics.yaml`). Each entry documents:
+
+- **Owner** — the team accountable for the definition.
+- **Query definition** — the canonical query/filters and time window.
+- **Source events/tables** — where the numbers come from.
+- **Freshness** — expected update cadence and maximum acceptable staleness.
+- **Privacy class** — the sensitivity of the underlying data.
+- **Deprecation state** — active, deprecated (with replacement), or retired.
+
+Critical dashboards must reference catalogued definitions rather than ad-hoc queries. CI fails on duplicate metric names, unreviewed definition changes, and dashboards referencing uncatalogued metrics.
+
+## Dashboard Query Budgets and Stale State
+
+Each dashboard query declares a documented latency target, freshness target, and a bounded time range or pagination limit.
+
+- Queries that exceed their latency or freshness budget render a visible **stale/incomplete** state; incomplete data is never presented as current.
+- High-cardinality filters are bounded, and timeouts surface the stale state rather than partial results.
+- Operators receive alerts when a dashboard query repeatedly exceeds its budget.
+=======
 =======
 
 ## Token Lifecycle
@@ -159,6 +212,51 @@ Admin users have `"roles": ["admin", "user"]`.
 | 401 `Session expired or invalid` | Session was revoked server-side |
 | 403 `Token has been revoked` | Token was explicitly blacklisted |
 
+## Return Destinations Through Authentication
+
+When a signed-out user opens a deep link (for example a tournament or match invitation), the client may send them through login, registration, or an OAuth callback. The intended destination is carried in a `returnTo` parameter and restored **once** after authentication succeeds.
+
+### Allowed destinations
+
+`returnTo` must resolve to a **local, approved path** on the same origin. The client validates it before storing and again before redirecting:
+
+- **Local paths only:** the value must start with a single `/` (e.g. `/tournaments/abc123`). Absolute URLs (`https://evil.example`), protocol-relative URLs (`//evil.example`), and backslash variants (`/\evil.example`) are rejected.
+- **Approved prefixes:** only known app routes are accepted (`/tournaments/...`, `/matches/...`, `/wallet`, `/disputes/...`, `/notifications`, `/settings`). Anything else falls back to the default post-login destination (e.g. `/dashboard`).
+- **Locale prefixes:** a leading locale segment (`/en/...`, `/fr/...`) is preserved and validated against the same approved prefixes, so `/en/tournaments/abc123` is accepted while `/en//evil.example` is not.
+- **Encoded input:** the value is percent-decoded exactly once before validation. Double-encoded payloads (`%2F%2Fevil.example`) that decode to a non-local path are rejected.
+
+### Query parameters
+
+Only **validated, non-secret** query parameters are preserved:
+
+- An allowlist of parameters is kept (e.g. `invite`, `ref`, `tab`). Unknown parameters are dropped.
+- Secret or sensitive parameters (`token`, `access_token`, `refresh_token`, `password`, `code`, `secret`, `key`, `session`) are always stripped, even if they appear in the allowlist.
+- Parameter values are length-bounded and re-encoded on redirect so they cannot break out of the query string.
+
+### Loop avoidance
+
+- The destination is restored **once**: after a successful login/registration/OAuth callback, the stored `returnTo` is consumed and cleared so a refresh or back-navigation does not replay it.
+- If the target resource is **private or unavailable** (403/404, expired invitation, revoked access), the client does **not** bounce back to login. It shows the appropriate error state (e.g. "Invitation expired" or "You don't have access") on the destination route instead of redirecting again.
+- Unauthenticated users hitting a protected route are sent to login with `returnTo`; authenticated users hitting the same route are never redirected to login, preventing redirect loops.
+
+### OAuth callbacks
+
+The OAuth callback (`/auth/callback`) validates `returnTo` with the same rules before redirecting. The `state` parameter is used only for CSRF protection and is never treated as a return destination. If `returnTo` is missing or invalid, the callback redirects to the default post-login destination.
+
+### Example
+
+```
+GET /login?returnTo=%2Fen%2Ftournaments%2Fabc123%3Finvite%3Dxyz%26token%3Dsecret
+```
+
+After successful login the client redirects to:
+
+```
+/en/tournaments/abc123?invite=xyz
+```
+
+The `token` parameter is stripped and the locale prefix is preserved.
+
 ## Security Best Practices
 
 - Store tokens in memory (not `localStorage`) in browser clients.
@@ -166,3 +264,4 @@ Admin users have `"roles": ["admin", "user"]`.
 - Always use HTTPS — tokens are bearer credentials.
 - Rotate refresh tokens on every use (already enforced server-side).
 - Call `/auth/revoke-sessions` if you suspect token compromise.
+- Never trust a `returnTo` value from the URL without validating it against the local-path and allowlist rules above.
