@@ -76,14 +76,8 @@ All canonical service responses use explicit boundary representations so clients
 <!-- handsoff-issue-22 -->
 - #22: Reconcile provider balances and unresolved payments
 
-<!-- handsoff-issue-175 -->
-- #175: Correlate audit records across a complete user action
+<!-- handsoff-issue-167 -->
+- #167: Propagate request deadlines and cancellation through service calls
 
-<!-- handsoff-issue-176 -->
-- #176: Add contract tests for every external provider adapter
-
-<!-- handsoff-issue-177 -->
-- #177: Normalize locale, currency, and timezone at API boundaries
-
-<!-- handsoff-issue-178 -->
-- #178: Complete the Rust party lifecycle API
+<!-- handsoff-issue-169 -->
+- #169: Build retry and dead-letter controls for background jobs
